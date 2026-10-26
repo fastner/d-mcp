@@ -1,6 +1,6 @@
 # WP1a: Project scaffold
 
-**Plan status:** Not implemented
+**Plan status:** Implemented
 **Source:** effective-flow plan
 **Recommended workflow:** Feature (`effective-flow build`)
 
@@ -166,6 +166,56 @@ Not relevant.
   loop. Adjusted by user decision: WP1a (this plan) and WP1b.
 - **Maintainability, Note.** Schema evolution before 1.0.0 had no rule. Adjusted: the schema rule
   in `CONTRIBUTING.md`.
+
+## Test results
+
+**Date:** 2026-10-26
+
+- `mise run check`: passed. `cargo fmt --check` and clippy with `-D warnings` are clean, and all
+  12 tests pass (8 unit tests, 4 smoke tests in `tests/smoke.rs`).
+- `mise run check:full`: passed. Line coverage is 98.15 % against the threshold of 85, and
+  `cargo deny check` reports advisories, bans, licenses and sources ok. It warns four times about
+  allowed licenses that no dependency uses yet (BSD-2-Clause, BSD-3-Clause, ISC, Zlib); they stay
+  as headroom, as in Dalo.
+- MSRV: `cargo +1.94 check --locked --all-targets --all-features` passed.
+- `cargo build --release --locked`: passed.
+- Static checks:
+  - all 16 workflow `uses:` lines are pinned to full commit SHAs;
+  - both workflow files parse as YAML;
+  - the CI tool versions match the `mise.toml` pins (cargo-llvm-cov 0.9.1, cargo-deny 0.20.2);
+  - `git diff --check` is clean.
+- Behaviour:
+  - `d-mcp --version` prints the crate version and exits 0, and `--help` exits 0.
+  - A bare invocation prints help on stderr and exits 2.
+  - Unknown flags exit 2.
+  - A failed write of help or version output exits 1; a broken pipe does not count as a failure.
+- Not verified locally: the CI run on GitHub. It runs on the pull request.
+
+Implementation notes:
+
+- The Cargo `[lints]` keys use underscores. The hyphenated form is deprecated and was silently
+  ignored. The lint groups carry `priority = -1`, as `clippy::lint_groups_priority` requires.
+- CI installs `cargo-llvm-cov` and `cargo-deny` with `cargo install --locked` at the versions
+  pinned in `mise.toml`, as Dalo does. A comment in each file asks for both to stay in sync.
+- `arg_required_else_help` makes a bare `d-mcp` print help and exit 2. WP1b documents this
+  together with its own usage errors.
+- The local toolchain was installed for this run: rustup stable 1.99.1 plus 1.94 for the MSRV
+  check, and mise 2026.10.19.
+
+## Review findings
+
+**Date:** 2026-10-26
+**Reviewer:** effective-flow-rust-reviewer (Rust bucket); effective-flow-code-validator (tooling and documentation buckets)
+
+### Summary
+
+| Status | Count |
+|---|---:|
+| Fixed | 3 |
+| Open / Not implemented | 0 |
+
+One further note (a bare invocation exits 2) was kept deliberately and is handed to WP1b to
+document.
 
 ## Open points
 
