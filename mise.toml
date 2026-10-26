@@ -1,0 +1,26 @@
+# Keep these versions in sync with the `cargo install --version` pins in
+# .github/workflows/ci.yml.
+[tools]
+"cargo:cargo-llvm-cov" = "0.9.1"
+"cargo:cargo-deny" = "0.20.2"
+
+[settings]
+auto_install = false
+not_found_auto_install = false
+not_found_system_fallback = false
+
+[tasks.check]
+description = "Fast local checks: formatting, clippy, and the unit and integration tests"
+run = [
+  "cargo fmt --check",
+  "cargo clippy --locked --all-targets --all-features -- -D warnings",
+  "cargo test --locked",
+]
+
+[tasks."check:full"]
+description = "The fast checks plus the coverage threshold and the dependency policy, as in CI"
+depends = ["check"]
+run = [
+  'cargo llvm-cov --workspace --all-features --summary-only --fail-under-lines "$(cat coverage-threshold)"',
+  "cargo deny check",
+]
