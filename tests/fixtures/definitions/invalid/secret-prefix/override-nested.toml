@@ -1,0 +1,6 @@
+name = "override-nested"
+[transport]
+type = "stdio"
+command = "server"
+[harness.codex.nested]
+list = ["ok", "github_pat_abc123"]

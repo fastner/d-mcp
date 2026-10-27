@@ -1,0 +1,5 @@
+name = "url-arg-query-value"
+[transport]
+type = "stdio"
+command = "server"
+args = ["https://api.example.com/v1?key=aB3dE5gH7jK9mN1pQ2rS4tU6vW8xY0zLk"]

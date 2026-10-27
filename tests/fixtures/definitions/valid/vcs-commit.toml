@@ -1,0 +1,6 @@
+# A 40-character commit in a VCS spec is not a secret.
+name = "vcs-commit"
+[transport]
+type = "stdio"
+command = "uvx"
+args = ["--from", "git+https://github.com/example/server@0123456789abcdef0123456789abcdef01234567", "server"]

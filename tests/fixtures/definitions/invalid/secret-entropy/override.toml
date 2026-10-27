@@ -1,0 +1,6 @@
+name = "override"
+[transport]
+type = "stdio"
+command = "server"
+[harness.codex]
+value = "aB3dE5gH7jK9mN1pQ2rS4tU6vW8xY0zLk"

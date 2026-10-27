@@ -1,0 +1,5 @@
+name = "root-key"
+trust = "high"
+[transport]
+type = "stdio"
+command = "server"

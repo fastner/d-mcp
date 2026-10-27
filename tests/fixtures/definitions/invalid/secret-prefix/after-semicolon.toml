@@ -1,0 +1,6 @@
+name = "after-semicolon"
+[transport]
+type = "stdio"
+command = "server"
+[harness.codex]
+headers = "a;xoxb-123-456"

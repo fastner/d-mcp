@@ -1,0 +1,6 @@
+name = "nan-override"
+[transport]
+type = "stdio"
+command = "server"
+[harness.codex]
+ratio = nan

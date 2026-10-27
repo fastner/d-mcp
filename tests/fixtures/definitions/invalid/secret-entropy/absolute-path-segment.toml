@@ -1,0 +1,5 @@
+name = "absolute-path-segment"
+[transport]
+type = "stdio"
+command = "server"
+args = ["/srv/aB3dE5gH7jK9mN1pQ2rS4tU6vW8xY0zLk/data"]

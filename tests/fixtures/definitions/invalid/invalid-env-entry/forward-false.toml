@@ -1,0 +1,6 @@
+name = "forward-false"
+[transport]
+type = "stdio"
+command = "server"
+[env]
+X = { forward = false }

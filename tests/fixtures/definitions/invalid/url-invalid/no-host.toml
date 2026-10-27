@@ -1,0 +1,4 @@
+name = "no-host"
+[transport]
+type = "http"
+url = "https:///mcp"

@@ -1,0 +1,6 @@
+name = "empty-entry"
+[transport]
+type = "stdio"
+command = "server"
+[env]
+X = {}

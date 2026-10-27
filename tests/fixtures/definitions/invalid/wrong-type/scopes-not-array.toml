@@ -1,0 +1,7 @@
+name = "scopes-not-array"
+[transport]
+type = "http"
+url = "https://mcp.example.com/mcp"
+[auth]
+type = "oauth"
+scopes = "read"

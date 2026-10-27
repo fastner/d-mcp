@@ -1,0 +1,5 @@
+name = "arg"
+[transport]
+type = "stdio"
+command = "server"
+args = ["--key", "0123456789abcdef0123456789abcdef"]

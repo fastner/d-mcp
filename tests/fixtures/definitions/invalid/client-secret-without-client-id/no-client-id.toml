@@ -1,0 +1,7 @@
+name = "no-client-id"
+[transport]
+type = "http"
+url = "https://mcp.example.com/mcp"
+[auth]
+type = "oauth"
+client_secret_env = "CLIENT_SECRET"

@@ -1,0 +1,4 @@
+name = "port-not-numeric"
+[transport]
+type = "http"
+url = "https://mcp.example.com:abc/mcp"

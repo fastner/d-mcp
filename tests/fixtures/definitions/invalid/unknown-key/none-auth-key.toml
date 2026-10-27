@@ -1,0 +1,7 @@
+name = "none-auth-key"
+[transport]
+type = "http"
+url = "https://mcp.example.com/mcp"
+[auth]
+type = "none"
+scopes = []

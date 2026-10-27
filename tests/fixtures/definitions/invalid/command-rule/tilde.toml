@@ -1,0 +1,4 @@
+name = "tilde"
+[transport]
+type = "stdio"
+command = "~/bin/server"

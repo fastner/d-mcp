@@ -1,0 +1,6 @@
+name = "auth-none"
+[transport]
+type = "http"
+url = "https://public.example.com/mcp"
+[auth]
+type = "none"

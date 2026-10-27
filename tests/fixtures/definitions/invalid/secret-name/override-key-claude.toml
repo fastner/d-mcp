@@ -1,0 +1,6 @@
+name = "override-key-claude"
+[transport]
+type = "stdio"
+command = "server"
+[harness.claude]
+api_key = "short"

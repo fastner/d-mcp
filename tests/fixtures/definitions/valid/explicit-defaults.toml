@@ -1,0 +1,8 @@
+name = "explicit-defaults"
+[transport]
+type = "stdio"
+command = "server"
+args = []
+[env]
+[harness.codex]
+[harness.claude]

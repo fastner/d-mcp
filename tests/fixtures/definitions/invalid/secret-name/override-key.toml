@@ -1,0 +1,6 @@
+name = "override-key"
+[transport]
+type = "stdio"
+command = "server"
+[harness.codex.env]
+GITHUB_TOKEN = "hunter2"

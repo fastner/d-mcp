@@ -1,0 +1,5 @@
+name = "arg-name-equals-prefixed"
+[transport]
+type = "stdio"
+command = "server"
+args = ["GITHUB_TOKEN=ghp_abc123"]

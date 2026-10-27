@@ -1,0 +1,8 @@
+name = "header-env"
+[transport]
+type = "http"
+url = "https://api.example.com/mcp"
+[auth]
+type = "header_env"
+header = "X-Api-Key"
+var = "EXAMPLE_API_KEY"

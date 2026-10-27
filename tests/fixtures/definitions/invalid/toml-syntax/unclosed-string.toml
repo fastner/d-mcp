@@ -1,0 +1,6 @@
+name = "unclosed-string"
+[transport]
+type = "stdio"
+command = "server"
+[env]
+X = { value = "ghp_CANARYtoken0123456789 }

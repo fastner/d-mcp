@@ -1,0 +1,6 @@
+name = "harness-codex-not-table"
+[transport]
+type = "stdio"
+command = "server"
+[harness]
+codex = "x"

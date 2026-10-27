@@ -1,0 +1,5 @@
+name = "after-comma"
+[transport]
+type = "stdio"
+command = "server"
+args = ["--scopes", "read,ghp_abc123"]

@@ -1,0 +1,4 @@
+name = "relative"
+[transport]
+type = "stdio"
+command = "bin/server"

@@ -1,0 +1,6 @@
+name = "override-env-array-of-tables"
+[transport]
+type = "stdio"
+command = "server"
+[[harness.codex.env]]
+password_var = "hunter2"

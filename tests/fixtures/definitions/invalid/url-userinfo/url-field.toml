@@ -1,0 +1,4 @@
+name = "url-field"
+[transport]
+type = "http"
+url = "https://user:pw@mcp.example.com/mcp"

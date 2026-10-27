@@ -1,0 +1,5 @@
+name = "arg-single-dash-flag"
+[transport]
+type = "stdio"
+command = "server"
+args = ["-dsn=postgres://user:hunter2@db/app"]

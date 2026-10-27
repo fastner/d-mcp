@@ -1,0 +1,6 @@
+name = "env-literal"
+[transport]
+type = "stdio"
+command = "server"
+[env]
+TARGET = { value = "${OTHER}" }

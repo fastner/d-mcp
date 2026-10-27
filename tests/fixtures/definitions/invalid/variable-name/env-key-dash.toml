@@ -1,0 +1,6 @@
+name = "env-key-dash"
+[transport]
+type = "stdio"
+command = "server"
+[env]
+"MY-VAR" = { forward = true }

@@ -1,0 +1,8 @@
+name = "bearer-env"
+[transport]
+type = "http"
+url = "https://api.example.com/mcp"
+[auth]
+type = "bearer_env"
+var = "EXAMPLE_TOKEN"
+oauth_supported = true

@@ -1,0 +1,6 @@
+name = "base64-with-slash"
+[transport]
+type = "stdio"
+command = "server"
+[env]
+EXAMPLE = { value = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEYxxAB" }

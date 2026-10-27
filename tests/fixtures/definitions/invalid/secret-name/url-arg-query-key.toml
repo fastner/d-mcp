@@ -1,0 +1,5 @@
+name = "url-arg-query-key"
+[transport]
+type = "stdio"
+command = "server"
+args = ["--endpoint", "https://api.example.com/v1?access_token=short"]

@@ -1,0 +1,4 @@
+name = "empty"
+[transport]
+type = "stdio"
+command = ""

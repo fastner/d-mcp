@@ -1,0 +1,5 @@
+name = "jdbc-flag-url"
+[transport]
+type = "stdio"
+command = "server"
+args = ["--url=jdbc:postgresql://db/app?password=hunter2"]

@@ -1,0 +1,6 @@
+name = "harness-key"
+[transport]
+type = "stdio"
+command = "server"
+[harness.gemini]
+x = 1

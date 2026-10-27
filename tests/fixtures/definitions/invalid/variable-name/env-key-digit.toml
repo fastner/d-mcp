@@ -1,0 +1,6 @@
+name = "env-key-digit"
+[transport]
+type = "stdio"
+command = "server"
+[env]
+"1VAR" = { value = "x" }

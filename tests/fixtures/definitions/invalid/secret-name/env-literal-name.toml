@@ -1,0 +1,6 @@
+name = "env-literal-name"
+[transport]
+type = "stdio"
+command = "server"
+[env]
+GITHUB_TOKEN = { value = "short" }

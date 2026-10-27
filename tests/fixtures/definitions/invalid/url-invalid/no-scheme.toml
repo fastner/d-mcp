@@ -1,0 +1,4 @@
+name = "no-scheme"
+[transport]
+type = "http"
+url = "mcp.example.com/mcp"

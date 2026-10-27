@@ -4,6 +4,23 @@
 //! entry point in the library lets tests drive the command-line interface
 //! in-process through [`run_from`] and lets later work packages add global
 //! options and subcommands to [`Cli`] without touching the binary.
+//!
+//! Module boundaries: [`definition`], [`credential`], [`config`] and
+//! [`resolver`] do no I/O, and [`resolver`] is pure. [`source`] reads files.
+//! [`store`] owns every write and the lock. [`cli`] parses, dispatches and
+//! renders through [`output`].
+
+pub mod cli;
+pub mod config;
+pub mod credential;
+pub mod definition;
+pub mod error;
+pub mod output;
+pub mod resolver;
+pub mod rule;
+pub mod source;
+pub mod spanned;
+pub mod store;
 
 use std::ffi::OsString;
 use std::io;
@@ -11,13 +28,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-/// Command-line interface of `d-mcp`.
-///
-/// WP1a ships no commands yet; clap provides `--help` and `--version`
-/// (the crate version from `Cargo.toml`).
-#[derive(Debug, Parser)]
-#[command(name = "d-mcp", version, about, long_about = None, arg_required_else_help = true)]
-pub struct Cli {}
+pub use cli::Cli;
 
 /// Runs `d-mcp` with the arguments of the current process.
 ///
@@ -32,6 +43,8 @@ pub fn run() -> ExitCode {
 /// Help and version output go to stdout with exit code 0; usage errors go to
 /// stderr with clap's usage exit code 2. If writing help or version output
 /// fails for a reason other than a broken pipe, the exit code is 1 instead.
+/// A parsed command runs against the process environment; its exit code is
+/// documented in `docs/reference.md`.
 #[must_use]
 pub fn run_from<I, T>(args: I) -> ExitCode
 where
@@ -39,7 +52,16 @@ where
     T: Into<OsString> + Clone,
 {
     match Cli::try_parse_from(args) {
-        Ok(Cli {}) => ExitCode::SUCCESS,
+        Ok(cli) => {
+            let environment = store::Environment::from_process();
+            let code = cli::execute(
+                &cli,
+                &environment,
+                &mut io::stdout().lock(),
+                &mut io::stderr().lock(),
+            );
+            ExitCode::from(code)
+        }
         Err(error) => exit_code_after_print(error.print(), error.exit_code()),
     }
 }

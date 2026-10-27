@@ -1,0 +1,6 @@
+name = "env-literal-url"
+[transport]
+type = "stdio"
+command = "server"
+[env]
+DATABASE_URL = { value = "postgres://app:hunter2@db.internal/app" }

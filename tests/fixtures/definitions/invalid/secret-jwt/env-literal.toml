@@ -1,0 +1,6 @@
+name = "env-literal"
+[transport]
+type = "stdio"
+command = "server"
+[env]
+SESSION = { value = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl" }

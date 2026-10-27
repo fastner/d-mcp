@@ -1,0 +1,6 @@
+name = "override-env-inline-array"
+[transport]
+type = "stdio"
+command = "server"
+[harness.codex]
+env = [{ token_env = "hunter2" }]

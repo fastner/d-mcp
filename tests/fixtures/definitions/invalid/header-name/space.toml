@@ -1,0 +1,8 @@
+name = "space"
+[transport]
+type = "http"
+url = "https://mcp.example.com/mcp"
+[auth]
+type = "header_env"
+header = "X Api Key"
+var = "X_VAR"
