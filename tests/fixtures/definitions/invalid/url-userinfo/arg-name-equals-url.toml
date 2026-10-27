@@ -1,0 +1,5 @@
+name = "arg-name-equals-url"
+[transport]
+type = "stdio"
+command = "server"
+args = ["DATABASE_URL=postgres://user:hunter2@db/app"]

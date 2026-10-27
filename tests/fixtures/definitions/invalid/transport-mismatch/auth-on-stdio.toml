@@ -1,0 +1,6 @@
+name = "auth-on-stdio"
+[transport]
+type = "stdio"
+command = "server"
+[auth]
+type = "none"

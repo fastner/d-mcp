@@ -1,0 +1,6 @@
+name = "override-env-var-key"
+[transport]
+type = "stdio"
+command = "server"
+[harness.codex]
+bearer_token_env_var = "ghp_abc123"

@@ -1,0 +1,6 @@
+name = "after-equals"
+[transport]
+type = "stdio"
+command = "server"
+[env]
+EXAMPLE = { value = "key=ghp_abc123" }

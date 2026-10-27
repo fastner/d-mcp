@@ -1,0 +1,6 @@
+name = "inf-override"
+[transport]
+type = "stdio"
+command = "server"
+[harness.claude]
+limits = [1.0, -inf]

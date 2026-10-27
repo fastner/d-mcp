@@ -1,0 +1,5 @@
+name = "arg-dollar"
+[transport]
+type = "stdio"
+command = "server"
+args = ["--dir", "$HOME"]

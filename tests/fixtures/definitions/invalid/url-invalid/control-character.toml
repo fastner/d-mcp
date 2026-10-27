@@ -1,0 +1,4 @@
+name = "control-character"
+[transport]
+type = "http"
+url = "https://mcp.example.com/m\u0007cp"

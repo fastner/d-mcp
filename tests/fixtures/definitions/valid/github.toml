@@ -1,0 +1,11 @@
+name = "github"
+description = "GitHub tools"
+[transport]
+type = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github@1.2.3"]
+[env]
+GITHUB_TOKEN = { forward = true }
+LOG_LEVEL = { value = "info" }
+[harness.codex]
+cwd = "/srv/github"

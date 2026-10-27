@@ -1,0 +1,9 @@
+name = "override-env-var-key"
+description = "Override keys that name environment variables"
+[transport]
+type = "stdio"
+command = "server"
+[harness.codex]
+bearer_token_env_var = "GITHUB_TOKEN"
+client_secret_env = "CLIENT_SECRET"
+token_env = "MY_TOKEN"

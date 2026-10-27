@@ -1,0 +1,5 @@
+name = "arg-connection-string"
+[transport]
+type = "stdio"
+command = "server"
+args = ["postgres://app:hunter2@db.internal:5432/app"]

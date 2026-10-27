@@ -1,0 +1,5 @@
+name = "flag-value-url"
+[transport]
+type = "stdio"
+command = "server"
+args = ["--database=postgres://app:hunter2@db.internal/app"]

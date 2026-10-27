@@ -1,0 +1,5 @@
+name = "description-not-string"
+description = ["x"]
+[transport]
+type = "stdio"
+command = "server"

@@ -1,0 +1,6 @@
+name = "env-on-http"
+[transport]
+type = "http"
+url = "https://mcp.example.com/mcp"
+[env]
+X = { forward = true }

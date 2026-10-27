@@ -1,0 +1,6 @@
+name = "override-url"
+[transport]
+type = "stdio"
+command = "server"
+[harness.claude]
+proxy = "http://u:p@proxy.internal"

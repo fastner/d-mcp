@@ -1,0 +1,4 @@
+name = "url-path"
+[transport]
+type = "http"
+url = "https://mcp.example.com/glpat-abcdef123/mcp"

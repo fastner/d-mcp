@@ -1,0 +1,4 @@
+name = "whitespace"
+[transport]
+type = "http"
+url = "https://mcp.example.com/m cp"

@@ -1,0 +1,4 @@
+name = "ftp"
+[transport]
+type = "http"
+url = "ftp://mcp.example.com/mcp"

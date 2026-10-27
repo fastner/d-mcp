@@ -1,0 +1,9 @@
+name = "linear"
+[transport]
+type = "http"
+url = "https://mcp.linear.app/mcp"
+[auth]
+type = "oauth"
+client_id = "d-mcp-linear"
+scopes = ["read"]
+client_secret_env = "LINEAR_CLIENT_SECRET"

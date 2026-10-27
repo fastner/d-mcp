@@ -1,0 +1,4 @@
+name = "transport-sse"
+[transport]
+type = "sse"
+url = "https://x.example.com"

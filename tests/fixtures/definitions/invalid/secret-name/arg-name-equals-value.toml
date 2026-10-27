@@ -1,0 +1,5 @@
+name = "arg-name-equals-value"
+[transport]
+type = "stdio"
+command = "server"
+args = ["GITHUB_TOKEN=hunter2!"]

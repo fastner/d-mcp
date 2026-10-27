@@ -1,0 +1,5 @@
+name = "flag-value"
+[transport]
+type = "stdio"
+command = "server"
+args = ["--github=ghp_CANARYtoken0123456789"]

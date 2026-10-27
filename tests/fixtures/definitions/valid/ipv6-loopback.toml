@@ -1,0 +1,4 @@
+name = "ipv6-loopback"
+[transport]
+type = "http"
+url = "http://[::1]:3000/mcp"

@@ -1,0 +1,4 @@
+name = "http-lookalike"
+[transport]
+type = "http"
+url = "http://localhost.example.com/mcp"

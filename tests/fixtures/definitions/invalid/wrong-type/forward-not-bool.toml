@@ -1,0 +1,6 @@
+name = "forward-not-bool"
+[transport]
+type = "stdio"
+command = "server"
+[env]
+X = { forward = "yes" }

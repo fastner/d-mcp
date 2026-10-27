@@ -1,0 +1,3 @@
+name = "inline-transport"
+transport = { type = "stdio", command = "server", args = ["serve"] }
+env = { DEBUG = { value = "1" }, HOME_DIR = { forward = true } }

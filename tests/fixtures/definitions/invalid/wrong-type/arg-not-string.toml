@@ -1,0 +1,5 @@
+name = "arg-not-string"
+[transport]
+type = "stdio"
+command = "server"
+args = ["serve", 1]

@@ -1,0 +1,6 @@
+name = "override-env-table-env-key"
+[transport]
+type = "stdio"
+command = "server"
+[harness.codex.env]
+TOKEN_ENV = "MY_TOKEN"

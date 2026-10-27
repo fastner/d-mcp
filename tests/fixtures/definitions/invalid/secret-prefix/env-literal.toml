@@ -1,0 +1,6 @@
+name = "env-literal"
+[transport]
+type = "stdio"
+command = "server"
+[env]
+GH = { value = "Bearer ghp_abcdef123456" }

@@ -1,0 +1,6 @@
+name = "env-entry-not-table"
+[transport]
+type = "stdio"
+command = "server"
+[env]
+X = "y"

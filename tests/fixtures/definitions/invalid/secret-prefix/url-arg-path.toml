@@ -1,0 +1,5 @@
+name = "url-arg-path"
+[transport]
+type = "stdio"
+command = "server"
+args = ["https://hooks.example.com/xoxp-123/hook"]

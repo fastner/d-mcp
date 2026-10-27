@@ -1,0 +1,5 @@
+name = "arg-env-braces"
+[transport]
+type = "stdio"
+command = "server"
+args = ["${env:WORKSPACE}"]

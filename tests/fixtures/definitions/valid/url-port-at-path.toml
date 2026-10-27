@@ -1,0 +1,4 @@
+name = "url-port-at-path"
+[transport]
+type = "http"
+url = "https://mastodon.example.com:443/@me/mcp"

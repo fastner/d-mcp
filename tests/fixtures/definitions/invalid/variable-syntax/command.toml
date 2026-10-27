@@ -1,0 +1,4 @@
+name = "command"
+[transport]
+type = "stdio"
+command = "${SERVER_BIN}"

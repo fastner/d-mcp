@@ -1,0 +1,16 @@
+name = "overrides"
+description = "Opaque override tables"
+[transport]
+type = "stdio"
+command = "server"
+[harness.codex]
+cwd = "/srv/overrides"
+startup_timeout_sec = 20
+ratio = 0.5
+enabled = true
+since = 1979-05-27T07:32:00Z
+tools = ["a", "b"]
+[harness.codex.nested]
+level = 2
+[harness.claude]
+note = "kept verbatim"

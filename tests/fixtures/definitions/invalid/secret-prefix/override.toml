@@ -1,0 +1,6 @@
+name = "override"
+[transport]
+type = "stdio"
+command = "server"
+[harness.claude]
+key = "AIzaSyExample123"

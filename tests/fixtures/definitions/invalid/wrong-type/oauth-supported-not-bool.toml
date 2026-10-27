@@ -1,0 +1,8 @@
+name = "oauth-supported-not-bool"
+[transport]
+type = "http"
+url = "https://mcp.example.com/mcp"
+[auth]
+type = "bearer_env"
+var = "X_VAR"
+oauth_supported = "yes"

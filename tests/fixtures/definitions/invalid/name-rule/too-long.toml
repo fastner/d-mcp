@@ -1,0 +1,4 @@
+name = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+[transport]
+type = "stdio"
+command = "server"

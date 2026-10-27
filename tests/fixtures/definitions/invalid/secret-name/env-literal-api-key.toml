@@ -1,0 +1,6 @@
+name = "env-literal-api-key"
+[transport]
+type = "stdio"
+command = "server"
+[env]
+OPENAI_API_KEY = { value = "short" }

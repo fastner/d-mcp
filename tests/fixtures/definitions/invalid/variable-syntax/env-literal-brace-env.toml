@@ -1,0 +1,6 @@
+name = "env-literal-brace-env"
+[transport]
+type = "stdio"
+command = "server"
+[env]
+TARGET = { value = "{env:OTHER}" }

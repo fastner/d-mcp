@@ -1,0 +1,4 @@
+name = "unclosed-bracket"
+[transport]
+type = "http"
+url = "https://[::1/mcp"

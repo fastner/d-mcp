@@ -1,0 +1,5 @@
+name = "absolute-command"
+[transport]
+type = "stdio"
+command = "/usr/local/bin/mcp-server"
+args = ["--port=8080", "--config", "/etc/mcp/server.toml"]

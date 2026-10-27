@@ -1,0 +1,6 @@
+name = "env-literal"
+[transport]
+type = "stdio"
+command = "server"
+[env]
+EXAMPLE = { value = "aB3dE5gH7jK9mN1pQ2rS4tU6vW8xY0zLk" }

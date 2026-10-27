@@ -1,0 +1,5 @@
+name = "arg"
+[transport]
+type = "stdio"
+command = "server"
+args = ["ghp_CANARYtoken0123456789"]

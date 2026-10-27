@@ -1,0 +1,7 @@
+name = "client-id"
+[transport]
+type = "http"
+url = "https://mcp.example.com/mcp"
+[auth]
+type = "oauth"
+client_id = "AKIAIOSFODNN7EXAMPLE"

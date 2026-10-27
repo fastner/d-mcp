@@ -1,0 +1,6 @@
+name = "forward-and-value"
+[transport]
+type = "stdio"
+command = "server"
+[env]
+X = { forward = true, value = "1" }

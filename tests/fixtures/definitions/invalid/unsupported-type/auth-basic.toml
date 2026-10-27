@@ -1,0 +1,6 @@
+name = "auth-basic"
+[transport]
+type = "http"
+url = "https://mcp.example.com/mcp"
+[auth]
+type = "basic"

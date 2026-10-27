@@ -1,0 +1,5 @@
+name = "description"
+description = "uses sk-ant-abc123"
+[transport]
+type = "stdio"
+command = "server"

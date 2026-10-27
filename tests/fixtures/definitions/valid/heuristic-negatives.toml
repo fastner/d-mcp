@@ -1,0 +1,14 @@
+name = "heuristic-negatives"
+[transport]
+type = "stdio"
+command = "server"
+args = [
+  "--registry=https://npm.example.com:4873/@scope/pkg",
+  "http://localhost:8080/pkg@1.0",
+  "https://h.example.com/x?t=10:00&e=a@b",
+  "https://h.example.com/search?q=a:b&mail=x@y",
+  "GoogleCloudPlatform/kubernetes-engine-samples",
+  "Azure-Samples/azure-openai-mcp-server-quickstart",
+  "awslabs/aws-documentation-mcp-server",
+  "AUTH_MODE=oauth",
+]

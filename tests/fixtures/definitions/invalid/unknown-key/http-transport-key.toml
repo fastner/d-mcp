@@ -1,0 +1,5 @@
+name = "http-transport-key"
+[transport]
+type = "http"
+url = "https://mcp.example.com/mcp"
+headers = "x"

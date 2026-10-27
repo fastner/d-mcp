@@ -1,0 +1,5 @@
+name = "description-url"
+description = "see https://u:p@host.example.com"
+[transport]
+type = "stdio"
+command = "server"

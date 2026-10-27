@@ -1,0 +1,5 @@
+name = "transport-key"
+[transport]
+type = "stdio"
+command = "server"
+cwd = "/srv"

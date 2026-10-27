@@ -1,0 +1,4 @@
+name = "0x-digits"
+[transport]
+type = "stdio"
+command = "server"

@@ -1,0 +1,4 @@
+name = "http-remote"
+[transport]
+type = "http"
+url = "http://mcp.example.com/mcp"

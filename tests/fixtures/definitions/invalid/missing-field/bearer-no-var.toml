@@ -1,0 +1,6 @@
+name = "bearer-no-var"
+[transport]
+type = "http"
+url = "https://mcp.example.com/mcp"
+[auth]
+type = "bearer_env"

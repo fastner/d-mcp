@@ -1,0 +1,6 @@
+name = "override-env-nested-table"
+[transport]
+type = "stdio"
+command = "server"
+[harness.codex.env.sub]
+token_env = "hunter2"

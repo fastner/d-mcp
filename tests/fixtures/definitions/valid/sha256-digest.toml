@@ -1,0 +1,6 @@
+# A sha256 digest is not a secret.
+name = "sha256-digest"
+[transport]
+type = "stdio"
+command = "docker"
+args = ["run", "--rm", "-i", "ghcr.io/example/server@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]

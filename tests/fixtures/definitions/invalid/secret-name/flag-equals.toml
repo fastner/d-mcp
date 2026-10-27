@@ -1,0 +1,5 @@
+name = "flag-equals"
+[transport]
+type = "stdio"
+command = "server"
+args = ["--token=short"]

@@ -1,0 +1,6 @@
+name = "env-entry-key"
+[transport]
+type = "stdio"
+command = "server"
+[env]
+X = { forward = true, rename = "Y" }

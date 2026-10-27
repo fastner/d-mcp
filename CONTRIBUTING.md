@@ -18,6 +18,9 @@ Run `mise run check` before every commit and `mise run check:full` before openin
 - Tests never use the network.
 - Every mutation of user data has a test for its failure path (the write fails or is refused, and the existing data is left intact).
 - Every mutating command has `--dry-run` coverage that proves nothing is written.
+- Command-level tests live in `tests/` and build on `tests/common/mod.rs`. Every command runs with `HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and the `XDG_*` directories inside a fresh temporary directory and without `D_MCP_STORE`, so no test touches the real `~/.d-mcp` or real harness configuration. Never bypass this helper.
+- Definition fixtures live in `tests/fixtures/definitions/`. A file in `invalid/<rule-code>/` must fail with exactly that rule code; a file in `valid/` must pass. The file stem is the server name. A new rule code needs a fixture and an entry in the rule-code table of `docs/reference.md`.
+- The error-code table in `docs/reference.md` (between the `error-codes` markers) is parsed by a unit test; keep every error code and its exit code in sync with `src/error.rs`.
 - The coverage threshold lives in `coverage-threshold` (percent of lines). It may be raised but never lowered.
 
 ## Dependencies

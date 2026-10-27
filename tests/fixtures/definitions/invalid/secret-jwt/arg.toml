@@ -1,0 +1,5 @@
+name = "arg"
+[transport]
+type = "stdio"
+command = "server"
+args = ["--session", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl"]

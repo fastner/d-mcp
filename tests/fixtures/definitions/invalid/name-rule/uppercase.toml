@@ -1,0 +1,4 @@
+name = "GitHub"
+[transport]
+type = "stdio"
+command = "server"
