@@ -13,7 +13,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::config::{Config, LOCAL_SOURCE_ID, SourceKind};
-use crate::definition::{is_valid_name, parse_definition};
+use crate::definition::{OverrideSites, is_valid_name, parse_definition_with_sites};
 use crate::resolver::{FileEntry, FileProblem, Notice, SourceSnapshot};
 use crate::rule::Rule;
 use crate::store::StorePaths;
@@ -108,6 +108,7 @@ pub fn scan(spec: &SourceSpec) -> SourceSnapshot {
                 file: display,
                 key: None,
                 outcome: Err(FileProblem::file(Rule::Unreadable)),
+                override_sites: OverrideSites::default(),
             });
             continue;
         };
@@ -135,14 +136,19 @@ pub fn scan(spec: &SourceSpec) -> SourceSnapshot {
         };
         // A lossy (non-UTF-8) name can never pass the name rule.
         let key = (name.to_str().is_some() && is_valid_name(stem)).then(|| stem.to_owned());
-        let outcome = match &key {
+        let parsed = match &key {
             None => Err(FileProblem::file(Rule::InvalidStem)),
             Some(stem) => read_definition(&path, &metadata, stem),
+        };
+        let (outcome, override_sites) = match parsed {
+            Ok((definition, sites)) => (Ok(definition), sites),
+            Err(problem) => (Err(problem), OverrideSites::default()),
         };
         snapshot.files.push(FileEntry {
             file: display,
             key,
             outcome,
+            override_sites,
         });
     }
     snapshot
@@ -162,7 +168,7 @@ fn read_definition(
     path: &Path,
     metadata: &fs::Metadata,
     stem: &str,
-) -> Result<crate::definition::Definition, FileProblem> {
+) -> Result<(crate::definition::Definition, OverrideSites), FileProblem> {
     if !metadata.is_file() {
         return Err(FileProblem::file(Rule::NotRegularFile));
     }
@@ -198,7 +204,7 @@ fn read_definition(
         return Err(FileProblem::file(Rule::FileTooLarge));
     }
     let text = String::from_utf8(bytes).map_err(|_| FileProblem::file(Rule::NotUtf8))?;
-    parse_definition(&text, stem).map_err(FileProblem::from)
+    parse_definition_with_sites(&text, stem).map_err(FileProblem::from)
 }
 
 #[cfg(test)]

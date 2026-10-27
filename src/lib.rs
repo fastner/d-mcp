@@ -5,22 +5,33 @@
 //! in-process through [`run_from`] and lets later work packages add global
 //! options and subcommands to [`Cli`] without touching the binary.
 //!
-//! Module boundaries: [`definition`], [`credential`], [`config`] and
-//! [`resolver`] do no I/O, and [`resolver`] is pure. [`source`] reads files.
-//! [`store`] owns every write and the lock. [`cli`] parses, dispatches and
-//! renders through [`output`].
+//! Module boundaries: [`definition`], [`credential`], [`config`],
+//! [`canonical`], [`validate`] and [`resolver`] do no I/O, and [`resolver`]
+//! is pure. [`source`] reads files. [`store`] owns every write to the store
+//! and the lock; [`state`] reads `state.toml` and writes it through
+//! [`store`]. [`sync`] splits into a pure planner and an executor (`sync::run`)
+//! that applies a plan through the [`adapter`] contract. An adapter owns the
+//! reads and writes of its harness's files (Codex: `$CODEX_HOME/config.toml`)
+//! and runs harness CLIs only through [`process`]. [`cli`] parses, dispatches
+//! and renders through [`output`].
 
+pub mod adapter;
+pub mod canonical;
 pub mod cli;
 pub mod config;
 pub mod credential;
 pub mod definition;
 pub mod error;
 pub mod output;
+pub mod process;
 pub mod resolver;
 pub mod rule;
 pub mod source;
 pub mod spanned;
+pub mod state;
 pub mod store;
+pub mod sync;
+pub mod validate;
 
 use std::ffi::OsString;
 use std::io;

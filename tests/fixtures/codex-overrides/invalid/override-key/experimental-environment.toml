@@ -1,0 +1,6 @@
+name = "experimental-environment"
+[transport]
+type = "stdio"
+command = "npx"
+[harness.codex]
+experimental_environment = "remote"

@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use super::{
-    Auth, Definition, DefinitionError, EnvValue, Transport, is_valid_header_name, is_valid_name,
-    is_valid_variable_name,
+    Auth, Definition, DefinitionError, EnvValue, OverrideKind, OverrideSite, OverrideSites,
+    Transport, is_valid_header_name, is_valid_name, is_valid_variable_name,
 };
 use crate::credential::{
     SecretFinding, contains_userinfo, contains_variable_syntax, parse_url_shape,
@@ -37,7 +37,7 @@ const ENV_REFERENCE_TABLES: &[&str] = &["env_http_headers"];
 /// depth and through arrays, are never exempt from the name heuristic.
 const LITERAL_ENV_TABLE: &str = "env";
 
-pub(super) fn walk(text: &str, stem: &str) -> Result<Definition> {
+pub(super) fn walk(text: &str, stem: &str) -> Result<(Definition, OverrideSites)> {
     Walker { text }.definition(stem)
 }
 
@@ -185,7 +185,7 @@ impl Walker<'_> {
         }
     }
 
-    fn definition(&self, stem: &str) -> Result<Definition> {
+    fn definition(&self, stem: &str) -> Result<(Definition, OverrideSites)> {
         let root = spanned::parse_document(self.text)
             .map_err(|offset| self.error(Rule::TomlSyntax, "", offset))?;
         self.check_keys(&root, "", ROOT_KEYS)?;
@@ -233,12 +233,15 @@ impl Walker<'_> {
         }
 
         let overrides = self.harness(&root)?;
-        Ok(Definition {
-            name: name.to_owned(),
-            description,
-            transport,
-            overrides,
-        })
+        Ok((
+            Definition {
+                name: name.to_owned(),
+                description,
+                transport,
+                overrides,
+            },
+            self.override_sites(&root),
+        ))
     }
 
     /// Parses `transport`. A stdio transport is returned with an empty `env`
@@ -496,6 +499,33 @@ impl Walker<'_> {
         Ok(overrides)
     }
 
+    /// Records the kind and position of every top-level key of every harness
+    /// table. The walk has already validated the `harness` structure.
+    fn override_sites(&self, root: &[Entry]) -> OverrideSites {
+        let mut sites = Vec::new();
+        let Some(NodeKind::Table(harnesses)) = find(root, "harness").map(|entry| &entry.value.kind)
+        else {
+            return OverrideSites::default();
+        };
+        for harness in harnesses {
+            let NodeKind::Table(entries) = &harness.value.kind else {
+                continue;
+            };
+            for entry in entries {
+                let (line, column) =
+                    spanned::line_column(self.text, entry.key_offset().unwrap_or(0));
+                sites.push(OverrideSite {
+                    harness: harness.key.clone(),
+                    key: entry.key.clone(),
+                    kind: override_kind(&entry.value),
+                    line,
+                    column,
+                });
+            }
+        }
+        OverrideSites(sites)
+    }
+
     /// Converts an override table. `table_key` is the key of this table in
     /// its parent override table, `None` for a harness table itself and for
     /// tables inside arrays. `in_env` is set when this table is an `env`
@@ -583,6 +613,23 @@ fn is_env_reference(in_env: bool, table_key: Option<&str>, key: &str, value: &st
     last_segment.eq_ignore_ascii_case("env")
         || last_segment.eq_ignore_ascii_case("var")
         || table_key.is_some_and(|table| ENV_REFERENCE_TABLES.contains(&table))
+}
+
+/// The [`OverrideKind`] of an override value.
+fn override_kind(node: &Node) -> OverrideKind {
+    match &node.kind {
+        NodeKind::String(_) => OverrideKind::String,
+        NodeKind::Integer(value) => OverrideKind::Integer(*value),
+        NodeKind::Float(value) => OverrideKind::Float(*value),
+        NodeKind::Boolean(_) => OverrideKind::Boolean,
+        NodeKind::Datetime(_) => OverrideKind::Datetime,
+        NodeKind::Array(items) => OverrideKind::Array {
+            all_strings: items
+                .iter()
+                .all(|item| matches!(item.kind, NodeKind::String(_))),
+        },
+        NodeKind::Table(_) => OverrideKind::Table,
+    }
 }
 
 fn default_auth() -> Auth {

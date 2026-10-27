@@ -1,0 +1,6 @@
+name = "approval-mode"
+[transport]
+type = "stdio"
+command = "npx"
+[harness.codex]
+default_tools_approval_mode = "approve"

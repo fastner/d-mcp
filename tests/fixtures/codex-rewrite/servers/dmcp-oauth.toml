@@ -1,0 +1,10 @@
+name = "dmcp-oauth"
+[transport]
+type = "http"
+url = "https://mcp.example.com/mcp"
+[auth]
+type = "oauth"
+client_id = "dmcp-client"
+scopes = ["read", "write"]
+[harness.codex]
+required = true

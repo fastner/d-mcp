@@ -1,0 +1,3 @@
+model = "o3"
+[mcp_servers.broken]
+command = "CANARY_BROKEN_LINE_VALUE

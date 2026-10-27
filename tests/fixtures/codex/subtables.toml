@@ -1,0 +1,11 @@
+[mcp_servers.first]
+command = "first"
+
+[mcp_servers.first.env]
+A = "1"
+
+[mcp_servers.first.tools.search]
+approval_mode = "approve"
+
+[mcp_servers.second]
+url = "https://second.example/mcp"

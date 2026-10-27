@@ -1,0 +1,7 @@
+name = "max-timeouts"
+[transport]
+type = "stdio"
+command = "npx"
+[harness.codex]
+startup_timeout_sec = 31536000
+tool_timeout_sec = 0

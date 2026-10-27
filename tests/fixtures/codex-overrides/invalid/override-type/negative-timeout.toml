@@ -1,0 +1,6 @@
+name = "negative-timeout"
+[transport]
+type = "stdio"
+command = "npx"
+[harness.codex]
+startup_timeout_sec = -5

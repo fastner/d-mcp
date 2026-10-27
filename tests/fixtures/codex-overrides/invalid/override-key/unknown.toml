@@ -1,0 +1,6 @@
+name = "unknown"
+[transport]
+type = "stdio"
+command = "npx"
+[harness.codex]
+knob = 1

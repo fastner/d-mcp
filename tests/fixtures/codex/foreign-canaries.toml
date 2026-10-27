@@ -1,0 +1,16 @@
+[mcp_servers.foreign-http]
+url = "https://foreign.example/mcp"
+http_headers = { "X-Api-Key" = "CANARY_FOREIGN_HEADER_VALUE" }
+
+[mcp_servers.foreign-stdio]
+command = "foreign"
+
+[mcp_servers.foreign-stdio.env]
+API_TOKEN = "CANARY_FOREIGN_ENV_VALUE"
+
+[mcp_servers.foreign-oauth]
+url = "https://foreign.example/oauth"
+
+[mcp_servers.foreign-oauth.oauth]
+client_id = "foreign-client"
+client_secret = "CANARY_FOREIGN_CLIENT_SECRET"

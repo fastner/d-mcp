@@ -1,0 +1,4 @@
+name = "no-overrides"
+[transport]
+type = "http"
+url = "https://mcp.example.com/mcp"

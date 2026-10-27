@@ -1,0 +1,26 @@
+[mcp_servers.dmcp-header]
+url = "https://header.example.com/mcp"
+enabled = false
+disabled_tools = ["delete"]
+
+[mcp_servers.dmcp-header.env_http_headers]
+X-Api-Key = "API_KEY_VAR"
+
+[mcp_servers.dmcp-oauth]
+url = "https://mcp.example.com/mcp"
+scopes = ["read", "write"]
+required = true
+
+[mcp_servers.dmcp-oauth.oauth]
+client_id = "dmcp-client"
+
+[mcp_servers.dmcp-stdio]
+command = "npx"
+env_vars = ["TOKEN_VAR"]
+cwd = "/srv/dmcp"
+startup_timeout_sec = 30
+tool_timeout_sec = 2.5
+enabled_tools = ["search"]
+
+[mcp_servers.dmcp-stdio.env]
+LOG_LEVEL = "info"

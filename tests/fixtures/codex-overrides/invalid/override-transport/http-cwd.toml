@@ -1,0 +1,6 @@
+name = "http-cwd"
+[transport]
+type = "http"
+url = "https://mcp.example.com/mcp"
+[harness.codex]
+cwd = "/srv/http"

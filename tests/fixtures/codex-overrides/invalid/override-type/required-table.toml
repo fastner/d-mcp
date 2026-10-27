@@ -1,0 +1,6 @@
+name = "required-table"
+[transport]
+type = "stdio"
+command = "npx"
+[harness.codex.required]
+value = true

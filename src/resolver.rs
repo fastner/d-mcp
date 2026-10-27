@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use crate::config::{HarnessSet, Selection};
-use crate::definition::{Definition, DefinitionError};
+use crate::definition::{Definition, DefinitionError, OverrideSites};
 use crate::rule::Rule;
 
 /// A scanned source, the resolver input.
@@ -50,6 +50,9 @@ pub struct FileEntry {
     pub key: Option<String>,
     /// The parsed definition, or the per-file problem.
     pub outcome: Result<Definition, FileProblem>,
+    /// The TOML kind and position of every top-level override key of a
+    /// parsed definition (empty for a problem), for the `validate` step.
+    pub override_sites: OverrideSites,
 }
 
 /// Why a file is invalid. It names the rule and position only.
@@ -428,6 +431,7 @@ mod tests {
             file: format!("servers/{name}.toml"),
             key: Some(name.to_owned()),
             outcome: Ok(definition(name, command)),
+            override_sites: OverrideSites::default(),
         }
     }
 
@@ -436,6 +440,7 @@ mod tests {
             file: format!("servers/{name}.toml"),
             key: Some(name.to_owned()),
             outcome: Err(FileProblem::file(Rule::TomlSyntax)),
+            override_sites: OverrideSites::default(),
         }
     }
 
@@ -514,6 +519,7 @@ mod tests {
             file: "servers/GitHub.toml".to_owned(),
             key: None,
             outcome: Err(FileProblem::file(Rule::InvalidStem)),
+            override_sites: OverrideSites::default(),
         };
         let sources = [
             source("local", 0, vec![valid("github", "low")]),

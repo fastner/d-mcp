@@ -1,7 +1,7 @@
 //! Property test: resolution is deterministic for shuffled inputs.
 
 use d_mcp::config::{HarnessSet, Selection};
-use d_mcp::definition::parse_definition;
+use d_mcp::definition::{OverrideSites, parse_definition};
 use d_mcp::resolver::{FileEntry, FileProblem, SourceSnapshot, resolve};
 use d_mcp::rule::Rule;
 use proptest::prelude::*;
@@ -19,6 +19,7 @@ fn file(spec: &FileSpec, position: usize) -> FileEntry {
             file: format!("servers/Bad{position}.toml"),
             key: None,
             outcome: Err(FileProblem::file(Rule::InvalidStem)),
+            override_sites: OverrideSites::default(),
         },
         Some(index) => {
             let name = NAMES[index];
@@ -37,6 +38,7 @@ fn file(spec: &FileSpec, position: usize) -> FileEntry {
                 file: format!("servers/{name}.toml"),
                 key: Some(name.to_owned()),
                 outcome,
+                override_sites: OverrideSites::default(),
             }
         }
     }

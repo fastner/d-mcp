@@ -1,0 +1,10 @@
+name = "http-cwd-with-other-keys"
+[transport]
+type = "http"
+url = "https://mcp.example.com/mcp"
+[auth]
+type = "bearer_env"
+var = "TOKEN_VAR"
+[harness.codex]
+enabled = false
+cwd = "/srv/http"

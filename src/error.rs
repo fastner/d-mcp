@@ -30,7 +30,7 @@ pub const EXIT_ENVIRONMENT: u8 = 4;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A d-mcp error.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
     /// The store directory has no `config.toml`.
     #[error("the store at {} is not initialized; run `d-mcp init`", path.display())]
@@ -160,6 +160,103 @@ pub enum Error {
     /// The current directory cannot be determined.
     #[error("the current directory cannot be determined")]
     CurrentDirUnavailable,
+    /// A harness configuration file changed between d-mcp's read and its
+    /// persist, or its symlink was retargeted. Nothing was written.
+    #[error(
+        "{} changed while d-mcp was editing it; nothing was written, run the command again",
+        path.display()
+    )]
+    HarnessFileChanged {
+        /// The harness file, as resolved before following symlinks.
+        path: PathBuf,
+    },
+    /// A harness configuration file is not valid TOML, not UTF-8 or not a
+    /// regular file. It is reported by position only.
+    #[error(
+        "{} is {reason}{}; fix it by hand, d-mcp will not edit it",
+        path.display(),
+        position.map_or_else(String::new, |(line, column)| format!(" at line {line}, column {column}"))
+    )]
+    HarnessConfigInvalid {
+        /// The harness file.
+        path: PathBuf,
+        /// What is wrong: `not valid TOML`, `not UTF-8` or `not a regular file`.
+        reason: &'static str,
+        /// 1-based line and column, for a syntax error.
+        position: Option<(usize, usize)>,
+    },
+    /// d-mcp could not produce a valid edit of a harness file: the spliced
+    /// text did not parse, or it changed something outside the plan. Nothing
+    /// was written.
+    #[error(
+        "d-mcp could not produce a valid edit of {}; nothing was written, please report this",
+        path.display()
+    )]
+    HarnessEditFailed {
+        /// The harness file.
+        path: PathBuf,
+    },
+    /// A harness configuration path is not valid UTF-8, so the write state
+    /// cannot record it.
+    #[error("the {harness} configuration path is not valid UTF-8; d-mcp cannot record it")]
+    HarnessPathNotUtf8 {
+        /// The harness.
+        harness: &'static str,
+    },
+    /// A harness file did not read back as written.
+    #[error(
+        "{} did not read back as written; {}",
+        path.display(),
+        if *restored {
+            "the original content was restored"
+        } else {
+            "restoring the original content FAILED, check the file by hand"
+        }
+    )]
+    HarnessVerifyFailed {
+        /// The harness file.
+        path: PathBuf,
+        /// Whether the original bytes were restored.
+        restored: bool,
+    },
+    /// `state.toml` breaks a rule. It is never rewritten.
+    #[error(
+        "{} is corrupt at line {line}, column {column}{}; fix or remove it by hand, d-mcp will not rewrite it",
+        path.display(),
+        if field.is_empty() { String::new() } else { format!(", field `{field}`") }
+    )]
+    StateCorrupt {
+        /// The file.
+        path: PathBuf,
+        /// 1-based line.
+        line: usize,
+        /// 1-based column.
+        column: usize,
+        /// The field path.
+        field: String,
+    },
+    /// At least one entry was blocked during `sync`.
+    #[error(
+        "{count} entr{} blocked (drift, collision, location change, unsupported style or an important gap); see the report",
+        if *count == 1 { "y is" } else { "ies are" }
+    )]
+    SyncBlocked {
+        /// The number of blocked entries.
+        count: usize,
+    },
+    /// `unmanage` of a server without a write-state record.
+    #[error("`{server}` is not managed by d-mcp in the requested harnesses")]
+    NotManaged {
+        /// The server name.
+        server: String,
+    },
+    /// `sync --take-over` names a server that is neither selected nor
+    /// recorded.
+    #[error("`{name}` is neither selected nor managed; nothing to take over")]
+    UnknownTakeOver {
+        /// The name.
+        name: String,
+    },
     /// A file-system operation failed.
     #[error("cannot {operation} {}: {}", path.display(), io::Error::from(*kind))]
     Io {
@@ -205,6 +302,15 @@ impl Error {
             Error::ConfigCorrupt { .. } => "config-corrupt",
             Error::SchemaUnsupported { .. } => "schema-unsupported",
             Error::StoreLocked { .. } => "store-locked",
+            Error::HarnessFileChanged { .. } => "harness-file-changed",
+            Error::HarnessConfigInvalid { .. } => "harness-config-invalid",
+            Error::HarnessVerifyFailed { .. } => "harness-verify-failed",
+            Error::HarnessEditFailed { .. } => "harness-edit-failed",
+            Error::HarnessPathNotUtf8 { .. } => "harness-path-not-utf8",
+            Error::StateCorrupt { .. } => "state-corrupt",
+            Error::SyncBlocked { .. } => "sync-blocked",
+            Error::NotManaged { .. } => "not-managed",
+            Error::UnknownTakeOver { .. } => "unknown-take-over",
             Error::HomeUnset => "home-unset",
             Error::CurrentDirUnavailable => "cwd-unavailable",
             Error::Io { .. } => "io-error",
@@ -229,11 +335,22 @@ impl Error {
             | Error::SourcePathRegistered { .. }
             | Error::SourcePathInStore { .. }
             | Error::SourceNotFound { .. }
-            | Error::NotSelected { .. } => EXIT_FAILURE,
+            | Error::NotSelected { .. }
+            | Error::SyncBlocked { .. }
+            | Error::NotManaged { .. }
+            | Error::UnknownTakeOver { .. } => EXIT_FAILURE,
             Error::ConfigCorrupt { .. }
             | Error::SchemaUnsupported { .. }
-            | Error::StoreLocked { .. } => EXIT_UNSAFE,
-            Error::HomeUnset | Error::CurrentDirUnavailable | Error::Io { .. } => EXIT_ENVIRONMENT,
+            | Error::StoreLocked { .. }
+            | Error::HarnessFileChanged { .. }
+            | Error::HarnessConfigInvalid { .. }
+            | Error::HarnessVerifyFailed { .. }
+            | Error::HarnessEditFailed { .. }
+            | Error::StateCorrupt { .. } => EXIT_UNSAFE,
+            Error::HomeUnset
+            | Error::CurrentDirUnavailable
+            | Error::HarnessPathNotUtf8 { .. }
+            | Error::Io { .. } => EXIT_ENVIRONMENT,
         }
     }
 
@@ -284,6 +401,31 @@ impl Error {
                 found: 2,
             },
             Error::StoreLocked { path: path.clone() },
+            Error::HarnessFileChanged { path: path.clone() },
+            Error::HarnessConfigInvalid {
+                path: path.clone(),
+                reason: "not valid TOML",
+                position: Some((2, 3)),
+            },
+            Error::HarnessVerifyFailed {
+                path: path.clone(),
+                restored: true,
+            },
+            Error::HarnessEditFailed { path: path.clone() },
+            Error::HarnessPathNotUtf8 { harness: "codex" },
+            Error::StateCorrupt {
+                path: path.clone(),
+                line: 1,
+                column: 1,
+                field: "records[0].sent".into(),
+            },
+            Error::SyncBlocked { count: 2 },
+            Error::NotManaged {
+                server: "github".into(),
+            },
+            Error::UnknownTakeOver {
+                name: "github".into(),
+            },
             Error::HomeUnset,
             Error::CurrentDirUnavailable,
             Error::Io {
@@ -314,6 +456,15 @@ impl Error {
                 | Error::ConfigCorrupt { .. }
                 | Error::SchemaUnsupported { .. }
                 | Error::StoreLocked { .. }
+                | Error::HarnessFileChanged { .. }
+                | Error::HarnessConfigInvalid { .. }
+                | Error::HarnessVerifyFailed { .. }
+                | Error::HarnessEditFailed { .. }
+                | Error::HarnessPathNotUtf8 { .. }
+                | Error::StateCorrupt { .. }
+                | Error::SyncBlocked { .. }
+                | Error::NotManaged { .. }
+                | Error::UnknownTakeOver { .. }
                 | Error::HomeUnset
                 | Error::CurrentDirUnavailable
                 | Error::Io { .. } => {}
@@ -389,6 +540,42 @@ mod tests {
         assert!(!error.to_string().contains("ghp_secret"));
         assert_eq!(error.code(), "io-error");
         assert_eq!(error.exit_code(), EXIT_ENVIRONMENT);
+    }
+
+    #[test]
+    fn harness_hints_name_positions_only() {
+        let invalid = Error::HarnessConfigInvalid {
+            path: PathBuf::from("/c/config.toml"),
+            reason: "not valid TOML",
+            position: Some((4, 2)),
+        };
+        assert_eq!(
+            invalid.hint(),
+            "/c/config.toml is not valid TOML at line 4, column 2; fix it by hand, d-mcp will not edit it"
+        );
+        let regular = Error::HarnessConfigInvalid {
+            path: PathBuf::from("/c/config.toml"),
+            reason: "not a regular file",
+            position: None,
+        };
+        assert!(regular.hint().contains("not a regular file; fix"));
+        let failed = Error::HarnessVerifyFailed {
+            path: PathBuf::from("/c/config.toml"),
+            restored: false,
+        };
+        assert!(failed.hint().contains("FAILED"));
+        assert!(
+            Error::SyncBlocked { count: 1 }
+                .hint()
+                .starts_with("1 entry is")
+        );
+        let state = Error::StateCorrupt {
+            path: PathBuf::from("/s/state.toml"),
+            line: 2,
+            column: 1,
+            field: String::new(),
+        };
+        assert!(state.hint().contains("line 2, column 1; fix"));
     }
 
     #[test]

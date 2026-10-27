@@ -73,6 +73,9 @@ pub enum Harness {
 }
 
 impl Harness {
+    /// Every known harness, in a stable order.
+    pub const ALL: [Harness; 2] = [Harness::Claude, Harness::Codex];
+
     /// The stable string form.
     #[must_use]
     pub fn as_str(self) -> &'static str {

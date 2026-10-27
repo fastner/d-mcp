@@ -1,0 +1,16 @@
+# Codex configuration, maintained by hand.
+model = "o3"
+
+[mcp_servers.foreign]
+command = "foreign"
+
+# Comment directly above the header d-mcp manages after a take-over.
+[mcp_servers.github]
+command = "old-command"
+
+[mcp_servers.github.env]
+OLD = "value" # same-line comment
+
+# Trailing comment after the last table; d-mcp must keep it.
+
+# Another trailing comment.

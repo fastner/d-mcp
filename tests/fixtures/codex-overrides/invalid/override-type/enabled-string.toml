@@ -1,0 +1,6 @@
+name = "enabled-string"
+[transport]
+type = "stdio"
+command = "npx"
+[harness.codex]
+enabled = "true"

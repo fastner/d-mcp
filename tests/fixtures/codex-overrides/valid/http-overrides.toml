@@ -1,0 +1,10 @@
+name = "http-overrides"
+[transport]
+type = "http"
+url = "https://mcp.example.com/mcp"
+[harness.codex]
+enabled = false
+required = true
+startup_timeout_sec = 15.5
+enabled_tools = ["search"]
+disabled_tools = ["write"]

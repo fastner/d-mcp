@@ -151,6 +151,32 @@ impl<'a> Ui<'a> {
         Ok(())
     }
 
+    /// Prints a report that may come with an aggregate error, and returns
+    /// the exit code: the error's, or as [`Ui::success`] without one. With
+    /// `--json` the envelope carries `data` either way, with `ok: false` and
+    /// the error when there is one (the `sync` extension of the envelope);
+    /// in text mode the report goes to stdout and the error to stderr.
+    pub fn finish(&mut self, report: &Report, error: Option<&Error>) -> u8 {
+        let Some(error) = error else {
+            return self.success(report);
+        };
+        let result = if self.json {
+            let document = envelope(Some(&report.data), &report.problems, Some(error));
+            writeln!(self.out, "{document:#}")
+        } else {
+            self.print_text(report).and_then(|()| {
+                writeln!(
+                    self.err,
+                    "error: {} [{}]",
+                    escape_control(&error.hint(), &[]),
+                    error.code()
+                )
+            })
+        };
+        self.record(result);
+        error.exit_code()
+    }
+
     /// Prints an error and returns its exit code. With `--json` the envelope
     /// goes to stdout; otherwise the message goes to stderr.
     pub fn failure(&mut self, error: &Error) -> u8 {
@@ -237,6 +263,27 @@ mod tests {
         assert_eq!(ui.success(&Report::new(json!({"a": 1}), String::new())), 0);
         let parsed: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed["data"]["a"], 1);
+    }
+
+    #[test]
+    fn finish_carries_data_with_an_error() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut ui = Ui::new(true, &mut out, &mut err);
+        let report = Report::new(json!({"harnesses": []}), "text".into());
+        let error = Error::SyncBlocked { count: 1 };
+        assert_eq!(ui.finish(&report, Some(&error)), 1);
+        let parsed: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["data"]["harnesses"], json!([]));
+        assert_eq!(parsed["error"]["code"], "sync-blocked");
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut ui = Ui::new(false, &mut out, &mut err);
+        assert_eq!(ui.finish(&report, Some(&error)), 1);
+        assert_eq!(ui.finish(&report, None), 0);
+        assert_eq!(String::from_utf8(out).unwrap(), "text\ntext\n");
+        assert!(String::from_utf8(err).unwrap().contains("[sync-blocked]"));
     }
 
     #[test]

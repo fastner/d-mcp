@@ -1,15 +1,14 @@
 //! Canonical JSON and the two definition hashes.
 //!
 //! The canonical JSON is the model after defaults with sorted keys and no
-//! whitespace. Keys are sorted explicitly by [`write_canonical`], byte-wise,
-//! so the result does not depend on whether `serde_json`'s `preserve_order`
-//! feature is enabled somewhere in the dependency graph.
+//! whitespace, written by the shared [`crate::canonical`] writer.
 //! Integers and floats stay distinct; floats use `serde_json`'s shortest
 //! round-trip form, and NaN or infinity never reach this module because the
 //! walker rejects them.
 
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
+
+use crate::canonical::{tagged_sha256, write_canonical};
 
 use super::{Auth, Definition, EnvValue, Transport};
 
@@ -69,38 +68,6 @@ pub fn canonical_json(definition: &Definition, full: bool) -> String {
     out
 }
 
-/// Writes a JSON value without whitespace and with every object's keys
-/// sorted byte-wise. Strings and numbers use `serde_json`'s encoding.
-fn write_canonical(value: &Value, out: &mut String) {
-    match value {
-        Value::Object(object) => {
-            let mut entries: Vec<(&String, &Value)> = object.iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(b.0));
-            out.push('{');
-            for (position, (key, item)) in entries.into_iter().enumerate() {
-                if position > 0 {
-                    out.push(',');
-                }
-                out.push_str(&Value::String(key.clone()).to_string());
-                out.push(':');
-                write_canonical(item, out);
-            }
-            out.push('}');
-        }
-        Value::Array(items) => {
-            out.push('[');
-            for (position, item) in items.iter().enumerate() {
-                if position > 0 {
-                    out.push(',');
-                }
-                write_canonical(item, out);
-            }
-            out.push(']');
-        }
-        scalar => out.push_str(&scalar.to_string()),
-    }
-}
-
 fn auth_value(auth: &Auth) -> Value {
     match auth {
         Auth::OAuth {
@@ -128,18 +95,6 @@ fn auth_value(auth: &Auth) -> Value {
         }
         Auth::None => json!({ "type": "none" }),
     }
-}
-
-fn tagged_sha256(tag: &str, body: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(tag.as_bytes());
-    hasher.update(b"\n");
-    hasher.update(body.as_bytes());
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }
 
 pub(super) fn definition_hash(definition: &Definition) -> String {
@@ -184,24 +139,6 @@ mod tests {
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
         );
         assert_ne!(hash, definition.core_hash());
-    }
-
-    #[test]
-    fn canonical_writer_sorts_keys_regardless_of_insertion_order() {
-        // Build objects whose insertion order is reversed; with
-        // `preserve_order` a plain `to_string` would keep that order.
-        let mut inner = Map::new();
-        inner.insert("z".to_owned(), json!(1));
-        inner.insert("a".to_owned(), json!([{"y": 1.5, "b": null}, "s\"q"]));
-        let mut outer = Map::new();
-        outer.insert("b".to_owned(), Value::Object(inner));
-        outer.insert("a".to_owned(), json!(true));
-        let mut out = String::new();
-        write_canonical(&Value::Object(outer), &mut out);
-        assert_eq!(
-            out,
-            r#"{"a":true,"b":{"a":[{"b":null,"y":1.5},"s\"q"],"z":1}}"#
-        );
     }
 
     #[test]

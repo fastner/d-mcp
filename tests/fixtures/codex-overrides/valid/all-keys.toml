@@ -1,0 +1,12 @@
+name = "all-keys"
+[transport]
+type = "stdio"
+command = "npx"
+[harness.codex]
+cwd = "/srv/all-keys"
+enabled = true
+required = false
+startup_timeout_sec = 20
+tool_timeout_sec = 12.5
+enabled_tools = ["search", "read"]
+disabled_tools = []
