@@ -97,7 +97,11 @@ fn relative_and_tilde_store_paths_are_resolved() {
     assert_eq!(code, 0);
     assert_eq!(
         value["data"]["store"],
-        env.work().join("rel/store").to_str().unwrap()
+        fs::canonicalize(env.work())
+            .unwrap()
+            .join("rel/store")
+            .to_str()
+            .unwrap()
     );
     let output = env
         .cmd()
