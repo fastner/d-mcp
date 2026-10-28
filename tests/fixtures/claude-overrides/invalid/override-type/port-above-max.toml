@@ -1,0 +1,6 @@
+name = "port-above-max"
+[transport]
+type = "http"
+url = "https://mcp.example.test/mcp"
+[harness.claude]
+oauth_callback_port = 65536

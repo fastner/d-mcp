@@ -1,0 +1,6 @@
+name = "env-table"
+[transport]
+type = "stdio"
+command = "npx"
+[harness.claude.env]
+MODE = "fast"

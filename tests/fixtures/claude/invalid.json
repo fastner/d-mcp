@@ -1,0 +1,6 @@
+{
+  "userID": "CANARY_CLAUDE_USER_ID",
+  "mcpServers": {
+    "a": { "command": CANARY_CLAUDE_BROKEN }
+  }
+}

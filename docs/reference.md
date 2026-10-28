@@ -1,8 +1,8 @@
 # d-mcp reference
 
 This is the reference for d-mcp: the store, the definition format, the secret rules, sources,
-selections, resolution, override validation, sync with the Codex adapter, the write state, exit and
-error codes, and the JSON documents. Later work packages (the Claude Code adapter, adoption,
+selections, resolution, override validation, sync with the Codex and Claude Code adapters, the
+write state, exit and error codes, and the JSON documents. Later work packages (adoption,
 approvals) build on it.
 
 ## Commands
@@ -16,8 +16,8 @@ approvals) build on it.
 | `d-mcp select <server> [--harness claude\|codex]...` | mutating | Select a server for harnesses. |
 | `d-mcp unselect <server>` | mutating | Remove a selection. |
 | `d-mcp resolve` | read-only | Resolve every selection against the sources. |
-| `d-mcp sync [--harness codex]... [--take-over <server>]... [--relocate]` | mutating | Write the selected servers into the harnesses (see [Sync](#sync)). |
-| `d-mcp unmanage <server> [--harness codex]...` | mutating | Stop managing a server's harness entries (see [Unmanage](#unmanage)). |
+| `d-mcp sync [--harness claude\|codex]... [--take-over <server>]... [--relocate]` | mutating | Write the selected servers into the harnesses (see [Sync](#sync)). |
+| `d-mcp unmanage <server> [--harness claude\|codex]...` | mutating | Stop managing a server's harness entries (see [Unmanage](#unmanage)). |
 
 Global options, accepted before or after the command:
 
@@ -218,8 +218,9 @@ Writing one of these defaults explicitly is equivalent to omitting it; both hash
 Server names and source ids use lowercase letters, digits, `-` and `_`. A name starts with a letter
 or digit, does not end with `-` or `_`, contains no `__`, and has at most 32 characters
 (`name-rule`). The limit follows from a 64-character model tool-name limit minus `mcp__` and `__`,
-which leaves at least 25 characters for tool names; WP3 re-verifies the 64-character assumption.
-Reserved names are adapter-specific (WP2, WP3).
+which leaves at least 25 characters for tool names. Claude Code 2.1.310 validates tool names
+against `^[a-zA-Z0-9_-]{1,64}$` (found in the binary; not observed through a model call).
+Reserved names are adapter-specific (see [Claude Code mapping](#claude-code-mapping)).
 
 ### URL rules
 
@@ -404,6 +405,19 @@ The preserved keys `oauth.client_secret`, `oauth.callback_url` and `oauth.callba
 excluded (and an `oauth` table that only held them). They are skipped while the entry is read, so
 their values never enter any model, hash or output.
 
+For the Claude Code adapter both hashes use the tag `d-mcp-claude-entry-v1` over the canonical
+JSON of the whole `mcpServers.<name>` value, every key included, so they are comparable as well.
+The same canonical form is applied to the rendering and to the entry read back, and it absorbs the
+normalization Claude Code applies when it writes an entry (verified against Claude Code 2.1.310):
+
+- `type = "stdio"` is Claude Code's default and is removed;
+- an empty `args` (which Claude Code adds to every stdio entry), `env` or `headers` is removed;
+- integral numbers get the integer form (`30000.0` becomes `30000`); keys are sorted.
+
+Claude Code also drops keys it does not know; d-mcp never renders such keys. A normalization the
+canonical form does not absorb makes the read-back verification fail (`harness-verify-failed`)
+instead of silently losing ownership.
+
 ## Sources and selections
 
 - `source add <path> --id <id> --priority <n>` registers a directory. `~` and relative paths are
@@ -474,14 +488,24 @@ Deliberately excluded in v1 for security reasons: `default_tools_approval_mode`,
 (`tools.<tool>.approval_mode`), `http_headers_helper` (it runs a local command) and
 `experimental_environment`. An owned entry that contains them counts as drift.
 
-`harness.claude` stays opaque until the Claude Code adapter (WP3), which will newly invalidate
-definitions with unknown Claude keys.
+The `harness.claude` allow-list:
+
+| Key | Type | Transport |
+|---|---|---|
+| `timeout` | integer milliseconds, `1000` to `31536000000` (365 days); Claude Code ignores values below one second | any |
+| `oauth_callback_port` | integer port, `1024` to `65535` | any (used only with `auth.type = "oauth"`) |
+
+Deliberately excluded: `headersHelper` and `headers_helper` (it runs a local command, like Codex's
+`http_headers_helper`) and `env` (environment entries belong to the neutral definition). Any other
+key is invalid. Since the Claude Code adapter exists, a definition with an unknown `harness.claude`
+key, which was opaque before, is invalid too, and the server is held for every harness, Codex
+included.
 
 ## Sync
 
-`sync` writes every selected, resolved server into each harness that has an adapter (Codex in this
-version), at user scope. `--harness` limits it to the named harnesses; a harness without an adapter
-(`claude`) is a usage error (exit 2).
+`sync` writes every selected, resolved server into each harness that has an adapter (Codex and
+Claude Code), at user scope. `--harness` limits it to the named harnesses (`claude`, `codex`); any
+other value is a usage error (exit 2).
 
 ### Operations
 
@@ -497,17 +521,17 @@ contains.
 | `drift` | recorded, the actual hash differs from the recorded read-back hash | Reported only (exit 1). |
 | `collision` | desired, not recorded, a same-name entry exists | Reported only (exit 1). |
 | `identical-collision` | a collision whose content equals the rendering | Reported only (exit 1); `--take-over` resolves it without a write. |
-| `vanished` | recorded, desired, absent | Re-added, with the notice "removed outside d-mcp; run `d-mcp unmanage <server> --harness codex` to keep it removed". |
+| `vanished` | recorded, desired, absent | Re-added, with the notice "removed outside d-mcp; run `d-mcp unmanage <server> --harness <harness>` to keep it removed". |
 | `held` | the resolver holds the server (`invalid-winner`, `source-unavailable`), or a recorded, still-selected server is `not-offered` | The entry is left unchanged; `reason` names why. A held server without a record plans nothing. |
 | `orphaned` | recorded, not desired, absent | The record is dropped. |
-| `location-changed` | the recorded file differs from the resolved one (for example after `CODEX_HOME` changed) | Reported (exit 1); nothing is planned for that harness until `sync --relocate`. |
+| `location-changed` | the recorded file differs from the resolved one (for example after `CODEX_HOME` or `CLAUDE_CONFIG_DIR` changed); the notice names the variable | Reported (exit 1); nothing is planned for that harness until `sync --relocate`. |
 | `blocked` | the rendering has an `important` gap | Not written (exit 1). |
-| `unsupported` | an owned entry was rewritten in an inline or dotted-key style | Left untouched (exit 1). |
+| `unsupported` | an owned entry was rewritten in a style d-mcp does not edit (Codex: an inline or dotted-key table; Claude Code: not a JSON object) | Left untouched (exit 1). |
 | `unchanged` | nothing to do | A changed definition hash with an identical rendering only refreshes the record. |
 
 The planner never compares a rendered entry with the read-back entry directly, except to detect an
-identical collision in adapters whose two hashes are comparable (Codex: yes). Without
-`--take-over`, a drifted entry is never modified.
+identical collision in adapters whose two hashes are comparable (Codex and Claude Code: yes).
+Without `--take-over`, a drifted entry is never modified.
 
 - A drifted entry that is still selected suggests `sync --take-over`. A drifted entry that is no
   longer selected suggests `unmanage` (or selecting it again) instead, because a take-over would
@@ -529,8 +553,10 @@ gap blocks the entry. Codex `note` gaps: `auth = none` (Codex falls back to OAut
 `oauth_supported` flag on `bearer_env` (Codex ignores it), and `client_secret_env` (a manual step,
 see [Codex mapping](#codex-mapping); it is not reported once the entry has an
 `oauth.client_secret`). Keys of another harness's override block that a harness cannot enforce are
-reported as `important` gaps by that harness's adapter; the Claude Code adapter (WP3) does this for
-`harness.codex.disabled_tools` and `enabled_tools`.
+reported as `important` gaps by that harness's adapter; the Claude Code adapter does this for
+`harness.codex.disabled_tools` and `enabled_tools`, so such a definition is not written to Claude
+Code (Codex proceeds). For the Claude Code gaps, see [Claude Code mapping](#claude-code-mapping).
+A reserved name is an `important` gap on `name` for that harness.
 
 ### Write state and recovery
 
@@ -552,6 +578,19 @@ keep the `mcp_servers` root editable, keep every entry outside the plan with its
 exactly the planned entries. Otherwise the harness fails with `harness-edit-failed` (exit 3) and
 nothing is written.
 
+The Codex adapter journals all operations at once before its single persist. The Claude Code
+adapter writes through the `claude` CLI one operation at a time, journals each intent right before
+its call, and reports a separate outcome per entry: `applied` (the record is promoted),
+`failed` (the pending record is settled against the file: reverted, dropped or, when the write did
+take effect, promoted), `rolled-back` or `lost` (see
+[Claude Code mapping](#claude-code-mapping)), or a `drift` found right before a removal. A harness
+with a failed entry has the status `failed` and carries the most severe entry error; the other
+entries keep their own outcomes.
+
+Every record carries a provenance marker (`written` in `state.toml`): it is set when d-mcp's own
+write is promoted and cleared by `--take-over` (and by WP4 adoption). The Claude Code adapter rolls
+back only entries with the marker, so foreign content never reaches a command line.
+
 ### Dry run and lock
 
 `sync` and `unmanage` fail on an uninitialized store before locking. `sync` holds the store lock
@@ -563,17 +602,18 @@ creates no file or directory, and treats a settled `pending` record as owned for
 
 Until WP4, sync output (text, JSON and errors) names only the harness, scope, file path, entry
 name, operation, outcome, hold reason, gaps and positions, plus the hashes of owned entries. It
-never contains field values, hashes of foreign or unowned entries, child process output or
-`toml_edit` error text.
+never contains field values, hashes of foreign or unowned entries, child process output, or
+`toml_edit` or `serde_json` error text. Shadowing notices name the entry and the project path
+only.
 
 ### Sync exit codes
 
 | Exit | When |
 |---:|---|
 | 0 | Everything was applied, unchanged, held or re-added after `vanished`, or the harness is not present. `note` gaps do not change the code. |
-| 1 | `sync-blocked`: at least one entry is blocked by drift, a collision, a location change, an unsupported entry or root style, or an `important` gap. |
+| 1 | `sync-blocked`: at least one entry is blocked by drift, a collision, a location change, an unsupported entry or root style, or an `important` gap; `harness-cli-failed`: a harness CLI call of an entry failed; `harness-no-neutral-dir`: no neutral working directory for a harness CLI, so nothing was run for that harness. |
 | 3 | `harness-file-changed`, `harness-config-invalid`, `harness-edit-failed`, `harness-verify-failed`; also `state-corrupt` and `schema-unsupported` for `state.toml`. |
-| 4 | An environment problem (`io-error`, `home-unset`, `harness-path-not-utf8`). |
+| 4 | An environment problem (`io-error`, `home-unset`, `harness-path-not-utf8`, `harness-cli-not-found`, `harness-cli-timeout`). |
 
 Across harnesses the highest-priority code wins, in the order 3, 4, 1, 0. Global errors
 (`store-locked`, `config-corrupt`, `state-corrupt`, an uninitialized store, `unknown-take-over`)
@@ -581,7 +621,7 @@ abort before any harness is touched; they carry no `data`.
 
 ## Unmanage
 
-`unmanage <server> [--harness codex]` removes the server's write-state records (without
+`unmanage <server> [--harness claude|codex]` removes the server's write-state records (without
 `--harness`: for every harness with a record) and drops those harnesses from the server's
 selection. The harness entries are left as they are, so the next sync reports no collision.
 
@@ -589,8 +629,8 @@ selection. The harness entries are left as they are, so the next sync reports no
   the unmanaged ones; the conversion is reported. An empty result removes the selection.
 - The record is removed before the selection is written, so a crash in between can only cause a
   collision on the next sync, never the removal of the entry.
-- A server without a record fails with `not-managed` (exit 1). A `--harness` value without an
-  adapter (`claude`) is a usage error (exit 2).
+- A server without a record fails with `not-managed` (exit 1). An unknown `--harness` value is a
+  usage error (exit 2).
 
 ## Codex mapping
 
@@ -692,6 +732,187 @@ storage, and child output is never printed: it is parsed in memory only, because
 echo foreign secrets. On a timeout only the direct child is killed; a grandchild (such as the native
 binary behind the npm shim) may outlive it.
 
+## Claude Code mapping
+
+The Claude Code adapter writes through the `claude` CLI and only reads Claude Code's configuration
+file; d-mcp never opens that file for writing. Its declarations: apply mode `harness-cli` (one CLI
+call per operation), discovery and write scope `user`, comparable sent and read-back hashes, the
+reserved names below, entries can vanish on their own (see [Limits](#limits)), verified against
+Claude Code `2.1.310`.
+
+### Location and presence
+
+- The file is resolved like Claude Code 2.1.310 does it (verified with separate `HOME` and
+  `CLAUDE_CONFIG_DIR` tempdirs): a legacy `.config.json` in the configuration directory
+  (`$CLAUDE_CONFIG_DIR`, otherwise `$HOME/.claude`) wins when it exists; otherwise
+  `$CLAUDE_CONFIG_DIR/.claude.json`, or `$HOME/.claude.json` without `CLAUDE_CONFIG_DIR`. A
+  `CLAUDE_CONFIG_DIR` that is exported but empty is not the same as unset: Claude Code 2.1.310 then
+  resolves its configuration home relative to its working directory, so it ignores
+  `$HOME/.claude/.config.json`, would prefer a legacy `<cwd>/.config.json`, and writes a full
+  backup of the configuration file to `<cwd>/backups/` on every change. d-mcp passes the empty
+  value on to `claude`, but always runs it from a fresh, empty temporary directory, never the store
+  root, and removes that directory with its `backups/` afterwards; there the legacy file cannot
+  exist, so both use `$HOME/.claude.json`. With `CLAUDE_CONFIG_DIR` set or unset, Claude Code keeps
+  its backups in `$CLAUDE_CONFIG_DIR/backups/` or `$HOME/.claude/backups/`, which d-mcp does not
+  manage. A relative one is resolved against the current directory.
+  The recorded path is the file as resolved before following symlinks; a path that is not valid
+  UTF-8 fails with `harness-path-not-utf8` (exit 4). A changed `CLAUDE_CONFIG_DIR` is a
+  `location-changed`, and the notice names the variable.
+- Claude Code counts as present when its file exists or a `claude` executable is on `PATH`. If
+  neither exists, it is `not-present` (exit 0) and nothing is created.
+- File present, `claude` missing: planning runs as usual, dry runs included. With operations, the
+  harness fails with `harness-cli-not-found` (exit 4) before anything is journaled; without
+  operations, it is `synced` with the notice "the harness CLI is not on PATH; d-mcp writes this harness only
+  through it". Codex proceeds in
+  both cases.
+- `claude` present, file missing: the first `add-json` creates it (`created: true`).
+- Only user-scope entries (top-level `mcpServers`) are written. Project scope (`.mcp.json`) is not
+  handled; local-scope entries (`projects.<path>.mcpServers`) are read by name only, to report
+  shadowing.
+
+### Reading
+
+d-mcp deserializes only the user-scope `mcpServers.<name>` values (every key of each entry, for the
+hash) and the names of each project's local-scope `mcpServers`; every other key, such as account
+data, caches and history, is skipped unread, and no file bytes are kept. Invalid JSON (also a top
+level that is not an object, or non-UTF-8 content) is retried once after a short delay, because a
+running Claude Code session can be in the middle of rewriting the file, and then fails with
+`harness-config-invalid` (exit 3), reported by line and column only. An `mcpServers` that is not a
+JSON object makes the harness `unsupported` (exit 1); an owned entry that is not an object is
+`unsupported`.
+
+### Rendering
+
+| Definition | Claude Code entry |
+|---|---|
+| stdio `command`, `args` | `command`, `args` (omitted when empty) |
+| `env` forward | `env` `"<VAR>": "${<VAR>:-}"` |
+| `env` literal | `env` `"<VAR>": "<value>"` |
+| http `url` | `type = "http"`, `url` |
+| `bearer_env` `var` | `headers` `"Authorization": "Bearer ${<var>}"` |
+| `header_env` | `headers` `"<header>": "${<var>}"` |
+| `oauth` `client_id` | `oauth.clientId` |
+| `oauth` `scopes` | `oauth.scopes`, joined with spaces (omitted when empty) |
+| `harness.claude.oauth_callback_port` | `oauth.callbackPort` (OAuth only; otherwise ignored with a `note` gap) |
+| `harness.claude.timeout` | `timeout` (milliseconds) |
+| `client_secret_env` | not rendered; see below |
+
+- Forwards use `${VAR:-}`: Claude Code 2.1.310 passes an unset `${VAR}` to the server as the
+  literal text `${VAR}` (with a "missing environment variables" warning for that server only),
+  while `${VAR:-}` reads as empty. This differs from Codex, which does not set an unset variable at
+  all. Claude Code passes its own environment to stdio servers as well. Headers use `${VAR}`, so
+  Claude Code's own diagnostics name a missing variable. WP1's `variable-syntax` rule keeps `$` and
+  `${` out of literals.
+- `client_secret_env`: on Add and Update, d-mcp calls `add-json --client-secret` and puts the
+  variable's value into `MCP_CLIENT_SECRET` of the child environment only; it never appears in
+  arguments, output, logs or files written by d-mcp. Setting or rotating the variable later does
+  not cause a write. When it is unset, the entry is added without a secret and that write reports a
+  manual step (`note` gap on `auth.client_secret_env`): set the variable, run `claude mcp remove -s
+  user <name>`, and the next `d-mcp sync` re-adds the entry with the secret.
+- `note` gaps: `auth = none` (Claude Code falls back to OAuth discovery), `oauth_supported` on
+  `bearer_env` (Claude Code sends the bearer token), `harness.codex.cwd` (Claude Code has no
+  working-directory setting), and an ignored `oauth_callback_port`.
+- `important` gaps (the entry is not written to Claude Code; Codex proceeds):
+  `harness.codex.enabled_tools` and `harness.codex.disabled_tools` (Claude Code has no per-server
+  tool filter), a credential name (below) and a reserved name.
+
+### Credential names
+
+Claude Code reads some variable names as empty in a remote server's `url` and `headers`, and
+ignores a `:-default` for them. A `bearer_env` or `header_env` variable of an `http` server with
+such a name is an `important` gap on `auth.var`. stdio forwards are not checked. The list, kept in
+`src/adapter/claude.rs`:
+
+- the names documented at code.claude.com/docs/en/mcp and observed with 2.1.310 through a local
+  HTTP endpoint: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_FOUNDRY_API_KEY`,
+  `AWS_BEARER_TOKEN_BEDROCK`, `AWS_SECRET_ACCESS_KEY`, `CODEARTIFACT_AUTH_TOKEN`, `HTTPS_PROXY`,
+  `NPM_TOKEN`;
+- by decision, conservatively, every name starting with `ANTHROPIC_` (except
+  `ANTHROPIC_BASE_URL`) or `AWS_`, and every name ending in `_PROXY` (case-insensitive). Claude
+  Code 2.1.310 still expands some of them (such as `AWS_ACCESS_KEY_ID`); they are blocked anyway.
+
+A name outside the list, such as `API_KEY` or `GITHUB_TOKEN`, expands as written. The list can be
+incomplete.
+
+### Reserved names
+
+`workspace`, `claude-in-chrome`, `computer-use`, `Claude Preview` and `Claude Browser`
+(code.claude.com/docs/en/mcp; `claude mcp add-json` rejects `workspace` in 2.1.310). The neutral
+name rule already excludes the last two. Such an entry is blocked before any CLI call; a rejection
+by the CLI stays a per-entry failure.
+
+### Write rules
+
+1. Add: `claude mcp add-json -s user [--client-secret] <name> <json>`. Remove: `claude mcp remove
+   -s user <name>`. Update: remove, then add. `-s user` is always passed; the JSON is one argument;
+   no shell is involved, and names follow the neutral name rule, so no argument starts with `-`.
+2. Every call runs from a neutral working directory: the store root, or a fresh temporary
+   directory when the store root or one of its parents has a `.mcp.json` or a project entry in the
+   file. With a `CLAUDE_CONFIG_DIR` that is set but empty, it is always a fresh temporary
+   directory, which must also hold no `.config.json`, and it is removed afterwards together with
+   the `backups/` Claude Code writes into it (see the Claude Code location rules above).
+   When the temporary directory is not neutral either, the harness fails with
+   `harness-no-neutral-dir` (exit 1) before any call. Claude Code therefore never creates or
+   touches a project entry for d-mcp's working directory. The child gets `PATH` from d-mcp's
+   environment, `HOME`, `CLAUDE_CONFIG_DIR` set (empty when d-mcp's is set but empty, removed when
+   unset), `DISABLE_AUTOUPDATER=1`, and no inherited `MCP_CLIENT_SECRET`. stdin is
+   null; there is no TTY. Child output is never printed or stored.
+3. Right before every removal, including the first step of an Update, the file is re-read and the
+   entry's hash compared with the hash it was planned from. A different hash is reported as `drift`
+   and the entry is skipped. The small window between this check and the `remove` is accepted;
+   absence is verified afterwards.
+4. After every add, the file is re-read and the entry must have the sent hash; otherwise the entry
+   fails with `harness-verify-failed` (exit 3), nothing is restored, and its pending record is
+   settled against the file: for an Add the entry is not owned (the record is dropped, so a
+   same-name entry is a `collision`); for an Update the record reverts to its previous hashes and
+   stays owned, so the next sync reports the entry as `drift` (or `vanished` when it is gone).
+5. If the add of an Update fails, the old entry, kept in memory from the drift check, is re-added
+   (`rolled-back`), but only when its record carries the provenance marker (a d-mcp rendering) and
+   with `--client-secret` when the variable is set. Otherwise, or when the rollback fails too, the
+   entry is `lost`: the notice names the removed entry's fields (names only), the record reverts to
+   its previous hashes, and the next sync re-adds the entry as `vanished`. The record is never
+   dropped. The rollback passes the client secret of the new rendering (its `client_secret_env`).
+   A `rolled-back` entry never reports the manual step of an added entry (the new entry is not in
+   place); when the restored entry has an `oauth` object and no secret was passed, it reports the
+   `note` gap "client secret needed; the restored entry has none" on `auth.client_secret_env`
+   instead.
+6. A CLI write that exits unsuccessfully is `harness-cli-failed` for that entry (exit 1; the hint
+   names program, subcommand and exit status only). A write that does not finish within 30 s is
+   stopped (`harness-cli-timeout`, exit 4); the outcome is unknown, so d-mcp re-reads the file and
+   settles the pending record from it and never rolls back blindly: an Update whose entry is gone
+   after the timeout is `lost`.
+7. `claude mcp remove` clears Claude Code's stored OAuth tokens and client secret for the entry
+   (verified against 2.1.310). An Update of a remote entry that can hold OAuth state therefore
+   reports a `note` gap "re-login needed".
+
+### Login state
+
+The adapter can read the login state of managed entries: one `claude mcp get <name>` per entry
+that can hold OAuth state (a remote entry with an `oauth` object or without static headers), run
+from a neutral working directory with the child environment above. Every other entry is
+`not-applicable` without a call; there is no `list` fallback. The `Status:` line maps as follows
+(recorded outputs of 2.1.310 are test fixtures in `tests/fixtures/claude/get/`):
+
+| `Status:` | State |
+|---|---|
+| `✔ Connected` | `logged-in` |
+| `! Needs authentication` | `needs-login` |
+| anything else (`✘ Failed to connect`), an absent entry, a missing binary, a failure, a timeout or oversized output | `unknown` |
+
+`sync` never calls it and never runs `--version`; `status --auth` (WP4) is its first consumer.
+`claude mcp get` connects to the server to check its health. d-mcp never reads Claude Code's token
+storage.
+
+### Limits
+
+- A running Claude Code session rewrites the file from memory, so it can undo a d-mcp add (the
+  entry is `vanished` on the next sync and re-added) or bring back an entry d-mcp removed (it is
+  then unowned and a `collision` if still selected).
+- A same-name local-scope entry shadows the managed user entry in that project. `sync` reports it
+  as a notice per project path. `add-json -s user` accepts a name that exists in local scope
+  (verified against 2.1.310).
+- Managed-policy deny lists can block user servers; d-mcp does not see them.
+
 ## `state.toml`
 
 ```toml
@@ -706,6 +927,7 @@ status = "owned"
 sent = "<64 hex>"
 readback = "<64 hex>"
 definition_hash = "<64 hex>"
+written = true
 time = 1793145600
 version = "0.1.0"
 ```
@@ -718,6 +940,13 @@ version = "0.1.0"
 - `status` is `owned` or `pending`. A `pending` record has `op` (`add`, `update` or `remove`), the
   expected `sent`, `readback` and `definition_hash` (not for `remove`), and the previous owned
   `prev_sent`, `prev_readback` and `prev_definition_hash` (not for an `add` of a new entry).
+- `written = true` (and `prev_written = true` for the previous hashes) is the provenance marker:
+  d-mcp itself wrote the entry with these hashes. It is absent after `--take-over`; `false` is
+  never written. Records written before the marker existed have none.
+- There is no downgrade path before 1.0: `schema_version` stays 1 when keys are added, and an older
+  d-mcp refuses a file with keys it does not know as `state-corrupt` (exit 3); for example, d-mcp
+  builds before the Claude Code adapter reject `written` and `prev_written`. Downgrading means
+  removing `state.toml` by hand, which forgets every record.
 - d-mcp writes the file atomically and in canonical form, records sorted by harness, scope and
   name. Any deviation makes it corrupt: `state-corrupt` (exit 3), reported by line, column and
   field path; another schema version fails with `schema-unsupported` (exit 3). d-mcp never
@@ -728,10 +957,10 @@ version = "0.1.0"
 | Code | Meaning | Cases |
 |---|---|---|
 | 0 | Success | Including resolution problems, holds, `note` gaps and warnings |
-| 1 | Expected failure | Store not initialized; invalid arguments; rejected `source add`; `init` into a non-empty directory that is not a store; a blocked sync entry; `unmanage` of an unmanaged server |
-| 2 | Usage error | clap usage errors (unknown flags, missing arguments, non-integer priority, a `--harness` without an adapter); clap prints them as text on stderr, also with `--json` |
+| 1 | Expected failure | Store not initialized; invalid arguments; rejected `source add`; `init` into a non-empty directory that is not a store; a blocked sync entry; a failed harness CLI call; `unmanage` of an unmanaged server |
+| 2 | Usage error | clap usage errors (unknown flags, missing arguments, non-integer priority, an unknown `--harness` value); clap prints them as text on stderr, also with `--json` |
 | 3 | Unsafe state | Corrupt or hand-broken `config.toml` or `state.toml`; unsupported schema version; `store-locked`; a harness file that changed, is invalid, could not be edited or did not verify |
-| 4 | Environment problem | A missing `HOME`; an unknown current directory; a harness path that is not UTF-8; a failed file-system operation |
+| 4 | Environment problem | A missing `HOME`; an unknown current directory; a harness path that is not UTF-8; a harness CLI that is missing or timed out; a failed file-system operation |
 
 ## Error codes
 
@@ -761,9 +990,13 @@ codes, never values.
 | `store-locked` | 3 | Another process holds the store lock after all retries. |
 | `harness-file-changed` | 3 | A harness file or its link target changed between read and persist; nothing was written. |
 | `harness-config-invalid` | 3 | A harness file is not valid TOML, not UTF-8 or not a regular file; reported by position only. |
-| `harness-verify-failed` | 3 | A harness file did not read back as written; the original was restored (or the restore failed, as the hint says). |
+| `harness-verify-failed` | 3 | A harness file did not read back as written; the original was restored (or the restore failed, as the hint says). For a harness written through its CLI (Claude Code) nothing is restored: after an Add the entry is not owned; after an Update the record keeps its previous hashes and the next sync reports `drift`. |
 | `harness-edit-failed` | 3 | d-mcp could not produce a valid edit of a harness file (the spliced text did not parse, or it changed something outside the plan); nothing was written. |
 | `harness-path-not-utf8` | 4 | A harness configuration path (such as `$CODEX_HOME/config.toml`) is not valid UTF-8, so the write state cannot record it; that harness is skipped. |
+| `harness-cli-not-found` | 4 | A harness that d-mcp writes through its CLI (Claude Code: `claude`) has operations, but the CLI is not on `PATH`; nothing was journaled or written for that harness. |
+| `harness-cli-failed` | 1 | A harness CLI call exited unsuccessfully (per entry); the hint names only the program, the subcommand and the exit status, never the output. |
+| `harness-no-neutral-dir` | 1 | No neutral working directory exists for a harness CLI (Claude Code: `claude`): the store root and a fresh temporary directory both have a `.mcp.json` or a `projects` entry of the harness configuration at or above them; nothing was run for that harness. Remove the marker or point `TMPDIR` elsewhere. |
+| `harness-cli-timeout` | 4 | A harness CLI call did not finish in time (Claude Code writes: 30 s); d-mcp re-read the file and settled the write. |
 | `state-corrupt` | 3 | `state.toml` breaks a rule; it is never rewritten. |
 | `sync-blocked` | 1 | At least one sync entry is blocked (drift, collision, location change, unsupported style, important gap). |
 | `not-managed` | 1 | `unmanage` of a server without a write-state record. |
@@ -965,26 +1198,33 @@ server. For `hold`, `source` names the source that causes the hold; the definiti
     "created": false, "error": null, "notices": ["harness not present"],
     "entries": [
       { "name": "linear", "operation": "add", "outcome": "applied", "reason": null, "notice": null,
-        "hash": "<64 hex>",
+        "hash": "<64 hex>", "error": null,
         "gaps": [ { "field": "auth.client_secret_env", "severity": "note", "reason": "manual step: ..." } ] }
     ] }
 ] }
 ```
 
 - `status`: `synced`, `not-present` (nothing created), `location-changed`, `unsupported` (an inline
-  or dotted `mcp_servers` root) or `failed` (with `error`).
-- `error`: `null`, or the harness's `{ "code", "hint" }`.
-- `operation`: see [Operations](#operations). `outcome`: `applied` (written), `planned` (a dry run
-  would write or record it), `failed` (the harness write failed), `recorded` (only the write state
-  changed: take-over, refresh, relocate, orphaned), `unchanged`, `blocked` (counts toward exit 1)
-  or `kept` (held).
+  or dotted `mcp_servers` root, or a Claude Code `mcpServers` that is not an object) or `failed`
+  (with `error`; for a harness-CLI adapter also when an entry failed).
+- `error` of a harness: `null`, or `{ "code", "hint" }`: its own error, or the most severe entry
+  error.
+- `operation`: see [Operations](#operations); a `drift` found by the Claude Code adapter right
+  before a removal replaces the planned operation. `outcome`: `applied` (written), `planned` (a
+  dry run would write or record it), `failed` (the harness write failed), `rolled-back` (an Update
+  failed and the previous entry was restored), `lost` (an Update removed the entry and could not
+  add it again; the next sync re-adds it), `recorded` (only the write state changed: take-over,
+  refresh, relocate, orphaned), `unchanged`, `blocked` (counts toward exit 1) or `kept` (held).
+- `error` of an entry: `null`, or its own `{ "code", "hint" }` (Claude Code: `harness-cli-failed`,
+  `harness-cli-timeout`, `harness-verify-failed`, ...).
 - `reason`: the hold reason for `held`: `invalid-winner`, `source-unavailable` or `not-offered`.
 - `notice`: a hint such as how to resolve drift, or `null`.
 - `hash`: the read-back hash of an owned entry, `null` otherwise (never the hash of a foreign
   entry).
 - `gaps`: `field`, `severity` (`note` or `important`) and `reason`.
 
-Harnesses and entries are sorted; problems are the resolver's (see [Problems](#problems)). In text
+Harnesses come in adapter order (`codex`, then `claude`), entries sorted by name; problems are the
+resolver's (see [Problems](#problems)). In text
 mode each harness prints one line, then one line per entry (`operation`, name, outcome), then its
 notices and gaps; a dry run ends with "Dry run: nothing was written."
 

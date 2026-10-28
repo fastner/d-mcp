@@ -1,0 +1,8 @@
+name = "with-codex"
+[transport]
+type = "stdio"
+command = "npx"
+[harness.codex]
+startup_timeout_sec = 20
+[harness.claude]
+timeout = 20000

@@ -4,14 +4,14 @@
 //! Output rules until WP4: reports name only harness, scope, file path, entry
 //! name, operation, outcome, gaps, hold reasons and positions, plus hashes of
 //! owned entries. They never contain field values, hashes of foreign
-//! entries, child process output or `toml_edit` error text.
+//! entries, child process output, or `toml_edit` or `serde_json` error text.
 
 use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
 use super::{HeldReason, Operation};
-use crate::adapter::{Gap, GapSeverity, Scope};
+use crate::adapter::{AdapterTexts, Gap, GapSeverity, Scope};
 use crate::config::Harness;
 use crate::error::{EXIT_ENVIRONMENT, EXIT_FAILURE, EXIT_UNSAFE, Error};
 
@@ -25,6 +25,8 @@ pub(super) enum Outcome {
     Unchanged,
     Blocked,
     Kept,
+    RolledBack,
+    Lost,
 }
 
 impl Outcome {
@@ -37,6 +39,8 @@ impl Outcome {
             Outcome::Unchanged => "unchanged",
             Outcome::Blocked => "blocked",
             Outcome::Kept => "kept",
+            Outcome::RolledBack => "rolled-back",
+            Outcome::Lost => "lost",
         }
     }
 }
@@ -76,6 +80,7 @@ pub(super) struct EntryReport {
     pub(super) reason: Option<HeldReason>,
     pub(super) notice: Option<String>,
     pub(super) hash: Option<String>,
+    pub(super) error: Option<Error>,
 }
 
 pub(super) struct HarnessReport {
@@ -143,6 +148,7 @@ impl HarnessReport {
                 "notice": entry.notice,
                 "hash": entry.hash,
                 "gaps": entry.gaps,
+                "error": entry.error.as_ref().map(|error| json!({ "code": error.code(), "hint": error.hint() })),
             })).collect::<Vec<_>>(),
         })
     }
@@ -180,6 +186,9 @@ impl HarnessReport {
             if let Some(notice) = &entry.notice {
                 out.push_str(&format!("\n    {notice}"));
             }
+            if let Some(error) = &entry.error {
+                out.push_str(&format!("\n    error: {} [{}]", error.hint(), error.code()));
+            }
             for gap in &entry.gaps {
                 let severity = match gap.severity {
                     GapSeverity::Note => "note",
@@ -200,6 +209,7 @@ pub(super) fn notice(
     operation: Operation,
     name: &str,
     harness: Harness,
+    texts: &AdapterTexts,
     taken_over: bool,
     desired: bool,
 ) -> Option<String> {
@@ -226,12 +236,13 @@ pub(super) fn notice(
         Operation::Orphaned => {
             "the managed entry is gone and no longer selected; the record is dropped".to_owned()
         }
-        Operation::LocationChanged => {
-            "recorded for another file; run `d-mcp sync --relocate` to manage it at the new location"
-                .to_owned()
-        }
+        Operation::LocationChanged => format!(
+            "recorded for another file (did `{}` change?); run `d-mcp sync --relocate` to manage it at the new location",
+            texts.location_variable
+        ),
         Operation::Unsupported => format!(
-            "written in an inline or dotted style d-mcp does not edit; restore the standard table or run `d-mcp unmanage {name} --harness {harness}`"
+            "{} or run `d-mcp unmanage {name} --harness {harness}`",
+            texts.unsupported_entry
         ),
         Operation::Blocked => "an important gap blocks this entry; it is not written".to_owned(),
         Operation::Add | Operation::Update | Operation::Remove | Operation::Unchanged => {
@@ -245,15 +256,19 @@ pub(super) fn notice(
     })
 }
 
-/// The aggregate error of a sync: the highest-priority harness code, in the
-/// order 3, 4, 1, 0.
-pub(super) fn aggregate_error(reports: &[HarnessReport]) -> Option<Error> {
-    let rank = |code: u8| match code {
+/// The priority of an exit code, in the order 3, 4, 1, 0.
+pub(super) fn rank(code: u8) -> u8 {
+    match code {
         EXIT_UNSAFE => 4,
         EXIT_ENVIRONMENT => 3,
         EXIT_FAILURE => 2,
         _ => 1,
-    };
+    }
+}
+
+/// The aggregate error of a sync: the highest-priority harness code, in the
+/// order 3, 4, 1, 0.
+pub(super) fn aggregate_error(reports: &[HarnessReport]) -> Option<Error> {
     let worst = reports
         .iter()
         .filter(|report| report.exit_code() != 0)
@@ -295,19 +310,44 @@ mod tests {
 
     #[test]
     fn drift_of_an_unselected_entry_never_advises_a_take_over() {
-        let selected = notice(Operation::Drift, "a", Harness::Codex, false, true).unwrap();
+        let texts = &crate::adapter::codex::TEXTS;
+        let selected = notice(Operation::Drift, "a", Harness::Codex, texts, false, true).unwrap();
         assert!(selected.contains("--take-over a"), "{selected}");
-        let unselected = notice(Operation::Drift, "a", Harness::Codex, false, false).unwrap();
+        let unselected =
+            notice(Operation::Drift, "a", Harness::Codex, texts, false, false).unwrap();
         assert!(!unselected.contains("take-over"), "{unselected}");
         assert!(unselected.contains("d-mcp unmanage a --harness codex"));
         assert_eq!(
-            notice(Operation::Update, "a", Harness::Codex, true, true).as_deref(),
+            notice(Operation::Update, "a", Harness::Codex, texts, true, true).as_deref(),
             Some("taken over")
         );
         assert_eq!(
-            notice(Operation::Add, "a", Harness::Codex, false, true),
+            notice(Operation::Add, "a", Harness::Codex, texts, false, true),
             None
         );
+        let claude = &crate::adapter::claude::TEXTS;
+        let moved = notice(
+            Operation::LocationChanged,
+            "a",
+            Harness::Claude,
+            claude,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(moved.contains("CLAUDE_CONFIG_DIR"), "{moved}");
+        let odd = notice(
+            Operation::Unsupported,
+            "a",
+            Harness::Claude,
+            claude,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(odd.starts_with("not a JSON object"), "{odd}");
+        assert_eq!(Outcome::RolledBack.as_str(), "rolled-back");
+        assert_eq!(Outcome::Lost.as_str(), "lost");
     }
 
     #[test]

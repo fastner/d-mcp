@@ -1,8 +1,12 @@
 //! The shared external-program runner.
 //!
 //! Programs run without a shell, with stdin connected to null and an explicit
-//! environment: the inherited one plus the variables the caller sets (for
-//! example the resolved `CODEX_HOME`, or WP3's child-environment injection).
+//! environment: the inherited one minus the variables the caller removes, plus
+//! the variables the caller sets (for example the resolved `CODEX_HOME`, or
+//! the Claude Code adapter's `HOME`, `CLAUDE_CONFIG_DIR` and
+//! `MCP_CLIENT_SECRET`). The child's `PATH` is always the `PATH` value d-mcp
+//! was given (`Environment.path`), not the process's own, and an invocation
+//! can name the child's working directory.
 //! stdout and stderr are drained on reader threads with a size cap; the
 //! timeout polls `try_wait`.
 //!
@@ -41,6 +45,11 @@ pub struct Invocation {
     pub args: Vec<OsString>,
     /// Variables set on top of the inherited environment.
     pub env: Vec<(OsString, OsString)>,
+    /// Inherited variables removed from the child environment; a variable
+    /// that is also set is set.
+    pub remove: Vec<OsString>,
+    /// The child's working directory; `None` inherits d-mcp's.
+    pub cwd: Option<PathBuf>,
 }
 
 impl Invocation {
@@ -51,6 +60,8 @@ impl Invocation {
             program: program.into(),
             args: Vec::new(),
             env: Vec::new(),
+            remove: Vec::new(),
+            cwd: None,
         }
     }
 
@@ -65,10 +76,25 @@ impl Invocation {
         self
     }
 
-    /// Sets a variable in the child environment (the WP3 injection hook).
+    /// Sets a variable in the child environment (for example the Claude Code adapter's `MCP_CLIENT_SECRET`).
     #[must_use]
     pub fn env(mut self, name: impl Into<OsString>, value: impl Into<OsString>) -> Self {
         self.env.push((name.into(), value.into()));
+        self
+    }
+
+    /// Removes an inherited variable from the child environment, unless it
+    /// is also set with [`Invocation::env`].
+    #[must_use]
+    pub fn env_remove(mut self, name: impl Into<OsString>) -> Self {
+        self.remove.push(name.into());
+        self
+    }
+
+    /// Sets the child's working directory.
+    #[must_use]
+    pub fn current_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(dir.into());
         self
     }
 }
@@ -194,7 +220,8 @@ fn drain(mut pipe: impl Read, cap: usize) -> (Vec<u8>, bool) {
 
 impl ProcessRunner {
     /// Runs an invocation. A bare program name is looked up in `path`
-    /// (the `PATH` value d-mcp was given), never through a shell.
+    /// (the `PATH` value d-mcp was given), never through a shell. The child
+    /// gets `path` as its `PATH`, or no `PATH` when it is `None`.
     ///
     /// # Errors
     ///
@@ -216,8 +243,18 @@ impl ProcessRunner {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        match path {
+            Some(path) => command.env("PATH", path),
+            None => command.env_remove("PATH"),
+        };
+        for name in &invocation.remove {
+            command.env_remove(name);
+        }
         for (name, value) in &invocation.env {
             command.env(name, value);
+        }
+        if let Some(cwd) = &invocation.cwd {
+            command.current_dir(cwd);
         }
         let mut child = command.spawn().map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -414,5 +451,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(output.exit, Exit::Signal(9));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sets_path_cwd_and_removes_variables() {
+        let runner = ProcessRunner::default();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().canonicalize().unwrap();
+        let script = "printf '%s|%s|%s|%s' \"$PATH\" \"$(pwd -P)\" \"${HOME-unset}\" \"${D_MCP_KEEP-unset}\"";
+        let output = runner
+            .run(
+                &Invocation::new("/bin/sh")
+                    .args(["-c", script])
+                    .env_remove("HOME")
+                    .env_remove("D_MCP_KEEP")
+                    .env("D_MCP_KEEP", "kept")
+                    .current_dir(&dir),
+                Some(OsStr::new("/d-mcp/test-path")),
+            )
+            .unwrap();
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            text,
+            format!("/d-mcp/test-path|{}|unset|kept", dir.display())
+        );
+        // A shell would set a default `PATH`; `env` shows the real one.
+        let output = runner.run(&Invocation::new("/usr/bin/env"), None).unwrap();
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            !text.lines().any(|line| line.starts_with("PATH=")),
+            "{text}"
+        );
     }
 }

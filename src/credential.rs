@@ -1,7 +1,7 @@
 //! Secret heuristics for definition values.
 //!
 //! The names [`secret_name_heuristic`] and [`secret_value_heuristic`] are
-//! deliberately distinct from WP3's Claude Code credential-name list, so the
+//! deliberately distinct from the Claude Code adapter's credential-name list, so the
 //! two cannot be confused. Both functions are pure: they never log, print or
 //! store the values they inspect, and their results carry no part of the
 //! value.

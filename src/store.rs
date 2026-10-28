@@ -111,8 +111,13 @@ pub struct Environment {
     pub cwd: Option<PathBuf>,
     /// `CODEX_HOME`.
     pub codex_home: Option<OsString>,
-    /// `PATH`, used to detect harness binaries without running them.
+    /// `PATH`, used to detect harness binaries and passed to the harness
+    /// CLIs d-mcp runs.
     pub path: Option<OsString>,
+    /// `CLAUDE_CONFIG_DIR`. `Some` with an empty value means "set but
+    /// empty", which Claude Code treats differently from unset (see
+    /// [`Environment::claude_config_file`]).
+    pub claude_config_dir: Option<OsString>,
 }
 
 impl Environment {
@@ -126,6 +131,66 @@ impl Environment {
             cwd: std::env::current_dir().ok(),
             codex_home: std::env::var_os("CODEX_HOME"),
             path: std::env::var_os("PATH"),
+            claude_config_dir: std::env::var_os("CLAUDE_CONFIG_DIR"),
+        }
+    }
+
+    /// Resolves `CLAUDE_CONFIG_DIR`: `None` when unset or empty; a relative
+    /// value is resolved like a store path.
+    ///
+    /// # Errors
+    ///
+    /// See [`Environment::absolute`].
+    pub fn claude_config_dir(&self) -> Result<Option<PathBuf>> {
+        match self
+            .claude_config_dir
+            .as_ref()
+            .filter(|dir| !dir.is_empty())
+        {
+            Some(dir) => self.absolute(Path::new(dir)).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether `CLAUDE_CONFIG_DIR` is exported with an empty value.
+    #[must_use]
+    pub fn claude_config_dir_empty(&self) -> bool {
+        self.claude_config_dir
+            .as_ref()
+            .is_some_and(|dir| dir.is_empty())
+    }
+
+    /// Resolves Claude Code's user configuration file, the way Claude Code
+    /// 2.1.310 does (verified with separate `HOME` and `CLAUDE_CONFIG_DIR`
+    /// tempdirs): a legacy `.config.json` in the configuration directory
+    /// (`$CLAUDE_CONFIG_DIR`, otherwise `$HOME/.claude`) wins when it exists;
+    /// otherwise `$CLAUDE_CONFIG_DIR/.claude.json`, or `$HOME/.claude.json`
+    /// without `CLAUDE_CONFIG_DIR`. A `CLAUDE_CONFIG_DIR` that is set but
+    /// empty makes Claude Code's configuration home relative to its working
+    /// directory: the legacy candidate is `<cwd>/.config.json`, and backups
+    /// go to `<cwd>/backups/`. d-mcp runs `claude` from a fresh, empty
+    /// temporary directory in that mode, where the legacy file cannot exist,
+    /// so the file is always `$HOME/.claude.json`. Never creates anything.
+    ///
+    /// # Errors
+    ///
+    /// See [`Environment::absolute`]; [`Error::HomeUnset`] when `HOME` is
+    /// needed and unset or empty.
+    pub fn claude_config_file(&self) -> Result<PathBuf> {
+        let dir = self.claude_config_dir()?;
+        let config_home = match &dir {
+            Some(dir) => Some(dir.clone()),
+            None if self.claude_config_dir_empty() => None,
+            None => Some(self.home()?.join(".claude")),
+        };
+        if let Some(legacy) = config_home.map(|home| home.join(".config.json"))
+            && fs::symlink_metadata(&legacy).is_ok()
+        {
+            return Ok(legacy);
+        }
+        match dir {
+            Some(dir) => Ok(dir.join(".claude.json")),
+            None => Ok(self.home()?.join(".claude.json")),
         }
     }
 
@@ -143,7 +208,12 @@ impl Environment {
         Ok(self.home()?.join(".codex"))
     }
 
-    fn home(&self) -> Result<PathBuf> {
+    /// The `HOME` directory.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::HomeUnset`] when `HOME` is unset or empty.
+    pub fn home(&self) -> Result<PathBuf> {
         match &self.home {
             Some(home) if !home.is_empty() => Ok(PathBuf::from(home)),
             _ => Err(Error::HomeUnset),
@@ -748,6 +818,46 @@ mod tests {
             env(None, None).codex_home(),
             Err(Error::HomeUnset)
         ));
+    }
+
+    #[test]
+    fn claude_config_file_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let dir = temp.path().join("claude");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        let mut e = Environment {
+            home: Some(home.clone().into_os_string()),
+            cwd: Some(temp.path().to_path_buf()),
+            ..Environment::default()
+        };
+        assert_eq!(e.claude_config_dir().unwrap(), None);
+        assert_eq!(e.claude_config_file().unwrap(), home.join(".claude.json"));
+        e.claude_config_dir = Some(OsString::new());
+        assert!(e.claude_config_dir_empty());
+        assert_eq!(e.claude_config_dir().unwrap(), None);
+        assert_eq!(e.claude_config_file().unwrap(), home.join(".claude.json"));
+        fs::write(home.join(".claude/.config.json"), "{}").unwrap();
+        // Set but empty: Claude Code 2.1.310 ignores the legacy file.
+        assert_eq!(e.claude_config_file().unwrap(), home.join(".claude.json"));
+        // Unset: the legacy file wins.
+        e.claude_config_dir = None;
+        assert!(!e.claude_config_dir_empty());
+        assert_eq!(
+            e.claude_config_file().unwrap(),
+            home.join(".claude/.config.json")
+        );
+        e.claude_config_dir = Some(OsString::from("claude"));
+        assert_eq!(e.claude_config_dir().unwrap(), Some(dir.clone()));
+        assert_eq!(e.claude_config_file().unwrap(), dir.join(".claude.json"));
+        fs::write(dir.join(".config.json"), "{}").unwrap();
+        assert_eq!(e.claude_config_file().unwrap(), dir.join(".config.json"));
+        // With CLAUDE_CONFIG_DIR, HOME is not needed.
+        e.home = None;
+        assert_eq!(e.claude_config_file().unwrap(), dir.join(".config.json"));
+        e.claude_config_dir = None;
+        assert!(matches!(e.claude_config_file(), Err(Error::HomeUnset)));
     }
 
     #[cfg(unix)]

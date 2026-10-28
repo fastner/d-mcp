@@ -1,0 +1,7 @@
+name = "all-keys"
+[transport]
+type = "http"
+url = "https://mcp.example.test/mcp"
+[harness.claude]
+timeout = 30000
+oauth_callback_port = 8123

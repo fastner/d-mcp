@@ -989,15 +989,17 @@ fn unmanage_drops_records_and_harnesses() {
     let (code, value, _) = env.json(&["unmanage", "github"]);
     assert_eq!(code, 1);
     assert_eq!(value["error"]["code"], "not-managed");
+    // `claude` has an adapter now; without a record it is not managed there.
+    let (code, value, _) = env.json(&["unmanage", "github", "--harness", "claude"]);
+    assert_eq!(code, 1);
+    assert_eq!(value["error"]["code"], "not-managed");
+    let (code, value, _) = sync_json(&env, &["--harness", "claude"]);
+    assert_eq!(code, 0, "{value:#}");
+    assert_eq!(harness(&value)["harness"], "claude");
+    assert_eq!(harness(&value)["status"], "not-present");
     let output = env
         .cmd()
-        .args(["unmanage", "github", "--harness", "claude"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    let output = env
-        .cmd()
-        .args(["sync", "--harness", "claude"])
+        .args(["sync", "--harness", "cursor"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));

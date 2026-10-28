@@ -1,0 +1,6 @@
+name = "stdio-timeout"
+[transport]
+type = "stdio"
+command = "npx"
+[harness.claude]
+timeout = 31536000000

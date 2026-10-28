@@ -6,21 +6,30 @@
 //! entries with [`Gap`]s, and applies a [`HarnessPlan`]. The sync engine in
 //! [`crate::sync`] depends only on this contract.
 //!
+//! A `direct-edit` adapter (Codex) applies a plan in one atomic persist and
+//! reports every entry as [`EntryOutcome::Applied`] or fails as a whole. A
+//! `harness-cli` adapter (Claude Code) runs one CLI call per operation,
+//! journals each intent right before its call, and reports a separate
+//! [`EntryOutcome`] per entry.
+//!
 //! A native-to-neutral import function is part of the contract as well; it
 //! is implemented in WP4, where adoption and duplicate detection need it, so
 //! the default [`Adapter::import`] returns `None`.
 
+pub mod claude;
 pub mod codex;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::config::Harness;
 use crate::definition::Definition;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::process::ProcessRunner;
 use crate::store::{Environment, StoreWarning};
 
@@ -30,7 +39,7 @@ pub enum ApplyMode {
     /// d-mcp edits the harness file itself and batches every operation into
     /// one atomic persist (Codex).
     DirectEdit,
-    /// d-mcp runs the harness's own CLI, one operation at a time (WP3).
+    /// d-mcp runs the harness's own CLI, one operation at a time (Claude Code).
     HarnessCli,
 }
 
@@ -96,6 +105,10 @@ pub struct Rendered {
     pub sent_hash: String,
     /// The gaps of the rendering.
     pub gaps: Vec<Gap>,
+    /// The variable whose value a harness-CLI adapter passes as the OAuth
+    /// client secret when it writes the entry (`client_secret_env`). Only
+    /// the name; it is not part of the entry or its hash.
+    pub secret_env: Option<String>,
 }
 
 /// The largest timeout override, in seconds: 365 days. Larger values (such
@@ -117,7 +130,23 @@ pub enum OverrideType {
     StringArray,
     /// A non-empty array of strings.
     NonEmptyStringArray,
+    /// An integer number of milliseconds, from [`MIN_TIMEOUT_MILLISECONDS`]
+    /// to [`MAX_TIMEOUT_MILLISECONDS`].
+    Milliseconds,
+    /// An integer TCP port from [`MIN_PORT`] to [`MAX_PORT`].
+    Port,
 }
+
+/// The smallest millisecond timeout override: Claude Code ignores values
+/// below one second.
+pub const MIN_TIMEOUT_MILLISECONDS: i64 = 1_000;
+/// The largest millisecond timeout override: 365 days, like
+/// [`MAX_TIMEOUT_SECONDS`].
+pub const MAX_TIMEOUT_MILLISECONDS: i64 = 31_536_000_000;
+/// The smallest port override; ports below it need privileges.
+pub const MIN_PORT: i64 = 1_024;
+/// The largest port override.
+pub const MAX_PORT: i64 = 65_535;
 
 impl OverrideType {
     /// A short description for messages and docs.
@@ -129,6 +158,8 @@ impl OverrideType {
             OverrideType::Seconds => "non-negative number of seconds, at most 31536000",
             OverrideType::StringArray => "array of strings",
             OverrideType::NonEmptyStringArray => "non-empty array of strings",
+            OverrideType::Milliseconds => "integer milliseconds, 1000 to 31536000000",
+            OverrideType::Port => "integer port, 1024 to 65535",
         }
     }
 }
@@ -207,6 +238,10 @@ pub struct HarnessRead {
     /// adapter: the original bytes, the resolved target and its mode). It
     /// never leaves memory.
     pub private: PrivateRead,
+    /// Entry names that a narrower scope shadows, with the places where it
+    /// does (Claude Code: the project paths with a same-name local-scope
+    /// entry). Names and paths only.
+    pub shadowed: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// Adapter-private read state of a direct-edit adapter.
@@ -268,6 +303,10 @@ pub struct WriteOp {
     pub kind: WriteKind,
     /// The rendering, for Add and Update.
     pub rendered: Option<Rendered>,
+    /// Whether the entry being replaced or removed was written by d-mcp
+    /// (the provenance marker of its record), so a harness-CLI adapter may
+    /// re-add it from memory when an Update fails halfway.
+    pub rollback: bool,
 }
 
 /// The write operations for one harness location.
@@ -290,7 +329,9 @@ pub struct Intent {
 
 /// Records intents durably before an adapter persists anything.
 pub trait Journal {
-    /// Writes `pending` records for the intents.
+    /// Writes `pending` records for the intents. A direct-edit adapter
+    /// journals all operations at once; a harness-CLI adapter journals each
+    /// operation right before its CLI call.
     ///
     /// # Errors
     ///
@@ -298,17 +339,72 @@ pub trait Journal {
     fn intend(&mut self, intents: &[Intent]) -> Result<()>;
 }
 
-/// The verified result of one write operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What happened to one write operation.
+#[derive(Debug, Clone)]
+pub enum EntryOutcome {
+    /// The write took effect and was verified; the record is promoted.
+    Applied,
+    /// The write failed or could not be verified. The pending record is
+    /// settled against the harness file.
+    Failed(Error),
+    /// The entry changed since planning (checked right before a removal);
+    /// it was skipped and is reported as drift.
+    Drift,
+    /// An Update removed the old entry, the new one could not be added, and
+    /// the old entry (a d-mcp rendering) was re-added from memory.
+    RolledBack(Error),
+    /// An Update removed the old entry, and neither the new one nor the old
+    /// one could be added. The record reverts to its previous hashes, so the
+    /// next sync re-adds the entry as vanished.
+    Lost {
+        /// Why the add failed.
+        error: Error,
+        /// The names of the fields of the removed entry.
+        fields: Vec<String>,
+    },
+}
+
+/// The result of one write operation.
+#[derive(Debug, Clone)]
 pub struct EntryResult {
     /// The entry name.
     pub name: String,
-    /// The read-back hash after the write; `None` after a Remove.
+    /// What happened.
+    pub outcome: EntryOutcome,
+    /// The verified read-back hash after an applied Add or Update; `None`
+    /// otherwise.
     pub readback: Option<String>,
+    /// Gaps that only the write revealed, such as a manual step for a
+    /// client secret that was not set; reported with the entry.
+    pub gaps: Vec<Gap>,
+}
+
+impl EntryResult {
+    /// An applied, verified write.
+    #[must_use]
+    pub fn applied(name: &str, readback: Option<String>) -> Self {
+        Self {
+            name: name.to_owned(),
+            outcome: EntryOutcome::Applied,
+            readback,
+            gaps: Vec::new(),
+        }
+    }
+
+    /// A write with another outcome.
+    #[must_use]
+    pub fn other(name: &str, outcome: EntryOutcome) -> Self {
+        Self {
+            name: name.to_owned(),
+            outcome,
+            readback: None,
+            gaps: Vec::new(),
+        }
+    }
 }
 
 /// The result of [`Adapter::apply`].
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ApplyResult {
     /// One result per operation.
     pub entries: Vec<EntryResult>,
@@ -316,6 +412,24 @@ pub struct ApplyResult {
     pub warnings: Vec<StoreWarning>,
     /// Whether the harness file was created.
     pub created: bool,
+}
+
+/// Looks up a variable of d-mcp's environment by name.
+pub type VarLookup<'a> = &'a dyn Fn(&str) -> Option<OsString>;
+
+/// What an adapter needs to apply a plan besides the plan itself.
+pub struct ApplyContext<'a> {
+    /// The environment: `HOME`, `PATH`, `CLAUDE_CONFIG_DIR`, ...
+    pub env: &'a Environment,
+    /// The process runner for harness CLI calls.
+    pub runner: &'a ProcessRunner,
+    /// The preferred neutral working directory for harness CLI calls (the
+    /// store root).
+    pub neutral_dir: &'a Path,
+    /// Looks up a variable of d-mcp's environment by name; used only for
+    /// the value of `client_secret_env`, which goes into the child
+    /// environment and nowhere else.
+    pub var: VarLookup<'a>,
 }
 
 /// Test seams of [`Adapter::apply`], for failure injection. Each runs at the
@@ -333,6 +447,25 @@ pub struct Hooks<'a> {
     pub after_persist: Option<&'a dyn Fn() -> Result<()>>,
     /// Makes the read-back verification fail, to exercise the restore.
     pub force_verify_failure: bool,
+    /// Runs after an Update's removal and before its add (harness-CLI
+    /// adapters). An error stops the run at once, as a crash would.
+    pub after_remove: Option<&'a dyn Fn() -> Result<()>>,
+    /// Overrides the timeout of harness CLI calls.
+    pub cli_timeout: Option<Duration>,
+}
+
+/// Adapter-provided report texts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdapterTexts {
+    /// Why the entry root cannot be edited.
+    pub unsupported_root: &'static str,
+    /// What an unsupported owned entry is and how to fix it; the `unmanage`
+    /// advice is appended.
+    pub unsupported_entry: &'static str,
+    /// What an old file still contains after `--relocate`.
+    pub relocated_leftover: &'static str,
+    /// The variable whose change moves the harness file.
+    pub location_variable: &'static str,
 }
 
 /// The adapter contract.
@@ -362,6 +495,8 @@ pub trait Adapter: Sync {
     fn entries_can_vanish(&self) -> bool;
     /// The harness versions this adapter was verified against.
     fn verified_versions(&self) -> &'static [&'static str];
+    /// The adapter's report texts.
+    fn texts(&self) -> &'static AdapterTexts;
     /// Resolves where the harness keeps the scope's configuration. Never
     /// creates anything.
     ///
@@ -393,11 +528,14 @@ pub trait Adapter: Sync {
     ///
     /// # Errors
     ///
-    /// Concurrency, persist and verification errors. On an error nothing
-    /// has been changed, or the original was restored, unless the error
-    /// says otherwise.
+    /// Harness-level errors: concurrency, persist and verification errors
+    /// of a direct-edit adapter, a missing harness CLI, a journal error. On
+    /// an error nothing has been changed, or the original was restored,
+    /// unless the error says otherwise. Per-entry failures of a harness-CLI
+    /// adapter are [`EntryOutcome`]s instead.
     fn apply(
         &self,
+        ctx: &ApplyContext<'_>,
         read: &HarnessRead,
         plan: &HarnessPlan,
         journal: &mut dyn Journal,
@@ -420,7 +558,8 @@ pub trait Adapter: Sync {
 /// The registry of adapters, in a stable order.
 #[must_use]
 pub fn registry() -> &'static [&'static dyn Adapter] {
-    static ADAPTERS: [&dyn Adapter; 1] = [&codex::CodexAdapter];
+    // Claude Code is registered after Codex, so reports keep Codex first.
+    static ADAPTERS: [&dyn Adapter; 2] = [&codex::CodexAdapter, &claude::ClaudeAdapter];
     &ADAPTERS
 }
 
@@ -466,9 +605,17 @@ mod tests {
 
     #[test]
     fn registry_and_lookup() {
-        assert_eq!(registry().len(), 1);
+        assert_eq!(registry().len(), 2);
+        assert_eq!(registry()[0].harness(), Harness::Codex);
+        assert_eq!(registry()[1].harness(), Harness::Claude);
         assert!(adapter_for(Harness::Codex).is_some());
-        assert!(adapter_for(Harness::Claude).is_none());
+        assert!(adapter_for(Harness::Claude).is_some());
+        assert!(
+            OverrideType::Milliseconds
+                .describe()
+                .contains("31536000000")
+        );
+        assert!(OverrideType::Port.describe().contains("65535"));
         assert_eq!(Scope::from_code("user"), Some(Scope::User));
         assert_eq!(Scope::from_code("project"), None);
         assert_eq!(Scope::User.as_str(), "user");
@@ -518,6 +665,7 @@ mod tests {
             entries: BTreeMap::new(),
             root_supported: true,
             private: PrivateRead::default(),
+            shadowed: BTreeMap::new(),
         };
         assert!(adapter.import(&read, "x").is_none());
         let definition = parse_definition(

@@ -1,0 +1,6 @@
+name = "headers-helper-snake"
+[transport]
+type = "http"
+url = "https://mcp.example.test/mcp"
+[harness.claude]
+headers_helper = "/usr/local/bin/token-helper"

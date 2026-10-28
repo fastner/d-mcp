@@ -207,17 +207,65 @@ pub enum Error {
     #[error(
         "{} did not read back as written; {}",
         path.display(),
-        if *restored {
-            "the original content was restored"
-        } else {
-            "restoring the original content FAILED, check the file by hand"
+        match restored {
+            Some(true) => "the original content was restored",
+            Some(false) => "restoring the original content FAILED, check the file by hand",
+            None => "the entry is left as the harness wrote it and is not taken as d-mcp's write (a new entry stays unowned; a replaced one is reported as drift on the next sync)",
         }
     )]
     HarnessVerifyFailed {
         /// The harness file.
         path: PathBuf,
-        /// Whether the original bytes were restored.
-        restored: bool,
+        /// Whether the original bytes were restored; `None` when the harness
+        /// wrote the file through its own CLI and nothing was restored.
+        restored: Option<bool>,
+    },
+    /// A harness CLI that d-mcp writes through is not on `PATH`.
+    #[error(
+        "the `{program}` CLI was not found on PATH; d-mcp writes {harness} entries through it, so nothing was written for {harness}"
+    )]
+    HarnessCliNotFound {
+        /// The harness.
+        harness: &'static str,
+        /// The program name.
+        program: &'static str,
+    },
+    /// A harness CLI call exited unsuccessfully. Its output is never shown.
+    #[error(
+        "`{program} mcp {subcommand}` failed ({status}); its output is not shown because it can contain secrets"
+    )]
+    HarnessCliFailed {
+        /// The program name.
+        program: &'static str,
+        /// The subcommand, such as `add-json`.
+        subcommand: &'static str,
+        /// The exit status, such as `exit status 1`.
+        status: String,
+    },
+    /// No neutral working directory exists for a harness CLI: even a fresh
+    /// temporary directory has a `.mcp.json` or a project entry of the
+    /// harness configuration at or above it. Nothing was run.
+    #[error(
+        "no neutral working directory for `{program}`: {} has a `.mcp.json` or a `projects` entry of the {harness} configuration at or above it, so nothing was run for {harness}; remove it or set TMPDIR to another directory",
+        path.display()
+    )]
+    HarnessNoNeutralDir {
+        /// The harness.
+        harness: &'static str,
+        /// The program name.
+        program: &'static str,
+        /// The temporary directory that was tried.
+        path: PathBuf,
+    },
+    /// A harness CLI call did not finish in time.
+    #[error(
+        "`{program} mcp {subcommand}` did not finish in time and was stopped; d-mcp re-read the harness file to settle the write"
+    )]
+    HarnessCliTimeout {
+        /// The program name.
+        program: &'static str,
+        /// The subcommand.
+        subcommand: &'static str,
     },
     /// `state.toml` breaks a rule. It is never rewritten.
     #[error(
@@ -307,6 +355,10 @@ impl Error {
             Error::HarnessVerifyFailed { .. } => "harness-verify-failed",
             Error::HarnessEditFailed { .. } => "harness-edit-failed",
             Error::HarnessPathNotUtf8 { .. } => "harness-path-not-utf8",
+            Error::HarnessCliNotFound { .. } => "harness-cli-not-found",
+            Error::HarnessCliFailed { .. } => "harness-cli-failed",
+            Error::HarnessCliTimeout { .. } => "harness-cli-timeout",
+            Error::HarnessNoNeutralDir { .. } => "harness-no-neutral-dir",
             Error::StateCorrupt { .. } => "state-corrupt",
             Error::SyncBlocked { .. } => "sync-blocked",
             Error::NotManaged { .. } => "not-managed",
@@ -338,7 +390,9 @@ impl Error {
             | Error::NotSelected { .. }
             | Error::SyncBlocked { .. }
             | Error::NotManaged { .. }
-            | Error::UnknownTakeOver { .. } => EXIT_FAILURE,
+            | Error::UnknownTakeOver { .. }
+            | Error::HarnessCliFailed { .. }
+            | Error::HarnessNoNeutralDir { .. } => EXIT_FAILURE,
             Error::ConfigCorrupt { .. }
             | Error::SchemaUnsupported { .. }
             | Error::StoreLocked { .. }
@@ -350,6 +404,8 @@ impl Error {
             Error::HomeUnset
             | Error::CurrentDirUnavailable
             | Error::HarnessPathNotUtf8 { .. }
+            | Error::HarnessCliNotFound { .. }
+            | Error::HarnessCliTimeout { .. }
             | Error::Io { .. } => EXIT_ENVIRONMENT,
         }
     }
@@ -409,7 +465,25 @@ impl Error {
             },
             Error::HarnessVerifyFailed {
                 path: path.clone(),
-                restored: true,
+                restored: Some(true),
+            },
+            Error::HarnessCliNotFound {
+                harness: "claude",
+                program: "claude",
+            },
+            Error::HarnessCliFailed {
+                program: "claude",
+                subcommand: "add-json",
+                status: "exit status 1".into(),
+            },
+            Error::HarnessCliTimeout {
+                program: "claude",
+                subcommand: "remove",
+            },
+            Error::HarnessNoNeutralDir {
+                harness: "claude",
+                program: "claude",
+                path: PathBuf::from("/tmp/d-mcp-x"),
             },
             Error::HarnessEditFailed { path: path.clone() },
             Error::HarnessPathNotUtf8 { harness: "codex" },
@@ -461,6 +535,10 @@ impl Error {
                 | Error::HarnessVerifyFailed { .. }
                 | Error::HarnessEditFailed { .. }
                 | Error::HarnessPathNotUtf8 { .. }
+                | Error::HarnessCliNotFound { .. }
+                | Error::HarnessCliFailed { .. }
+                | Error::HarnessCliTimeout { .. }
+                | Error::HarnessNoNeutralDir { .. }
                 | Error::StateCorrupt { .. }
                 | Error::SyncBlocked { .. }
                 | Error::NotManaged { .. }
@@ -561,9 +639,34 @@ mod tests {
         assert!(regular.hint().contains("not a regular file; fix"));
         let failed = Error::HarnessVerifyFailed {
             path: PathBuf::from("/c/config.toml"),
-            restored: false,
+            restored: Some(false),
         };
         assert!(failed.hint().contains("FAILED"));
+        let cli = Error::HarnessVerifyFailed {
+            path: PathBuf::from("/c/.claude.json"),
+            restored: None,
+        };
+        assert!(cli.hint().contains("left as the harness wrote it"));
+        let failed = Error::HarnessCliFailed {
+            program: "claude",
+            subcommand: "add-json",
+            status: "exit status 1".into(),
+        };
+        assert_eq!(
+            failed.hint(),
+            "`claude mcp add-json` failed (exit status 1); its output is not shown because it can contain secrets"
+        );
+        let neutral = Error::HarnessNoNeutralDir {
+            harness: "claude",
+            program: "claude",
+            path: PathBuf::from("/tmp/d-mcp-x"),
+        };
+        assert_eq!(
+            neutral.hint(),
+            "no neutral working directory for `claude`: /tmp/d-mcp-x has a `.mcp.json` or a `projects` entry of the claude configuration at or above it, so nothing was run for claude; remove it or set TMPDIR to another directory"
+        );
+        assert_eq!(neutral.code(), "harness-no-neutral-dir");
+        assert_eq!(neutral.exit_code(), EXIT_FAILURE);
         assert!(
             Error::SyncBlocked { count: 1 }
                 .hint()
