@@ -82,8 +82,8 @@ pub enum Command {
     },
     /// Resolve every selection against the sources (read-only).
     Resolve,
-    /// Write the selected servers into the harnesses (Codex in this
-    /// version), at user scope.
+    /// Write the selected servers into the harnesses (Codex and Claude
+    /// Code), at user scope.
     Sync {
         /// Sync only this harness; repeat for several. Without it, every
         /// harness with an adapter is synced.
@@ -94,8 +94,8 @@ pub enum Command {
         #[arg(long = "take-over", value_name = "SERVER")]
         take_over: Vec<String>,
         /// Manage the recorded entries at the newly resolved harness file,
-        /// for example after `CODEX_HOME` changed. The old file is not
-        /// edited.
+        /// for example after `CODEX_HOME` or `CLAUDE_CONFIG_DIR` changed. The
+        /// old file is not edited.
         #[arg(long)]
         relocate: bool,
     },
@@ -114,6 +114,8 @@ pub enum Command {
 /// A harness with an adapter, on the command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum AdapterArg {
+    /// Claude Code.
+    Claude,
     /// Codex.
     Codex,
 }
@@ -121,6 +123,7 @@ pub enum AdapterArg {
 impl From<AdapterArg> for Harness {
     fn from(arg: AdapterArg) -> Self {
         match arg {
+            AdapterArg::Claude => Harness::Claude,
             AdapterArg::Codex => Harness::Codex,
         }
     }

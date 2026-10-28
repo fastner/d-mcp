@@ -1,9 +1,9 @@
 # ADR 0005: Adapter Write Strategy and Ownership
 
-- Status: Accepted (Codex half; WP3 completes it for Claude Code)
-- Date: 2026-10-27
+- Status: Accepted
+- Date: 2026-10-27 (Codex half), 2026-10-28 (Claude Code half)
 - Source: concept `docs/concept/2026-10-26-d-mcp.md`, WP2 plan "Adapter contract, sync engine and
-  Codex adapter"
+  Codex adapter", WP3 plan "Claude Code adapter"
 
 ## Context
 
@@ -21,12 +21,17 @@ capabilities (apply mode, scopes, override allow-list, reserved names, comparabi
 whether entries can vanish, verified harness versions, login-state capability) and implements
 locate, read, render with gaps, and `apply(harness_plan)`. The sync engine depends only on this
 contract. A `direct-edit` adapter (Codex) batches all operations into one atomic persist; a
-`harness-cli` adapter (Claude Code, WP3) runs them one by one.
+`harness-cli` adapter (Claude Code) runs them one by one. `apply` receives an apply context (the
+environment, the process runner, a neutral working directory and a variable lookup) and returns an
+outcome per entry (`applied`, `failed`, `drift`, `rolled-back`, `lost`); the executor promotes the
+applied entries, settles the others against the harness file, and reports each entry's outcome.
 
 **Ownership is recorded, not marked.** d-mcp writes no marker comments into harness files. The
 write state `state.toml` records, per harness, scope and entry name, the file path as resolved
 before following symlinks, the hash of the entry as sent, the semantic hash of the entry as read
-back, and the source definition hash. An entry is owned only when it has a record.
+back, and the source definition hash. An entry is owned only when it has a record. A provenance
+marker (`written`) tells whether d-mcp itself wrote the entry with those hashes; it is set on every
+promoted d-mcp write and cleared by a take-over.
 
 **Three-way planning.** Each sync compares desired (rendered), recorded and actual entries. Updates
 are decided by comparing the new rendering with the recorded *sent* hash and the actual entry with
@@ -36,7 +41,8 @@ entry is never modified until the user takes it over (`sync --take-over`), and a
 only when it is unchanged since d-mcp wrote it.
 
 **Intent before write.** Before persisting, d-mcp records `pending` intents with the expected and
-the previous owned hashes, under the store lock. After verification they are promoted; on a failed
+the previous owned hashes, under the store lock: all at once for a direct-edit adapter, one right
+before each CLI call for a harness-CLI adapter. After verification they are promoted; on a failed
 persist or verification they revert; after a crash, the next sync settles them against the actual
 file. Ownership is never lost.
 
@@ -58,6 +64,38 @@ An Update carries a preserved key over only while it fits the new rendering: Cod
 whole configuration for an `oauth` table on a stdio entry or a client secret without a client ID.
 A key that no longer fits is removed and reported by name as a `note` gap, never by value.
 
+**Claude Code is written through its CLI and only read by d-mcp.** `~/.claude.json` belongs to
+running Claude Code sessions and holds account data, caches and history. d-mcp never opens it for
+writing (a structural test guards this): it adds entries with `claude mcp add-json -s user`,
+removes them with `claude mcp remove -s user`, and updates by removing and adding. It reads the
+file only to plan and verify, deserializing just the user-scope `mcpServers` values and the names
+of local-scope entries, and keeps no bytes. Every call runs from a neutral working directory with
+an explicit child environment (`PATH`, `HOME`, `CLAUDE_CONFIG_DIR`, `DISABLE_AUTOUPDATER=1`, no
+inherited `MCP_CLIENT_SECRET`); the client secret of `client_secret_env` is passed only through
+`MCP_CLIENT_SECRET` of that child. When not even a fresh temporary directory is neutral, nothing
+is run for Claude Code (`harness-no-neutral-dir`). With an empty `CLAUDE_CONFIG_DIR`, Claude Code
+treats its working directory as its configuration home (legacy `.config.json`, `backups/`), so the
+child always runs from a fresh temporary directory that is removed afterwards, never from the
+store root.
+
+**One semantic hash for Claude Code.** Claude Code normalizes entries when it writes them (it adds
+`args = []`, drops unknown keys, writes JavaScript numbers). The Claude Code entry hash
+(`d-mcp-claude-entry-v1`) is computed over a canonical form that absorbs this and is applied alike
+to the rendering and the read-back entry, so the two hashes are comparable: the journal records the
+sent hash as the expected read-back, identical collisions are detected, and a normalization the
+form does not absorb fails verification instead of silently losing ownership.
+
+**Drift check and rollback for a CLI that cannot write atomically.** Right before each removal,
+d-mcp re-reads the file and skips the entry as drift when its hash changed since planning; the
+remaining window is accepted and absence is verified afterwards. When the add of an Update fails,
+the entry just removed is re-added from memory, but only if its record carries the provenance
+marker, so foreign or taken-over content never reaches a command line. Otherwise, or when the
+rollback fails, the entry is reported as lost by field names, its record reverts to the previous
+hashes and the next sync re-adds it. A failed verification is settled against the file like any
+pending record: a new entry stays unowned, a replaced one keeps its previous hashes and is drift on
+the next sync. A CLI timeout is "unknown": d-mcp settles from the file and
+never rolls back blindly.
+
 ## Consequences
 
 - Users can keep editing harness files by hand; d-mcp reports drift instead of fighting it, and
@@ -75,5 +113,13 @@ A key that no longer fits is removed and reported by name as a `note` gap, never
 - Ownership survives crashes and failed writes, at the cost of a second persisted file.
 - Moving `CODEX_HOME` is reported as a location change; `sync --relocate` moves ownership but never
   edits the old file.
-- WP3 adds the `harness-cli` half for Claude Code, where sent and read-back hashes are not
-  comparable, and completes this ADR.
+- Claude Code writes are not atomic across a sync: each entry succeeds or fails on its own, and a
+  harness can end with some entries applied and one rolled back or lost. The report shows each
+  entry's outcome; the record is never dropped, so the next sync repairs a lost entry.
+- A running Claude Code session rewrites `~/.claude.json` from memory and can undo a d-mcp add or
+  bring back a removed entry. The next sync reports the first as vanished (and re-adds it) and the
+  second as an unowned entry.
+- Replacing a Claude Code entry clears its stored OAuth tokens and client secret (verified against
+  2.1.310), so an Update of an OAuth server reports that a new login is needed.
+- d-mcp depends on the `claude` CLI being on `PATH` to write Claude Code entries. Without it, a sync
+  with operations fails for that harness (`harness-cli-not-found`) before anything is journaled.

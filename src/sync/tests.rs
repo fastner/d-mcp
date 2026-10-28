@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use super::*;
 use crate::adapter::{
-    ApplyMode, ApplyResult, HarnessPlan, Hooks, Journal, Location, LoginState, OverrideKey,
-    PrivateRead, Scope, foreign_security_gaps,
+    AdapterTexts, ApplyContext, ApplyMode, ApplyResult, HarnessPlan, Hooks, Journal, Location,
+    LoginState, OverrideKey, PrivateRead, Scope, foreign_security_gaps,
 };
 use crate::config::Harness;
 use crate::definition::{Definition, parse_definition};
@@ -55,6 +55,9 @@ impl Adapter for TestAdapter {
     fn verified_versions(&self) -> &'static [&'static str] {
         &[]
     }
+    fn texts(&self) -> &'static AdapterTexts {
+        &crate::adapter::claude::TEXTS
+    }
     fn locate(&self, _env: &Environment, scope: Scope) -> Result<Location> {
         Ok(location(scope))
     }
@@ -68,10 +71,12 @@ impl Adapter for TestAdapter {
             entry: Vec::new(),
             sent_hash: hash(&definition.definition_hash()[..1]),
             gaps,
+            secret_env: None,
         }
     }
     fn apply(
         &self,
+        _ctx: &ApplyContext<'_>,
         _read: &HarnessRead,
         _plan: &HarnessPlan,
         _journal: &mut dyn Journal,
@@ -111,6 +116,7 @@ fn read(location: Location, entries: BTreeMap<String, ActualEntry>) -> HarnessRe
         entries,
         root_supported: true,
         private: PrivateRead::default(),
+        shadowed: BTreeMap::new(),
     }
 }
 
@@ -129,6 +135,7 @@ fn owned(sent: &str, readback: &str) -> Record {
             sent: hash(sent),
             readback: hash(readback),
             definition_hash: hash("d"),
+            written: true,
         },
     )
 }
@@ -139,6 +146,7 @@ fn render(sent: &str) -> Desired {
             entry: Vec::new(),
             sent_hash: hash(sent),
             gaps: Vec::new(),
+            secret_env: None,
         },
         definition_hash: hash("d"),
     }
@@ -256,6 +264,7 @@ fn a_new_definition_hash_with_the_same_rendering_refreshes_the_record() {
                 entry: Vec::new(),
                 sent_hash: hash("1"),
                 gaps: Vec::new(),
+                secret_env: None,
             },
             definition_hash: hash("e"),
         },
@@ -512,6 +521,7 @@ fn a_note_gap_is_dropped_once_its_preserved_key_is_present() {
             entry: Vec::new(),
             sent_hash: hash("1"),
             gaps: vec![gap],
+            secret_env: None,
         },
         definition_hash: hash("d"),
     };
@@ -539,6 +549,7 @@ fn an_update_reports_preserved_keys_that_no_longer_fit() {
             entry,
             sent_hash: hash("2"),
             gaps,
+            secret_env: None,
         },
         definition_hash: hash("d"),
     };

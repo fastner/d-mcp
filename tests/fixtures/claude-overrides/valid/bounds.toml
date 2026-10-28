@@ -1,0 +1,7 @@
+name = "bounds"
+[transport]
+type = "http"
+url = "https://mcp.example.test/mcp"
+[harness.claude]
+timeout = 1000
+oauth_callback_port = 65535

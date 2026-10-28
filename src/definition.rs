@@ -19,8 +19,8 @@ pub use hash::{CORE_DOMAIN_TAG, DEFINITION_DOMAIN_TAG, canonical_json};
 /// Maximum length of a neutral name.
 ///
 /// It follows from a 64-character model tool-name limit minus `mcp__` and
-/// `__`, which leaves at least 25 characters for tool names. WP3 re-verifies
-/// the 64-character assumption.
+/// `__`, which leaves at least 25 characters for tool names. Claude Code
+/// 2.1.310 validates tool names against `^[a-zA-Z0-9_-]{1,64}$`.
 pub const MAX_NAME_LEN: usize = 32;
 
 /// A validated server definition, with defaults applied.

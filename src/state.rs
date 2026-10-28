@@ -45,6 +45,11 @@ pub struct Hashes {
     pub readback: String,
     /// The hash of the source definition (WP5 binds approvals to it).
     pub definition_hash: String,
+    /// Provenance: whether d-mcp itself wrote the entry with these hashes.
+    /// Set on every promoted d-mcp write; cleared by a take-over (and by WP4
+    /// adoption). A harness-CLI adapter rolls back only entries d-mcp wrote,
+    /// so foreign content never reaches a command line.
+    pub written: bool,
 }
 
 /// The status of a record.
@@ -192,6 +197,8 @@ const RECORD_KEYS: &[&str] = &[
     "prev_sent",
     "prev_readback",
     "prev_definition_hash",
+    "written",
+    "prev_written",
     "time",
     "version",
 ];
@@ -226,6 +233,15 @@ fn optional_hashes(
         .iter()
         .filter(|key| find(entries, key).is_some())
         .count();
+    let written_key = format!("{prefix}written");
+    let written = match find(entries, &written_key) {
+        None => false,
+        Some(entry) => match entry.value.kind {
+            // Only `true` is ever written; `false` is the absence.
+            NodeKind::Boolean(true) if present > 0 => true,
+            _ => return corrupt(&format!("{field}.{written_key}"), entry.value_offset()),
+        },
+    };
     if present == 0 {
         return Ok(None);
     }
@@ -249,6 +265,7 @@ fn optional_hashes(
         sent,
         readback,
         definition_hash,
+        written,
     }))
 }
 
@@ -381,6 +398,9 @@ fn put_hashes(table: &mut Table, prefix: &str, hashes: &Hashes) {
     table[&format!("{prefix}sent")] = value(hashes.sent.as_str());
     table[&format!("{prefix}readback")] = value(hashes.readback.as_str());
     table[&format!("{prefix}definition_hash")] = value(hashes.definition_hash.as_str());
+    if hashes.written {
+        table[&format!("{prefix}written")] = value(true);
+    }
 }
 
 impl State {
@@ -510,6 +530,7 @@ mod tests {
             sent: seed.to_string().repeat(64),
             readback: seed.to_string().repeat(64),
             definition_hash: "f".repeat(64),
+            written: seed != 'a',
         }
     }
 
@@ -586,6 +607,15 @@ mod tests {
             good.replacen(&"a".repeat(64), "short", 1),
             good.replacen("name = \"b\"", "name = \"a\"", 1),
             good.replacen("name = \"a\"", "name = 1", 1),
+            good.replacen("written = true", "written = false", 1),
+            good.replacen("written = true", "written = 1", 1),
+            good.replacen("prev_written = true", "prev_written = \"yes\"", 1),
+            // A provenance marker without hashes.
+            good.replacen(
+                "version = \"0.1.0\"",
+                "version = \"0.1.0\"\nprev_written = true",
+                1,
+            ),
         ];
         for text in &cases {
             let error = State::parse(text, path).unwrap_err();

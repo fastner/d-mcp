@@ -315,6 +315,8 @@ pub fn plan_harness(input: &PlanInput<'_>) -> Planned {
                         sent: actual.hash.clone(),
                         readback: actual.hash.clone(),
                         definition_hash,
+                        // A taken-over entry was not written by d-mcp.
+                        written: false,
                     },
                 ));
                 taken_over = true;

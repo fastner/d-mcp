@@ -431,3 +431,88 @@ fn every_error_variant_maps_to_its_documented_code() {
         );
     }
 }
+
+#[test]
+fn claude_sync_and_unmanage_documents_match_the_reference() {
+    let env = TestEnv::new();
+    let bin = env.fake_claude_dir();
+    let env = env.with_path(&[bin]);
+    env.init();
+    env.write_local("github", &stdio("github", "/usr/bin/github"));
+    env.write_local(
+        "linear",
+        include_str!("fixtures/definitions/valid/linear.toml"),
+    );
+    env.json(&["select", "github", "--harness", "claude"]);
+    env.json(&["select", "linear", "--harness", "claude"]);
+    for args in [
+        vec!["--dry-run", "sync", "--harness", "claude"],
+        vec!["sync", "--harness", "claude"],
+        vec!["sync", "--harness", "claude"],
+    ] {
+        let (code, value, _) = env.json(&args);
+        assert_eq!(code, 0, "{args:?}: {value:#}");
+        check_success(&value, "### `sync`");
+        let harnesses = value["data"]["harnesses"].as_array().unwrap();
+        assert_eq!(harnesses.len(), 1);
+        assert_eq!(harnesses[0]["harness"], "claude");
+    }
+
+    // Exit 1: a failed CLI call, with the per-entry error.
+    env.write_local("github", &stdio("github", "/usr/bin/github-v2"));
+    env.claude_mode(&["fail add-json github"]);
+    let (code, value, _) = env.json(&["sync", "--harness", "claude"]);
+    check_sync_failure(&value, 1, code, "harness-cli-failed");
+    let entry = &value["data"]["harnesses"][0]["entries"][0];
+    assert_eq!(entry["outcome"], "lost");
+    assert_eq!(entry["error"]["code"], "harness-cli-failed");
+    assert!(entry["error"]["hint"].is_string());
+
+    // Exit 3: the entry does not read back as written.
+    env.claude_mode(&["alter add-json github"]);
+    let (code, value, _) = env.json(&["sync", "--harness", "claude"]);
+    check_sync_failure(&value, 3, code, "harness-verify-failed");
+    env.claude_mode(&[]);
+
+    // Exit 4: the CLI is missing while there are operations.
+    let without = env.root().join("empty-bin");
+    let output = env
+        .cmd()
+        .env("PATH", &without)
+        .args([
+            "--json",
+            "unmanage",
+            "github",
+            "--harness",
+            "claude",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    env.write_local("tools", &stdio("tools", "/usr/bin/tools"));
+    env.json(&["select", "tools", "--harness", "claude"]);
+    let output = env
+        .cmd()
+        .env("PATH", &without)
+        .args(["--json", "sync", "--harness", "claude"])
+        .output()
+        .unwrap();
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    check_sync_failure(
+        &value,
+        4,
+        output.status.code().unwrap(),
+        "harness-cli-not-found",
+    );
+
+    for args in [
+        vec!["--dry-run", "unmanage", "linear", "--harness", "claude"],
+        vec!["unmanage", "linear", "--harness", "claude"],
+    ] {
+        let (code, value, _) = env.json(&args);
+        assert_eq!(code, 0, "{args:?}");
+        check_success(&value, "### `unmanage`");
+        assert_eq!(value["data"]["harnesses"], serde_json::json!(["claude"]));
+    }
+}

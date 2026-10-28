@@ -15,7 +15,10 @@
 //! is never accepted as a string. A key that is not on the allow-list is not
 //! echoed unless it is one of the adapter's deliberately excluded keys.
 
-use crate::adapter::{Adapter, MAX_TIMEOUT_SECONDS, OverrideType};
+use crate::adapter::{
+    Adapter, MAX_PORT, MAX_TIMEOUT_MILLISECONDS, MAX_TIMEOUT_SECONDS, MIN_PORT,
+    MIN_TIMEOUT_MILLISECONDS, OverrideType,
+};
 use crate::definition::{Definition, OverrideKind, OverrideSite, OverrideSites, Transport};
 use crate::resolver::{FileProblem, SourceSnapshot};
 use crate::rule::Rule;
@@ -114,6 +117,14 @@ fn check_site(
                     .and_then(serde_json::Value::as_array)
                     .is_some_and(|items| !items.is_empty())
         }
+        OverrideType::Milliseconds => matches!(
+            site.kind,
+            OverrideKind::Integer(ms) if (MIN_TIMEOUT_MILLISECONDS..=MAX_TIMEOUT_MILLISECONDS).contains(&ms)
+        ),
+        OverrideType::Port => matches!(
+            site.kind,
+            OverrideKind::Integer(port) if (MIN_PORT..=MAX_PORT).contains(&port)
+        ),
     };
     let field = format!("{table}.{}", site.key);
     if !valid {
@@ -197,13 +208,42 @@ mod tests {
         );
     }
 
+    fn check_claude(overrides: &str) -> Result<(), FileProblem> {
+        check_text(&format!(
+            "name = \"a\"\n[transport]\ntype = \"http\"\nurl = \"https://x.test/mcp\"\n[harness.claude]\n{overrides}"
+        ))
+    }
+
     #[test]
-    fn claude_overrides_stay_opaque() {
-        assert!(
-            check_text(
-                "name = \"a\"\n[transport]\ntype = \"stdio\"\ncommand = \"x\"\n[harness.claude]\nanything = 1\n"
-            )
-            .is_ok()
-        );
+    fn claude_overrides_have_an_allow_list() {
+        assert!(check_claude("timeout = 1000\noauth_callback_port = 1024\n").is_ok());
+        assert!(check_claude("timeout = 31536000000\noauth_callback_port = 65535\n").is_ok());
+        let unknown = check_claude("anything = 1\n").unwrap_err();
+        assert_eq!(unknown.rule, Rule::OverrideKey);
+        assert_eq!(unknown.field.as_deref(), Some("harness.claude"));
+        for excluded in ["headersHelper", "headers_helper", "env"] {
+            let problem = check_claude(&format!("{excluded} = \"x\"\n")).unwrap_err();
+            assert_eq!(problem.rule, Rule::OverrideKey);
+            assert_eq!(
+                problem.field.as_deref(),
+                Some(format!("harness.claude.{excluded}").as_str())
+            );
+        }
+        for bad in [
+            "timeout = 999\n",
+            "timeout = 31536000001\n",
+            "timeout = 1500.0\n",
+            "timeout = \"1000\"\n",
+            "oauth_callback_port = 80\n",
+            "oauth_callback_port = 65536\n",
+            "oauth_callback_port = 8080.0\n",
+            "oauth_callback_port = true\n",
+        ] {
+            assert_eq!(
+                check_claude(bad).unwrap_err().rule,
+                Rule::OverrideType,
+                "{bad}"
+            );
+        }
     }
 }

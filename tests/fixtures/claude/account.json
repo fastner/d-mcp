@@ -1,0 +1,53 @@
+{
+  "numStartups": 12,
+  "installMethod": "native",
+  "autoUpdates": false,
+  "userID": "CANARY_CLAUDE_USER_ID",
+  "oauthAccount": {
+    "accountUuid": "CANARY_CLAUDE_ACCOUNT",
+    "emailAddress": "canary-account@example.test",
+    "organizationName": "CANARY_CLAUDE_ORG"
+  },
+  "cachedStatsigGates": {
+    "CANARY_CLAUDE_CACHE_GATE": true
+  },
+  "cachedChangelog": "CANARY_CLAUDE_CHANGELOG",
+  "tipsHistory": {
+    "mcp": 3
+  },
+  "mcpServers": {
+    "foreign": {
+      "command": "/usr/bin/foreign",
+      "args": [],
+      "env": {
+        "TOKEN": "CANARY_CLAUDE_FOREIGN_SECRET"
+      }
+    },
+    "remote": {
+      "type": "http",
+      "url": "https://foreign.example.test/mcp",
+      "headers": {
+        "Authorization": "Bearer CANARY_CLAUDE_FOREIGN_TOKEN"
+      }
+    }
+  },
+  "projects": {
+    "/work/app": {
+      "allowedTools": [],
+      "history": [
+        {
+          "display": "CANARY_CLAUDE_HISTORY"
+        }
+      ],
+      "mcpServers": {
+        "github": {
+          "command": "/usr/bin/local-github",
+          "env": {
+            "T": "CANARY_CLAUDE_LOCAL_SECRET"
+          }
+        }
+      },
+      "hasTrustDialogAccepted": true
+    }
+  }
+}

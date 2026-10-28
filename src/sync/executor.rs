@@ -9,12 +9,13 @@ use super::{
     Desired, HeldReason, Operation, PlanInput, PlanStatus, PlannedEntry, RecordChange, plan_harness,
 };
 use crate::adapter::{
-    self, Adapter, Gap, GapSeverity, HarnessPlan, HarnessRead, Hooks, Intent, Journal, Scope,
-    WriteOp,
+    self, Adapter, ApplyContext, ApplyMode, EntryOutcome, EntryResult, Gap, GapSeverity,
+    HarnessPlan, HarnessRead, Hooks, Intent, Journal, Scope, VarLookup, WriteOp,
 };
 use crate::config::{Harness, HarnessSet};
 use crate::error::{Error, Result};
 use crate::output::Report;
+use crate::process::ProcessRunner;
 use crate::resolver::{HoldReason, Resolution, Status, resolve};
 use crate::source::{scan, source_specs};
 use crate::state::{self, Hashes, Record, RecordKey, RecordState, Settled, State};
@@ -45,6 +46,9 @@ pub struct SyncOptions<'a> {
     pub take_over: BTreeSet<String>,
     /// Rewrite recorded paths to the newly resolved location.
     pub relocate: bool,
+    /// Looks up a variable of d-mcp's environment (for `client_secret_env`);
+    /// `None` reads the process environment.
+    pub var: Option<VarLookup<'a>>,
     /// Test seams.
     pub hooks: SyncHooks<'a>,
 }
@@ -82,6 +86,7 @@ impl Journal for StateJournal<'_> {
                         .unwrap_or_default(),
                     readback: readback.clone(),
                     definition_hash: entry.definition_hash.clone().unwrap_or_default(),
+                    written: true,
                 }),
                 _ => None,
             };
@@ -244,17 +249,28 @@ fn sync_harness(
         PlanStatus::LocationChanged => report.status = HarnessStatus::LocationChanged,
         PlanStatus::UnsupportedRoot => {
             report.status = HarnessStatus::Unsupported;
-            report.notices.push(
-                "`mcp_servers` is an inline table or uses dotted keys; d-mcp does not edit it"
-                    .to_owned(),
-            );
+            report
+                .notices
+                .push(adapter.texts().unsupported_root.to_owned());
         }
     }
     for old in &planned.relocated_from {
         report.notices.push(format!(
-            "relocated from {}: that file still contains the formerly managed tables, and d-mcp no longer owns them",
-            old.to_string_lossy()
+            "relocated from {}: that file still contains {}, and d-mcp no longer owns them",
+            old.to_string_lossy(),
+            adapter.texts().relocated_leftover
         ));
+    }
+    for entry in &planned.entries {
+        let managed = entry.desired || entry.owned_hash.is_some();
+        if let (true, Some(projects)) = (managed, read.shadowed.get(&entry.name)) {
+            for project in projects {
+                report.notices.push(format!(
+                    "`{}` is shadowed by a local-scope entry in the project {project}; the harness uses that entry there",
+                    entry.name
+                ));
+            }
+        }
     }
     let dry_run = context.options.dry_run;
     let key = |name: &str| RecordKey {
@@ -281,15 +297,21 @@ fn sync_harness(
                 name: entry.name.clone(),
                 kind: entry.write?,
                 rendered: entry.rendered.clone(),
+                rollback: entry.previous.as_ref().is_some_and(|hashes| hashes.written),
             })
         })
         .collect();
+    if adapter.apply_mode() == ApplyMode::HarnessCli && !location.binary_found {
+        report.notices.push(
+            "the harness CLI is not on PATH; d-mcp writes this harness only through it".to_owned(),
+        );
+    }
     let mut write_outcome = if dry_run {
         Outcome::Planned
     } else {
         Outcome::Applied
     };
-    let mut readbacks: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut results: BTreeMap<String, EntryResult> = BTreeMap::new();
     // The journal persists `pending` records, so after a write attempt the
     // final state is saved even when it equals the state before the run.
     let attempted = context.lock.is_some() && !ops.is_empty();
@@ -304,7 +326,15 @@ fn sync_harness(
             planned: &planned.entries,
             warnings,
         };
+        let process_env = |name: &str| std::env::var_os(name);
+        let ctx = ApplyContext {
+            env: context.env,
+            runner: &ProcessRunner::default(),
+            neutral_dir: &context.paths.root,
+            var: context.options.var.unwrap_or(&process_env),
+        };
         let applied = adapter.apply(
+            &ctx,
             &read,
             &HarnessPlan { ops },
             &mut journal,
@@ -317,32 +347,25 @@ fn sync_harness(
                 }
                 report.created = result.created;
                 warnings.extend(result.warnings.iter().map(ToString::to_string));
+                let mut unsettled = false;
                 for entry in result.entries {
-                    let planned_entry = planned.entries.iter().find(|p| p.name == entry.name);
-                    match (&entry.readback, planned_entry) {
-                        (Some(readback), Some(planned_entry)) => {
-                            let hashes = Hashes {
-                                sent: planned_entry
-                                    .rendered
-                                    .as_ref()
-                                    .map(|rendered| rendered.sent_hash.clone())
-                                    .unwrap_or_default(),
-                                readback: readback.clone(),
-                                definition_hash: planned_entry
-                                    .definition_hash
-                                    .clone()
-                                    .unwrap_or_default(),
-                            };
-                            state.records.insert(
-                                key(&entry.name),
-                                Record::owned(location.file.clone(), hashes),
-                            );
+                    match entry.outcome {
+                        EntryOutcome::Applied => {
+                            promote(state, key(&entry.name), &location.file, &planned, &entry);
                         }
-                        _ => {
-                            state.records.remove(&key(&entry.name));
-                        }
+                        // Nothing was journaled for a skipped entry.
+                        EntryOutcome::Drift => {}
+                        _ => unsettled = true,
                     }
-                    readbacks.insert(entry.name, entry.readback);
+                    results.insert(entry.name.clone(), entry);
+                }
+                if unsettled {
+                    // A harness-CLI write that failed, was rolled back or
+                    // lost its entry: settle its intent against the file.
+                    // An unreadable file keeps it pending.
+                    if let Ok(reread) = adapter.read(&location) {
+                        settle_pending(state, harness, scope, &reread);
+                    }
                 }
             }
             Err(error) => {
@@ -361,49 +384,145 @@ fn sync_harness(
         let warning = state::save(context.paths, lock, state)?;
         warnings.extend(warning.map(|warning| warning.to_string()));
     }
+    let texts = adapter.texts();
+    let mut worst: Option<Error> = None;
     for entry in planned.entries {
-        let outcome = if entry.write.is_some() {
-            write_outcome
-        } else if entry.operation.blocks() {
-            Outcome::Blocked
-        } else if entry.operation == Operation::Held {
-            Outcome::Kept
-        } else if entry.record != RecordChange::Keep {
-            if dry_run {
-                Outcome::Planned
-            } else {
-                Outcome::Recorded
+        let result = results.remove(&entry.name);
+        let mut operation = entry.operation;
+        let mut error = None;
+        let mut gaps = entry.gaps;
+        let mut extra_notice = None;
+        // The verified read-back of an applied write (`None` after a Remove).
+        let mut readback: Option<Option<String>> = None;
+        let outcome = match result {
+            Some(result) => {
+                gaps.extend(result.gaps);
+                match result.outcome {
+                    EntryOutcome::Applied => {
+                        readback = Some(result.readback);
+                        Outcome::Applied
+                    }
+                    EntryOutcome::Drift => {
+                        operation = Operation::Drift;
+                        readback = Some(entry.owned_hash.clone());
+                        Outcome::Blocked
+                    }
+                    EntryOutcome::Failed(failure) => {
+                        error = Some(failure);
+                        Outcome::Failed
+                    }
+                    EntryOutcome::RolledBack(failure) => {
+                        error = Some(failure);
+                        extra_notice = Some(
+                            "the new entry could not be added; the previous entry was restored"
+                                .to_owned(),
+                        );
+                        Outcome::RolledBack
+                    }
+                    EntryOutcome::Lost {
+                        error: failure,
+                        fields,
+                    } => {
+                        error = Some(failure);
+                        extra_notice = Some(format!(
+                            "lost: the update removed the entry and could not add it again (fields: {}); the next sync re-adds it",
+                            fields.join(", ")
+                        ));
+                        Outcome::Lost
+                    }
+                }
             }
-        } else {
-            Outcome::Unchanged
+            None if entry.write.is_some() => write_outcome,
+            None if entry.operation.blocks() => Outcome::Blocked,
+            None if entry.operation == Operation::Held => Outcome::Kept,
+            None if entry.record != RecordChange::Keep => {
+                if dry_run {
+                    Outcome::Planned
+                } else {
+                    Outcome::Recorded
+                }
+            }
+            None => Outcome::Unchanged,
         };
-        let hash = match readbacks.get(&entry.name) {
-            Some(readback) => readback.clone(),
-            None if outcome == Outcome::Failed => entry.owned_hash.clone(),
-            None => match &entry.record {
+        let hash = match (readback, outcome) {
+            (Some(readback), _) => readback,
+            (None, Outcome::Failed | Outcome::RolledBack | Outcome::Lost) => {
+                entry.owned_hash.clone()
+            }
+            (None, _) => match &entry.record {
                 RecordChange::Set(record) => record.hashes().map(|h| h.readback.clone()),
                 RecordChange::Drop => None,
                 RecordChange::Keep if entry.write.is_some() => None,
                 RecordChange::Keep => entry.owned_hash.clone(),
             },
         };
+        if let Some(failure) = &error
+            && worst.as_ref().is_none_or(|current| {
+                report::rank(failure.exit_code()) > report::rank(current.exit_code())
+            })
+        {
+            worst = Some(failure.clone());
+        }
+        let notice = report::notice(
+            operation,
+            &entry.name,
+            harness,
+            texts,
+            entry.taken_over,
+            entry.desired,
+        );
+        let notice = match (notice, extra_notice) {
+            (Some(notice), Some(extra)) => Some(format!("{notice}; {extra}")),
+            (notice, extra) => notice.or(extra),
+        };
         report.entries.push(report::EntryReport {
-            notice: report::notice(
-                entry.operation,
-                &entry.name,
-                harness,
-                entry.taken_over,
-                entry.desired,
-            ),
+            notice,
             name: entry.name,
-            operation: entry.operation,
+            operation,
             outcome,
-            gaps: entry.gaps,
+            gaps,
             reason: entry.reason,
             hash,
+            error,
         });
     }
+    if let (None, Some(worst)) = (&report.error, worst) {
+        report = report.failed(worst);
+    }
     Ok(report)
+}
+
+/// Promotes the record of an applied write: owned with the planned hashes
+/// and the verified read-back hash, written by d-mcp; or dropped after a
+/// Remove.
+fn promote(
+    state: &mut State,
+    key: RecordKey,
+    file: &Path,
+    planned: &super::Planned,
+    entry: &EntryResult,
+) {
+    let planned_entry = planned.entries.iter().find(|p| p.name == entry.name);
+    match (&entry.readback, planned_entry) {
+        (Some(readback), Some(planned_entry)) => {
+            let hashes = Hashes {
+                sent: planned_entry
+                    .rendered
+                    .as_ref()
+                    .map(|rendered| rendered.sent_hash.clone())
+                    .unwrap_or_default(),
+                readback: readback.clone(),
+                definition_hash: planned_entry.definition_hash.clone().unwrap_or_default(),
+                written: true,
+            };
+            state
+                .records
+                .insert(key, Record::owned(file.to_path_buf(), hashes));
+        }
+        _ => {
+            state.records.remove(&key);
+        }
+    }
 }
 
 /// Runs `sync`. A global error (store, lock, config, state, unknown

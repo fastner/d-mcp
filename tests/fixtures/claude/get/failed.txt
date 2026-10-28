@@ -1,0 +1,9 @@
+linear:
+  Scope: User config (available in all your projects)
+  Status: ✘ Failed to connect
+  Issue: ECONNREFUSED: ECONNREFUSED: Unable to connect. Is the computer able to access the url?
+  Type: http
+  URL: https://mcp.linear.test/mcp
+  OAuth: client_id configured
+
+To remove this server, run: claude mcp remove linear -s user

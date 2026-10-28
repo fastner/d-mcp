@@ -31,9 +31,9 @@ use std::path::Path;
 use serde_json::{Map, Value, json};
 
 use super::{
-    ActualEntry, Adapter, ApplyMode, ApplyResult, EntryResult, Gap, GapSeverity, HarnessPlan,
-    HarnessRead, Hooks, Intent, Journal, Location, LoginState, OverrideKey, OverrideType,
-    PrivateRead, Rendered, Scope, WriteKind,
+    ActualEntry, Adapter, AdapterTexts, ApplyContext, ApplyMode, ApplyResult, EntryResult, Gap,
+    GapSeverity, HarnessPlan, HarnessRead, Hooks, Intent, Journal, Location, LoginState,
+    OverrideKey, OverrideType, PrivateRead, Rendered, Scope, WriteKind,
 };
 use crate::config::Harness;
 use crate::definition::{Auth, Definition, EnvValue, Transport};
@@ -103,6 +103,14 @@ pub const EXCLUDED_OVERRIDE_KEYS: &[&str] = &[
     "experimental_environment",
 ];
 
+/// The Codex adapter's report texts.
+pub const TEXTS: AdapterTexts = AdapterTexts {
+    unsupported_root: "`mcp_servers` is an inline table or uses dotted keys; d-mcp does not edit it",
+    unsupported_entry: "written in an inline or dotted style d-mcp does not edit; restore the standard table",
+    relocated_leftover: "the formerly managed tables",
+    location_variable: "CODEX_HOME",
+};
+
 /// The Codex adapter.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CodexAdapter;
@@ -122,7 +130,7 @@ struct FileMeta {
 
 /// Reads a file without following a final symlink and without blocking on a
 /// FIFO; it must be a regular file. Returns the bytes, the mode and the
-/// owner.
+/// owner. The file is opened for reading only.
 fn read_regular(path: &Path) -> std::result::Result<(Vec<u8>, FileMeta), ReadProblem> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -401,7 +409,8 @@ impl Adapter for CodexAdapter {
     }
 
     fn foreign_security_keys(&self) -> &'static [(Harness, &'static str)] {
-        // `harness.claude` stays opaque until WP3.
+        // No `harness.claude` key is security-relevant for Codex: the Claude
+        // Code allow-list holds only `timeout` and `oauth_callback_port`.
         &[]
     }
 
@@ -415,6 +424,10 @@ impl Adapter for CodexAdapter {
 
     fn verified_versions(&self) -> &'static [&'static str] {
         VERIFIED_VERSIONS
+    }
+
+    fn texts(&self) -> &'static AdapterTexts {
+        &TEXTS
     }
 
     fn locate(&self, env: &Environment, scope: Scope) -> Result<Location> {
@@ -439,6 +452,7 @@ impl Adapter for CodexAdapter {
             entries: BTreeMap::new(),
             root_supported: true,
             private: PrivateRead::default(),
+            shadowed: BTreeMap::new(),
         };
         if !location.file_exists {
             return Ok(read);
@@ -497,11 +511,14 @@ impl Adapter for CodexAdapter {
             sent_hash: entry_hash(&Value::Object(object)),
             entry,
             gaps,
+            // Codex has no environment form for the client secret.
+            secret_env: None,
         }
     }
 
     fn apply(
         &self,
+        _ctx: &ApplyContext<'_>,
         read: &HarnessRead,
         plan: &HarnessPlan,
         journal: &mut dyn Journal,
@@ -615,10 +632,7 @@ impl Adapter for CodexAdapter {
                 .map(|op| {
                     let readback = actual.entries.get(&op.name).map(|e| e.hash.clone());
                     let wanted = expected.entries.get(&op.name).map(|e| e.hash.clone());
-                    (readback == wanted).then(|| EntryResult {
-                        name: op.name.clone(),
-                        readback,
-                    })
+                    (readback == wanted).then(|| EntryResult::applied(&op.name, readback))
                 })
                 .collect::<Option<Vec<_>>>();
             (text, entries)
@@ -634,7 +648,7 @@ impl Adapter for CodexAdapter {
                 let restored = ours && restore(&target, read).is_ok();
                 Err(Error::HarnessVerifyFailed {
                     path: file.clone(),
-                    restored,
+                    restored: Some(restored),
                 })
             }
         }
@@ -700,6 +714,7 @@ mod tests {
             name: name.to_owned(),
             kind,
             rendered: None,
+            rollback: false,
         }
     }
 
@@ -824,6 +839,7 @@ mod tests {
         assert!(!adapter.entries_can_vanish());
         assert!(adapter.foreign_security_keys().is_empty());
         assert_eq!(adapter.verified_versions(), ["codex-cli 0.165.0"]);
+        assert_eq!(adapter.texts().location_variable, "CODEX_HOME");
         assert_eq!(adapter.override_keys().len(), 7);
         assert!(
             adapter

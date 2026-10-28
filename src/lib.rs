@@ -11,9 +11,11 @@
 //! and the lock; [`state`] reads `state.toml` and writes it through
 //! [`store`]. [`sync`] splits into a pure planner and an executor (`sync::run`)
 //! that applies a plan through the [`adapter`] contract. An adapter owns the
-//! reads and writes of its harness's files (Codex: `$CODEX_HOME/config.toml`)
-//! and runs harness CLIs only through [`process`]. [`cli`] parses, dispatches
-//! and renders through [`output`].
+//! reads of its harness's files and every write to them. Codex edits
+//! `$CODEX_HOME/config.toml` itself; Claude Code is read from `~/.claude.json`
+//! (or under `CLAUDE_CONFIG_DIR`), which d-mcp never writes, and written
+//! through the `claude` CLI. Harness CLIs run only through [`process`]. [`cli`]
+//! parses, dispatches and renders through [`output`].
 
 pub mod adapter;
 pub mod canonical;

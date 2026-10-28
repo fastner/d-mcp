@@ -4,9 +4,15 @@
 //! `XDG_*` directories pointing into a fresh temporary directory, with
 //! `D_MCP_STORE` removed and the current directory inside the temporary
 //! directory. No test touches the real `~/.d-mcp` or real harness
-//! configuration. `PATH` is inherited unless a test controls it with
-//! [`TestEnv::with_path`] or [`TestEnv::without_codex`], which matters
-//! because a `codex` binary on `PATH` makes Codex count as present.
+//! configuration.
+//!
+//! `PATH` is always controlled: by default it holds only an empty directory,
+//! so neither a real `codex` nor a real `claude` is ever found or run (a
+//! binary on `PATH` makes its harness count as present, and d-mcp writes
+//! Claude Code entries through `claude`). Tests that need a harness CLI put
+//! the fakes on `PATH` with [`TestEnv::with_path`], [`TestEnv::fake_codex_dir`]
+//! and [`TestEnv::fake_claude_dir`]. The fake `claude` refuses to run unless
+//! its `HOME` lies in a directory marked by [`TEST_ROOT_MARKER`].
 
 #![allow(dead_code)]
 
@@ -19,11 +25,16 @@ use assert_cmd::cargo::cargo_bin_cmd;
 use serde_json::Value;
 use tempfile::TempDir;
 
+/// The marker file in the temporary root; the fake `claude` runs only when
+/// its `HOME` is a child of a directory that holds it.
+pub const TEST_ROOT_MARKER: &str = ".d-mcp-test-root";
+
 /// An isolated environment for running `d-mcp`.
 pub struct TestEnv {
     dir: TempDir,
-    path: Option<OsString>,
+    path: OsString,
     codex_home: bool,
+    claude_config_dir: bool,
 }
 
 impl TestEnv {
@@ -42,24 +53,83 @@ impl TestEnv {
         ] {
             fs::create_dir_all(dir.path().join(sub)).expect("create isolation dirs");
         }
+        fs::write(dir.path().join(TEST_ROOT_MARKER), "").expect("write the test root marker");
+        let empty = dir.path().join("empty-bin");
+        fs::create_dir_all(&empty).expect("create empty bin dir");
         Self {
+            path: std::env::join_paths([&empty]).expect("join PATH"),
             dir,
-            path: None,
             codex_home: true,
+            claude_config_dir: true,
         }
     }
 
     /// Sets `PATH` to exactly these directories.
     pub fn with_path(mut self, dirs: &[PathBuf]) -> Self {
-        self.path = Some(std::env::join_paths(dirs).expect("join PATH"));
+        self.path = std::env::join_paths(dirs).expect("join PATH");
         self
     }
 
-    /// Sets `PATH` to an empty directory, so no `codex` binary is found.
+    /// Sets `PATH` to an empty directory, so no `codex` binary is found (the
+    /// default).
     pub fn without_codex(self) -> Self {
         let empty = self.root().join("empty-bin");
-        fs::create_dir_all(&empty).expect("create empty bin dir");
         self.with_path(&[empty])
+    }
+
+    /// Sets `PATH` to an empty directory, so no `claude` binary is found (the
+    /// default).
+    pub fn without_claude(self) -> Self {
+        self.without_codex()
+    }
+
+    /// Unsets `CLAUDE_CONFIG_DIR`, so Claude Code falls back to
+    /// `$HOME/.claude.json`.
+    pub fn without_claude_config_dir(mut self) -> Self {
+        self.claude_config_dir = false;
+        self
+    }
+
+    /// The isolated `CLAUDE_CONFIG_DIR`.
+    pub fn claude_dir(&self) -> PathBuf {
+        self.root().join("claude")
+    }
+
+    /// Claude Code's configuration file (no legacy `.config.json`).
+    pub fn claude_config(&self) -> PathBuf {
+        if self.claude_config_dir {
+            self.claude_dir().join(".claude.json")
+        } else {
+            self.home().join(".claude.json")
+        }
+    }
+
+    /// Installs the fake `claude` (the `fake_claude` test target, built from
+    /// `tests/support/fake_claude.rs`) as `<root>/claude-bin/claude` and
+    /// returns the directory.
+    pub fn fake_claude_dir(&self) -> PathBuf {
+        let bin = self.root().join("claude-bin");
+        fs::create_dir_all(&bin).expect("create claude bin dir");
+        let built = fake_claude_binary();
+        let target = bin.join("claude");
+        fs::copy(&built, &target).expect("install fake claude");
+        bin
+    }
+
+    /// The fake `claude`'s call log: one JSON object per call.
+    pub fn claude_calls(&self) -> Vec<Value> {
+        fs::read_to_string(self.root().join("fake-claude.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("fake claude log line"))
+            .collect()
+    }
+
+    /// Sets the fake `claude`'s directives, one per line.
+    pub fn claude_mode(&self, lines: &[&str]) {
+        fs::write(self.root().join("fake-claude-mode"), lines.join("\n"))
+            .expect("write fake claude mode");
+        let _ = fs::remove_file(self.root().join("fake-claude-state"));
     }
 
     /// Unsets `CODEX_HOME`, so Codex falls back to `$HOME/.codex`.
@@ -112,7 +182,10 @@ impl TestEnv {
             codex_home: self
                 .codex_home
                 .then(|| self.root().join("codex").into_os_string()),
-            path: self.path.clone().or_else(|| std::env::var_os("PATH")),
+            path: Some(self.path.clone()),
+            claude_config_dir: self
+                .claude_config_dir
+                .then(|| self.claude_dir().into_os_string()),
         }
     }
 
@@ -140,21 +213,24 @@ impl TestEnv {
     pub fn cmd(&self) -> Command {
         let mut cmd = cargo_bin_cmd!("d-mcp");
         cmd.env("HOME", self.home())
-            .env("CLAUDE_CONFIG_DIR", self.root().join("claude"))
+            .env("PATH", &self.path)
             .env("XDG_CONFIG_HOME", self.root().join("xdg/config"))
             .env("XDG_DATA_HOME", self.root().join("xdg/data"))
             .env("XDG_STATE_HOME", self.root().join("xdg/state"))
             .env("XDG_CACHE_HOME", self.root().join("xdg/cache"))
             .env("XDG_RUNTIME_DIR", self.root().join("xdg"))
             .env_remove("D_MCP_STORE")
+            .env_remove("MCP_CLIENT_SECRET")
             .current_dir(self.work());
+        if self.claude_config_dir {
+            cmd.env("CLAUDE_CONFIG_DIR", self.claude_dir());
+        } else {
+            cmd.env_remove("CLAUDE_CONFIG_DIR");
+        }
         if self.codex_home {
             cmd.env("CODEX_HOME", self.root().join("codex"));
         } else {
             cmd.env_remove("CODEX_HOME");
-        }
-        if let Some(path) = &self.path {
-            cmd.env("PATH", path);
         }
         cmd
     }
@@ -208,6 +284,74 @@ impl TestEnv {
         fs::create_dir_all(dir.join("servers")).expect("create source dir");
         dir
     }
+}
+
+/// The built fake `claude`: the `fake_claude` test target (no libtest
+/// harness) next to this test executable in `target/<profile>/deps/`
+/// (`cargo llvm-cov` uses its own target directory with the same layout).
+/// Every `cargo test` without `--test` builds it; a run filtered with
+/// `--test` needs `--test fake_claude` as well.
+///
+/// The lookup never uses a stale build. A candidate counts only when it is
+/// fresh the way cargo decides it: the binary is at least as new as every
+/// source listed in its rustc dep-info file (`fake_claude-<hash>.d`: the
+/// fake's source, the fixtures it includes and `Cargo.toml`). Among fresh
+/// candidates (one per feature set or profile, all built from the same
+/// sources) the newest wins, ties broken by name. Without a fresh candidate
+/// the test panics with the command that builds one.
+pub fn fake_claude_binary() -> PathBuf {
+    let exe = std::env::current_exe().expect("the test executable");
+    let deps = exe.parent().expect("target/<profile>/deps");
+    let suffix = std::env::consts::EXE_SUFFIX;
+    let mut fresh: Vec<(std::time::SystemTime, PathBuf)> = fs::read_dir(deps)
+        .expect("read the deps directory")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?;
+            let rest = name.strip_prefix("fake_claude-")?;
+            let hash = rest.strip_suffix(suffix).unwrap_or(rest);
+            if hash.len() != 16 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return None;
+            }
+            let built = fs::metadata(&path).ok().filter(fs::Metadata::is_file)?;
+            let built = built.modified().ok()?;
+            let dep_info = deps.join(format!("fake_claude-{hash}.d"));
+            is_fresh(&dep_info, built).then_some((built, path))
+        })
+        .collect();
+    fresh.sort();
+    fresh.pop().map(|(_, path)| path).unwrap_or_else(|| {
+        panic!(
+            "no up-to-date fake_claude build in {}; run `cargo test` (or add `--test fake_claude`)",
+            deps.display()
+        )
+    })
+}
+
+/// Whether a build is at least as new as every source its rustc dep-info
+/// file lists. Source paths are relative to the package root; `\ ` escapes
+/// a space. A missing or empty dep-info file, or a missing source, is not
+/// fresh.
+pub fn is_fresh(dep_info: &Path, built: std::time::SystemTime) -> bool {
+    let Ok(text) = fs::read_to_string(dep_info) else {
+        return false;
+    };
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // rustc lists every source once more as a rule without prerequisites,
+    // `<source>:`; the rules of the outputs have `: ` and prerequisites.
+    let sources: Vec<PathBuf> = text
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.strip_suffix(':'))
+        .filter(|source| !source.is_empty() && !source.contains(": "))
+        .map(|source| root.join(source.replace("\\ ", " ")))
+        .collect();
+    !sources.is_empty()
+        && sources.iter().all(|source| {
+            fs::metadata(source)
+                .and_then(|meta| meta.modified())
+                .is_ok_and(|modified| modified <= built)
+        })
 }
 
 /// A minimal valid stdio definition.
