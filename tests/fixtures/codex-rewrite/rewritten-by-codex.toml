@@ -1,0 +1,33 @@
+[mcp_servers.dmcp-header]
+url = "https://header.example.com/mcp"
+enabled = false
+disabled_tools = ["delete"]
+
+[mcp_servers.dmcp-header.env_http_headers]
+X-Api-Key = "API_KEY_VAR"
+
+[mcp_servers.dmcp-oauth]
+url = "https://mcp.example.com/mcp"
+required = true
+scopes = ["read", "write"]
+
+[mcp_servers.dmcp-oauth.oauth]
+client_id = "dmcp-client"
+
+[mcp_servers.dmcp-stdio]
+command = "npx"
+env_vars = ["TOKEN_VAR"]
+cwd = "/srv/dmcp"
+startup_timeout_sec = 30.0
+tool_timeout_sec = 2.5
+enabled_tools = ["search"]
+
+[mcp_servers.dmcp-stdio.env]
+LOG_LEVEL = "info"
+
+[mcp_servers.foreign]
+command = "/bin/echo"
+args = ["hi"]
+
+[mcp_servers.foreign.env]
+FOREIGN = "CANARY_FOREIGN_ENV"

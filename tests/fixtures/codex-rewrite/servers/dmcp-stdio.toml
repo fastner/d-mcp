@@ -1,0 +1,16 @@
+name = "dmcp-stdio"
+[transport]
+type = "stdio"
+command = "npx"
+args = []
+[env]
+TOKEN_VAR = { forward = true }
+LOG_LEVEL = { value = "info" }
+[harness.codex]
+cwd = "/srv/dmcp"
+enabled = true
+required = false
+startup_timeout_sec = 30
+tool_timeout_sec = 2.5
+enabled_tools = ["search"]
+disabled_tools = []

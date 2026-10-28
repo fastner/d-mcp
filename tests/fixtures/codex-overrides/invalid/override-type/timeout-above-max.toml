@@ -1,0 +1,6 @@
+name = "timeout-above-max"
+[transport]
+type = "stdio"
+command = "npx"
+[harness.codex]
+tool_timeout_sec = 31536001

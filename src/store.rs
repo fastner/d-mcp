@@ -36,8 +36,8 @@ pub const LOCK_RETRY_DELAYS: [Duration; 7] = [
 ];
 
 /// Store entries that may exist in a (possibly partial) store directory.
-/// `state.toml`, `lock.toml` and `approvals.toml` are written by later work
-/// packages.
+/// `state.toml` is written by `sync`; `lock.toml` and `approvals.toml` are
+/// written by later work packages.
 const KNOWN_ENTRIES: [&str; 6] = [
     "config.toml",
     "local",
@@ -67,6 +67,12 @@ pub enum StoreWarning {
         /// The permission bits.
         mode: u32,
     },
+    /// An atomic replace of a harness file owned by another user or group:
+    /// the new file has d-mcp's owner and group. The write still succeeded.
+    OwnerNotKept {
+        /// The harness file.
+        path: PathBuf,
+    },
 }
 
 impl std::fmt::Display for StoreWarning {
@@ -84,6 +90,12 @@ impl std::fmt::Display for StoreWarning {
                  d-mcp expects 0700 and leaves it unchanged",
                 path.display()
             ),
+            StoreWarning::OwnerNotKept { path } => write!(
+                f,
+                "{} was owned by another user or group; the atomic replace gave it d-mcp's owner \
+                 and group (extended attributes and ACLs are not kept either)",
+                path.display()
+            ),
         }
     }
 }
@@ -97,6 +109,10 @@ pub struct Environment {
     pub store: Option<OsString>,
     /// The current directory.
     pub cwd: Option<PathBuf>,
+    /// `CODEX_HOME`.
+    pub codex_home: Option<OsString>,
+    /// `PATH`, used to detect harness binaries without running them.
+    pub path: Option<OsString>,
 }
 
 impl Environment {
@@ -108,7 +124,23 @@ impl Environment {
             home: std::env::var_os("HOME"),
             store: std::env::var_os("D_MCP_STORE"),
             cwd: std::env::current_dir().ok(),
+            codex_home: std::env::var_os("CODEX_HOME"),
+            path: std::env::var_os("PATH"),
         }
+    }
+
+    /// Resolves the Codex home: `CODEX_HOME` (an empty value counts as unset;
+    /// a relative value is resolved like a store path), then `$HOME/.codex`.
+    ///
+    /// # Errors
+    ///
+    /// See [`Environment::absolute`]; [`Error::HomeUnset`] when the default
+    /// is needed and `HOME` is unset or empty.
+    pub fn codex_home(&self) -> Result<PathBuf> {
+        if let Some(home) = self.codex_home.as_ref().filter(|home| !home.is_empty()) {
+            return self.absolute(Path::new(home));
+        }
+        Ok(self.home()?.join(".codex"))
     }
 
     fn home(&self) -> Result<PathBuf> {
@@ -189,6 +221,8 @@ pub struct StorePaths {
     pub local_servers: PathBuf,
     /// `.lock`, the advisory lock file.
     pub lock: PathBuf,
+    /// `state.toml`, the write state of `sync`.
+    pub state: PathBuf,
 }
 
 impl StorePaths {
@@ -200,6 +234,7 @@ impl StorePaths {
             local_root: root.join("local"),
             local_servers: root.join("local").join("servers"),
             lock: root.join(".lock"),
+            state: root.join("state.toml"),
             root,
         }
     }
@@ -419,7 +454,7 @@ pub(crate) fn no_follow(options: &mut OpenOptions, nonblocking: bool) {
 pub(crate) fn no_follow(_options: &mut OpenOptions, _nonblocking: bool) {}
 
 /// Creates one directory with mode `0700`.
-fn create_dir(path: &Path) -> Result<()> {
+pub(crate) fn create_dir(path: &Path) -> Result<()> {
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -457,6 +492,33 @@ pub fn write_atomic_with(
     bytes: &[u8],
     before_persist: impl FnOnce(&Path) -> io::Result<()>,
 ) -> Result<Option<StoreWarning>> {
+    write_atomic_file(path, bytes, None, |temp| {
+        before_persist(temp).map_err(|error| Error::io("write", path, &error))
+    })
+}
+
+/// Writes any file d-mcp owns a change to atomically, store files and harness
+/// files alike: temp file in the target's directory, fsync, mode, the
+/// `before_persist` seam, `persist` over the target, then an fsync of the
+/// parent directory.
+///
+/// `mode: None` gives the file mode `0600`; `Some(mode)` keeps an existing
+/// file's permission bits. The seam returns a d-mcp [`Result`], so a caller can
+/// abort with its own error (a concurrency re-check, for example); a failing
+/// seam removes the temp file and leaves the target untouched. `path` must be
+/// the final target: symlinks are resolved by the caller, so a link is never
+/// replaced by a regular file.
+///
+/// # Errors
+///
+/// The seam's error, or [`Error::Io`] when any step up to and including the
+/// rename fails; the old file then stays intact.
+pub fn write_atomic_file(
+    path: &Path,
+    bytes: &[u8],
+    mode: Option<u32>,
+    before_persist: impl FnOnce(&Path) -> Result<()>,
+) -> Result<Option<StoreWarning>> {
     let parent = path.parent().unwrap_or(Path::new("."));
     let io_error = |error: io::Error| Error::io("write", path, &error);
     let mut temp = NamedTempFile::new_in(parent).map_err(io_error)?;
@@ -466,10 +528,12 @@ pub fn write_atomic_with(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(temp.path(), fs::Permissions::from_mode(FILE_MODE))
-            .map_err(io_error)?;
+        let mode = mode.unwrap_or(FILE_MODE) & 0o7777;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(mode)).map_err(io_error)?;
     }
-    before_persist(temp.path()).map_err(io_error)?;
+    #[cfg(not(unix))]
+    let _ = mode;
+    before_persist(temp.path())?;
     temp.persist(path).map_err(|error| io_error(error.error))?;
     Ok(File::open(parent)
         .and_then(|directory| directory.sync_all())
@@ -617,7 +681,7 @@ fn loose_permissions(_path: &Path, _metadata: &fs::Metadata) -> Option<StoreWarn
 }
 
 /// Creates a directory and its missing parents, each with mode `0700`.
-fn create_dir_all(path: &Path, created: &mut Vec<PathBuf>) -> Result<()> {
+pub(crate) fn create_dir_all(path: &Path, created: &mut Vec<PathBuf>) -> Result<()> {
     let mut missing = Vec::new();
     let mut current = Some(path);
     while let Some(candidate) = current {
@@ -666,7 +730,45 @@ mod tests {
             home: home.map(OsString::from),
             store: store.map(OsString::from),
             cwd: Some(PathBuf::from("/work")),
+            ..Environment::default()
         }
+    }
+
+    #[test]
+    fn codex_home_resolution() {
+        let mut e = env(Some("/home/u"), None);
+        assert_eq!(e.codex_home().unwrap(), PathBuf::from("/home/u/.codex"));
+        e.codex_home = Some(OsString::new());
+        assert_eq!(e.codex_home().unwrap(), PathBuf::from("/home/u/.codex"));
+        e.codex_home = Some(OsString::from("rel/codex"));
+        assert_eq!(e.codex_home().unwrap(), PathBuf::from("/work/rel/codex"));
+        e.codex_home = Some(OsString::from("/abs/codex"));
+        assert_eq!(e.codex_home().unwrap(), PathBuf::from("/abs/codex"));
+        assert!(matches!(
+            env(None, None).codex_home(),
+            Err(Error::HomeUnset)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_file_keeps_a_given_mode_and_maps_seam_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("config.toml");
+        write_atomic_file(&target, b"a", Some(0o644), |_| Ok(())).unwrap();
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+        let result = write_atomic_file(&target, b"b", None, |_| {
+            Err(Error::HarnessFileChanged {
+                path: target.clone(),
+            })
+        });
+        assert!(matches!(result, Err(Error::HarnessFileChanged { .. })));
+        assert_eq!(fs::read(&target).unwrap(), b"a");
+        write_atomic_file(&target, b"c", None, |_| Ok(())).unwrap();
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, FILE_MODE);
     }
 
     #[test]

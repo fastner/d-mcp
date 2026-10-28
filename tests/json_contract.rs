@@ -328,3 +328,106 @@ fn every_exit_class_uses_the_documented_error_envelope() {
         );
     }
 }
+
+/// Checks the envelope of a `sync` run that exits non-zero: `data` is still
+/// the documented document, with `ok: false` and the aggregate error.
+fn check_sync_failure(value: &Value, exit: i32, code: i32, error: &str) {
+    assert_eq!(code, exit);
+    assert_shape(&documented("### Envelope"), value, "envelope");
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], error);
+    assert_shape(&documented("### `sync`"), &value["data"], "sync");
+    assert!(
+        REFERENCE.contains(&format!("| `{error}` | {exit} |")),
+        "{error} documented with exit {exit}"
+    );
+}
+
+#[test]
+fn sync_and_unmanage_documents_match_the_reference() {
+    let env = TestEnv::new().without_codex();
+    env.init();
+    // Codex not present.
+    env.write_local("github", &stdio("github", "npx"));
+    env.json(&["select", "github"]);
+    let (code, value, _) = env.json(&["sync"]);
+    assert_eq!(code, 0);
+    check_success(&value, "### `sync`");
+    assert_eq!(value["data"]["harnesses"][0]["status"], "not-present");
+
+    fs::create_dir_all(env.codex_home()).unwrap();
+    fs::write(env.codex_config(), "").unwrap();
+    env.write_local(
+        "linear",
+        include_str!("fixtures/definitions/valid/linear.toml"),
+    );
+    env.json(&["select", "linear", "--harness", "codex"]);
+    for args in [vec!["--dry-run", "sync"], vec!["sync"], vec!["sync"]] {
+        let (code, value, _) = env.json(&args);
+        assert_eq!(code, 0, "{args:?}");
+        check_success(&value, "### `sync`");
+        let gaps = &value["data"]["harnesses"][0]["entries"][1]["gaps"];
+        assert_eq!(gaps[0]["field"], "auth.client_secret_env");
+    }
+
+    // Exit 1: drift, with data.
+    let text = fs::read_to_string(env.codex_config()).unwrap();
+    fs::write(
+        env.codex_config(),
+        text.replace("command = \"npx\"", "command = \"npx\"\nargs = [\"x\"]"),
+    )
+    .unwrap();
+    let (code, value, _) = env.json(&["sync"]);
+    check_sync_failure(&value, 1, code, "sync-blocked");
+    assert_eq!(
+        value["data"]["harnesses"][0]["entries"][0]["operation"],
+        "drift"
+    );
+
+    // Exit 3: an invalid harness file, with data.
+    fs::write(env.codex_config(), "[[").unwrap();
+    let (code, value, _) = env.json(&["sync"]);
+    check_sync_failure(&value, 3, code, "harness-config-invalid");
+    assert_eq!(value["data"]["harnesses"][0]["status"], "failed");
+    assert_eq!(
+        value["data"]["harnesses"][0]["error"]["code"],
+        "harness-config-invalid"
+    );
+    fs::write(env.codex_config(), text).unwrap();
+
+    for args in [
+        vec!["--dry-run", "unmanage", "github"],
+        vec!["unmanage", "github"],
+    ] {
+        let (code, value, _) = env.json(&args);
+        assert_eq!(code, 0, "{args:?}");
+        check_success(&value, "### `unmanage`");
+    }
+    let (code, value, _) = env.json(&["unmanage", "linear"]);
+    assert_eq!(code, 0);
+    check_success(&value, "### `unmanage`");
+    assert_eq!(value["data"]["selection"], Value::Null);
+    assert_eq!(value["data"]["selection_removed"], true);
+
+    // Global errors carry no data.
+    let (code, value, _) = env.json(&["sync", "--take-over", "nobody"]);
+    assert_eq!(code, 1);
+    assert_eq!(value["data"], Value::Null);
+    assert_eq!(value["error"]["code"], "unknown-take-over");
+    let (code, value, _) = env.json(&["unmanage", "github"]);
+    assert_eq!(code, 1);
+    assert_eq!(value["data"], Value::Null);
+    assert_eq!(value["error"]["code"], "not-managed");
+}
+
+#[test]
+fn every_error_variant_maps_to_its_documented_code() {
+    for error in d_mcp::error::Error::samples() {
+        assert!(
+            REFERENCE.contains(&format!("| `{}` | {} |", error.code(), error.exit_code())),
+            "`{}` with exit {} is not documented",
+            error.code(),
+            error.exit_code()
+        );
+    }
+}

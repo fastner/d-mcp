@@ -4,10 +4,13 @@
 //! `XDG_*` directories pointing into a fresh temporary directory, with
 //! `D_MCP_STORE` removed and the current directory inside the temporary
 //! directory. No test touches the real `~/.d-mcp` or real harness
-//! configuration.
+//! configuration. `PATH` is inherited unless a test controls it with
+//! [`TestEnv::with_path`] or [`TestEnv::without_codex`], which matters
+//! because a `codex` binary on `PATH` makes Codex count as present.
 
 #![allow(dead_code)]
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -19,6 +22,8 @@ use tempfile::TempDir;
 /// An isolated environment for running `d-mcp`.
 pub struct TestEnv {
     dir: TempDir,
+    path: Option<OsString>,
+    codex_home: bool,
 }
 
 impl TestEnv {
@@ -37,7 +42,78 @@ impl TestEnv {
         ] {
             fs::create_dir_all(dir.path().join(sub)).expect("create isolation dirs");
         }
-        Self { dir }
+        Self {
+            dir,
+            path: None,
+            codex_home: true,
+        }
+    }
+
+    /// Sets `PATH` to exactly these directories.
+    pub fn with_path(mut self, dirs: &[PathBuf]) -> Self {
+        self.path = Some(std::env::join_paths(dirs).expect("join PATH"));
+        self
+    }
+
+    /// Sets `PATH` to an empty directory, so no `codex` binary is found.
+    pub fn without_codex(self) -> Self {
+        let empty = self.root().join("empty-bin");
+        fs::create_dir_all(&empty).expect("create empty bin dir");
+        self.with_path(&[empty])
+    }
+
+    /// Unsets `CODEX_HOME`, so Codex falls back to `$HOME/.codex`.
+    pub fn without_codex_home(mut self) -> Self {
+        self.codex_home = false;
+        self
+    }
+
+    /// The isolated `CODEX_HOME` (or `$HOME/.codex` without one).
+    pub fn codex_home(&self) -> PathBuf {
+        if self.codex_home {
+            self.root().join("codex")
+        } else {
+            self.home().join(".codex")
+        }
+    }
+
+    /// The Codex config file.
+    pub fn codex_config(&self) -> PathBuf {
+        self.codex_home().join("config.toml")
+    }
+
+    /// Installs `tests/support/fake-codex.sh` as `<root>/bin/codex` (mode
+    /// 0755) and returns the directory.
+    pub fn fake_codex_dir(&self) -> PathBuf {
+        let bin = self.root().join("bin");
+        fs::create_dir_all(&bin).expect("create bin dir");
+        let target = bin.join("codex");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake-codex.sh"),
+            &target,
+        )
+        .expect("install fake codex");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o755))
+                .expect("make fake codex executable");
+        }
+        bin
+    }
+
+    /// The library environment matching [`TestEnv::cmd`], for in-process
+    /// tests of the sync engine.
+    pub fn environment(&self) -> d_mcp::store::Environment {
+        d_mcp::store::Environment {
+            home: Some(self.home().into_os_string()),
+            store: None,
+            cwd: Some(self.work()),
+            codex_home: self
+                .codex_home
+                .then(|| self.root().join("codex").into_os_string()),
+            path: self.path.clone().or_else(|| std::env::var_os("PATH")),
+        }
     }
 
     /// The temporary root.
@@ -65,7 +141,6 @@ impl TestEnv {
         let mut cmd = cargo_bin_cmd!("d-mcp");
         cmd.env("HOME", self.home())
             .env("CLAUDE_CONFIG_DIR", self.root().join("claude"))
-            .env("CODEX_HOME", self.root().join("codex"))
             .env("XDG_CONFIG_HOME", self.root().join("xdg/config"))
             .env("XDG_DATA_HOME", self.root().join("xdg/data"))
             .env("XDG_STATE_HOME", self.root().join("xdg/state"))
@@ -73,7 +148,26 @@ impl TestEnv {
             .env("XDG_RUNTIME_DIR", self.root().join("xdg"))
             .env_remove("D_MCP_STORE")
             .current_dir(self.work());
+        if self.codex_home {
+            cmd.env("CODEX_HOME", self.root().join("codex"));
+        } else {
+            cmd.env_remove("CODEX_HOME");
+        }
+        if let Some(path) = &self.path {
+            cmd.env("PATH", path);
+        }
         cmd
+    }
+
+    /// Runs `d-mcp <args>` in text mode and returns exit code, stdout and
+    /// stderr.
+    pub fn text(&self, args: &[&str]) -> (i32, String, String) {
+        let output = self.cmd().args(args).output().expect("run d-mcp");
+        (
+            output.status.code().expect("exit code"),
+            String::from_utf8(output.stdout).expect("utf-8 stdout"),
+            String::from_utf8(output.stderr).expect("utf-8 stderr"),
+        )
     }
 
     /// Runs `d-mcp --json <args>` and returns exit code, parsed stdout and

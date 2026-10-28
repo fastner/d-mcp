@@ -77,6 +77,10 @@ rules! {
     SecretJwt => "secret-jwt",
     SecretHex => "secret-hex",
     SecretEntropy => "secret-entropy",
+    // Harness override tables (`validate`).
+    OverrideKey => "override-key",
+    OverrideType => "override-type",
+    OverrideTransport => "override-transport",
     // `config.toml` only.
     InvalidValue => "invalid-value",
     DuplicateEntry => "duplicate-entry",

@@ -1,0 +1,19 @@
+# Codex configuration, maintained by hand.
+model = "o3"
+approval_policy = "on-request"  # inline comment
+
+# A foreign stdio server; d-mcp must never touch it.
+[mcp_servers.foreign-stdio]
+command = "foreign-cmd"
+args = ["--flag"]
+
+# Comment directly above a header d-mcp will manage after a take-over.
+[mcp_servers.github]
+command = "old-command"
+
+[mcp_servers.github.env]
+OLD = "value"
+
+# Comment above the next foreign table.
+[profiles.fast]
+model = "o4-mini"

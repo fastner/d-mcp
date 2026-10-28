@@ -1,0 +1,6 @@
+name = "relative-cwd"
+[transport]
+type = "stdio"
+command = "npx"
+[harness.codex]
+cwd = "srv/relative"

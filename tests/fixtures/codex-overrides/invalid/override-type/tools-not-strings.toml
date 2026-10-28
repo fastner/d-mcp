@@ -1,0 +1,6 @@
+name = "tools-not-strings"
+[transport]
+type = "stdio"
+command = "npx"
+[harness.codex]
+disabled_tools = [1, 2]

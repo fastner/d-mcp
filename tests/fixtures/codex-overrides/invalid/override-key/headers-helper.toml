@@ -1,0 +1,6 @@
+name = "headers-helper"
+[transport]
+type = "http"
+url = "https://mcp.example.com/mcp"
+[harness.codex]
+http_headers_helper = "/usr/local/bin/helper"

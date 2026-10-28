@@ -1,0 +1,6 @@
+name = "tool-approval"
+[transport]
+type = "stdio"
+command = "npx"
+[harness.codex.tools.search]
+approval_mode = "approve"

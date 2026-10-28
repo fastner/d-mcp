@@ -1,0 +1,6 @@
+name = "tilde-cwd"
+[transport]
+type = "stdio"
+command = "npx"
+[harness.codex]
+cwd = "~/srv"

@@ -1,0 +1,4 @@
+[mcp_servers.foreign]
+command = "foreign"
+
+# no trailing newline after this comment

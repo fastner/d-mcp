@@ -1,0 +1,6 @@
+name = "empty-enabled-tools"
+[transport]
+type = "stdio"
+command = "npx"
+[harness.codex]
+enabled_tools = []

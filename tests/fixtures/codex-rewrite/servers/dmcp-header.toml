@@ -1,0 +1,11 @@
+name = "dmcp-header"
+[transport]
+type = "http"
+url = "https://header.example.com/mcp"
+[auth]
+type = "header_env"
+header = "X-Api-Key"
+var = "API_KEY_VAR"
+[harness.codex]
+enabled = false
+disabled_tools = ["delete"]

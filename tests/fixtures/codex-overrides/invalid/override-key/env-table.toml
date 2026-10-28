@@ -1,0 +1,6 @@
+name = "env-table"
+[transport]
+type = "stdio"
+command = "npx"
+[harness.codex.env]
+LOG_LEVEL = "debug"

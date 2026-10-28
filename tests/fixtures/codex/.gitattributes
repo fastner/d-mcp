@@ -1,0 +1,5 @@
+# Keep the exact bytes of these fixtures: CRLF line endings and a missing
+# trailing newline are what the tests are about.
+crlf.toml -text whitespace=cr-at-eol
+no-trailing-newline.toml -text
+trailing-comments-crlf.toml -text whitespace=cr-at-eol

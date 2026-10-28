@@ -1,8 +1,9 @@
 # d-mcp reference
 
-This is the reference for the harness-independent core of d-mcp: the store, the definition format,
-the secret rules, sources, selections, resolution, exit and error codes, and the JSON documents.
-Later work packages (harness adapters, sync, adoption, approvals) build on it.
+This is the reference for d-mcp: the store, the definition format, the secret rules, sources,
+selections, resolution, override validation, sync with the Codex adapter, the write state, exit and
+error codes, and the JSON documents. Later work packages (the Claude Code adapter, adoption,
+approvals) build on it.
 
 ## Commands
 
@@ -15,6 +16,8 @@ Later work packages (harness adapters, sync, adoption, approvals) build on it.
 | `d-mcp select <server> [--harness claude\|codex]...` | mutating | Select a server for harnesses. |
 | `d-mcp unselect <server>` | mutating | Remove a selection. |
 | `d-mcp resolve` | read-only | Resolve every selection against the sources. |
+| `d-mcp sync [--harness codex]... [--take-over <server>]... [--relocate]` | mutating | Write the selected servers into the harnesses (see [Sync](#sync)). |
+| `d-mcp unmanage <server> [--harness codex]...` | mutating | Stop managing a server's harness entries (see [Unmanage](#unmanage)). |
 
 Global options, accepted before or after the command:
 
@@ -48,13 +51,14 @@ command fails with `home-unset` (exit 4).
 ```text
 <store>/
 ├── config.toml        schema version, user sources, selections
+├── state.toml         write state of `sync` (created on first write)
 ├── .lock              advisory lock file
 └── local/             root of the built-in local source
     └── servers/       definitions of the built-in local source
 ```
 
-Directories are created with mode `0700`, files with mode `0600`. Later work packages create
-`state.toml`, `lock.toml` and `approvals.toml` on first write. Every persisted file carries
+Directories are created with mode `0700`, files with mode `0600`. `sync` creates `state.toml` on
+its first write; later work packages create `lock.toml` and `approvals.toml`. Every persisted file carries
 `schema_version = 1`; another version fails with `schema-unsupported` (exit 3).
 
 `init`:
@@ -122,6 +126,10 @@ cannot be added, removed or re-prioritized (`source-id-reserved`).
   directory. An interrupted write leaves the old file intact. If only the final fsync of the
   parent directory fails, the new content is already in place: the command succeeds and prints a
   warning on stderr that the change may not survive a crash.
+- A rename-based replace creates a new file: it keeps the permission bits d-mcp sets, but not the
+  owner, group, extended attributes or ACLs of the file it replaces. When an existing harness file
+  is owned by another user or group than the d-mcp process, the write still succeeds and prints a
+  `warning:` line that the owner and group changed.
 
 ## Definition format
 
@@ -167,7 +175,7 @@ client_secret_env = "LINEAR_CLIENT_SECRET"
 | `transport.url` | http | The server URL. |
 | `env` | no | stdio only. Table of variable name to `{ forward = true }` or `{ value = "..." }`. |
 | `auth` | no | http only. The auth method. |
-| `harness.codex`, `harness.claude` | no | Opaque per-harness override tables. |
+| `harness.codex`, `harness.claude` | no | Per-harness override tables. `harness.codex` is checked against the Codex allow-list (see [Override validation](#override-validation)); `harness.claude` stays opaque until the Claude Code adapter. |
 
 The `auth` forms:
 
@@ -375,6 +383,27 @@ set), and `harness` when an override table is non-empty. Value encoding:
 Formatting, comments, key order, inline versus standard tables, `scopes` order and explicitly
 written defaults do not change either hash.
 
+### Entry hashes
+
+Harness entries have their own hashes, used by the write state: the *sent* hash of an entry as
+rendered and the *read-back* hash of the entry as read back from the harness. For the Codex adapter
+both use the tag `d-mcp-codex-entry-v1` over the canonical JSON of the full `mcp_servers.<name>`
+subtree, sub-tables included, so the two are comparable. Before hashing, values are canonicalized:
+
+- keys with the value Codex treats as its default are removed, because Codex drops them when it
+  re-saves its file (verified against Codex 0.165.0): `enabled = true`, `required = false`, and an
+  empty `args`, `env_vars`, `env`, `env_http_headers`, `scopes` or `disabled_tools`. An empty
+  `enabled_tools` is not a default (it allows no tool) and is kept;
+- `env_vars` strings become `{ name = "...", source = "local" }`;
+- `startup_timeout_ms` becomes `startup_timeout_sec` (when `startup_timeout_sec` is absent);
+- integers and floats get one number form. This deliberately differs from the definition hashes,
+  where they stay distinct, because Codex rewrites `30` as `30.0` when it saves its file;
+- datetimes keep the `+00:00` to `Z` rule; keys are sorted.
+
+The preserved keys `oauth.client_secret`, `oauth.callback_url` and `oauth.callback_port` are
+excluded (and an `oauth` table that only held them). They are skipped while the entry is read, so
+their values never enter any model, hash or output.
+
 ## Sources and selections
 
 - `source add <path> --id <id> --priority <n>` registers a directory. `~` and relative paths are
@@ -406,19 +435,303 @@ are ordered by descending priority. For every selected server it returns exactly
 
 `source-unavailable` is checked before `invalid-winner`. `config.toml` keeps selections unique; if
 the resolver is given duplicate selections of a server anyway, it keeps the one whose harness list
-sorts first, independent of the input order. WP2 turns `hold` into its *Held*
-operation (keep the existing managed entry unchanged), and WP5 adds the reason
-`pending-approval`.
+sorts first, independent of the input order. `sync` turns `hold` into its *Held* operation (keep the
+existing managed entry unchanged), and WP5 adds the reason `pending-approval`.
+
+## Override validation
+
+`resolve` and `sync` run a `validate` step between the source scan and the resolver. Parsing stays
+adapter-agnostic; `validate` checks each valid definition's `harness.<id>` table against that
+adapter's allow-list, per-key types and ranges, and per-key transport restrictions. A definition
+that breaks it becomes invalid with the rule `override-key` (a key that is not allowed),
+`override-type` (a wrong type or a value outside its range) or `override-transport` (a key that is
+not valid for the definition's transport), reported by line, column and field path. The resolver
+then reports `invalid-definition`, and `invalid-winner` for a selected server: the server is held
+for every harness, Claude Code included (fail closed). Because `resolve` and `sync` run the same
+step, they agree, and d-mcp never writes a value that makes Codex refuse to load its whole
+configuration.
+
+The type check reads the TOML kind as written, so a datetime is never accepted as a string. A key
+that is not on the allow-list is not echoed in the field path unless it is one of the deliberately
+excluded keys.
+
+The `harness.codex` allow-list:
+
+| Key | Type | Transport |
+|---|---|---|
+| `cwd` | absolute path string (starts with `/`; no `~`) | stdio only |
+| `enabled`, `required` | boolean | any |
+| `startup_timeout_sec`, `tool_timeout_sec` | non-negative integer or float of seconds, at most `31536000` (365 days) | any |
+| `enabled_tools` | non-empty array of strings | any |
+| `disabled_tools` | array of strings | any |
+
+These restrictions follow Codex 0.165.0, which refuses to load a configuration with `cwd` on a
+streamable HTTP entry, or with a timeout it cannot convert into a duration (such as `1e300`). An
+empty `enabled_tools` is rejected because Codex drops it when it re-saves its file, which would
+turn "allow no tool" into "allow every tool"; to disable a server, use `enabled = false`.
+
+Deliberately excluded in v1 for security reasons: `default_tools_approval_mode`, `tools`
+(`tools.<tool>.approval_mode`), `http_headers_helper` (it runs a local command) and
+`experimental_environment`. An owned entry that contains them counts as drift.
+
+`harness.claude` stays opaque until the Claude Code adapter (WP3), which will newly invalidate
+definitions with unknown Claude keys.
+
+## Sync
+
+`sync` writes every selected, resolved server into each harness that has an adapter (Codex in this
+version), at user scope. `--harness` limits it to the named harnesses; a harness without an adapter
+(`claude`) is a usage error (exit 2).
+
+### Operations
+
+For each harness, `sync` compares three things per entry name: what the resolver wants (the
+*desired* entry, rendered), what the write state records, and what the harness file actually
+contains.
+
+| Operation | When | Effect |
+|---|---|---|
+| `add` | desired, not recorded, absent | Written. |
+| `update` | the new rendering's hash differs from the recorded sent hash, and the actual hash equals the recorded read-back hash | Rewritten. |
+| `remove` | not desired, recorded, the actual hash equals the recorded read-back hash | Deleted. |
+| `drift` | recorded, the actual hash differs from the recorded read-back hash | Reported only (exit 1). |
+| `collision` | desired, not recorded, a same-name entry exists | Reported only (exit 1). |
+| `identical-collision` | a collision whose content equals the rendering | Reported only (exit 1); `--take-over` resolves it without a write. |
+| `vanished` | recorded, desired, absent | Re-added, with the notice "removed outside d-mcp; run `d-mcp unmanage <server> --harness codex` to keep it removed". |
+| `held` | the resolver holds the server (`invalid-winner`, `source-unavailable`), or a recorded, still-selected server is `not-offered` | The entry is left unchanged; `reason` names why. A held server without a record plans nothing. |
+| `orphaned` | recorded, not desired, absent | The record is dropped. |
+| `location-changed` | the recorded file differs from the resolved one (for example after `CODEX_HOME` changed) | Reported (exit 1); nothing is planned for that harness until `sync --relocate`. |
+| `blocked` | the rendering has an `important` gap | Not written (exit 1). |
+| `unsupported` | an owned entry was rewritten in an inline or dotted-key style | Left untouched (exit 1). |
+| `unchanged` | nothing to do | A changed definition hash with an identical rendering only refreshes the record. |
+
+The planner never compares a rendered entry with the read-back entry directly, except to detect an
+identical collision in adapters whose two hashes are comparable (Codex: yes). Without
+`--take-over`, a drifted entry is never modified.
+
+- A drifted entry that is still selected suggests `sync --take-over`. A drifted entry that is no
+  longer selected suggests `unmanage` (or selecting it again) instead, because a take-over would
+  plan its removal.
+- `--take-over <server>` accepts the actual entry as owned (its sent and read-back hashes become
+  the actual hash), then plans normally in the same run: an identical collision becomes
+  `unchanged` without a write; any other content becomes an `update`. It applies to drift,
+  collision and identical collision. A name that is neither selected nor recorded fails with
+  `unknown-take-over` (exit 1). WP4 adoption reuses this operation.
+- `--relocate` rewrites the recorded paths of a harness to the newly resolved file, then plans
+  normally, which usually re-adds the entries. It reports that the old file still contains the
+  formerly managed tables and that d-mcp no longer owns them; it never edits the old file.
+
+### Gaps
+
+When a definition carries something a harness cannot express, or needs a manual step, rendering
+reports a gap with `field`, `severity` and `reason`. A `note` gap is informational; an `important`
+gap blocks the entry. Codex `note` gaps: `auth = none` (Codex falls back to OAuth discovery), an
+`oauth_supported` flag on `bearer_env` (Codex ignores it), and `client_secret_env` (a manual step,
+see [Codex mapping](#codex-mapping); it is not reported once the entry has an
+`oauth.client_secret`). Keys of another harness's override block that a harness cannot enforce are
+reported as `important` gaps by that harness's adapter; the Claude Code adapter (WP3) does this for
+`harness.codex.disabled_tools` and `enabled_tools`.
+
+### Write state and recovery
+
+Before a harness file is persisted, `sync` writes a `pending` record per entry with the expected
+hashes and the previous owned hashes, under the store lock. The previous hashes are the ones the
+entry was planned from: after `--take-over` or `--relocate` these are the taken-over or relocated
+hashes, so a failed or interrupted write never loses a take-over. After verification the records
+are promoted to `owned`. If the persist or the verification fails, an `update` or `remove` reverts
+to the previous owned record, and an `add` of a new entry drops its record. A `pending` record left
+by a crash is settled by the next sync before planning: it is promoted when the actual hash equals
+the expected read-back hash, otherwise reverted to the previous hashes; an `add` of a new entry
+without previous hashes is dropped, so a same-name entry with other content is reported as a
+`collision`, never owned. A `pending` record for another file than the one just read (for example
+after a crash and a changed `CODEX_HOME`) is left pending; it is reported as `location-changed` and
+settled once its file is read again. Ownership is never lost.
+
+d-mcp checks its own edit before anything is journaled or written: the spliced text must parse,
+keep the `mcp_servers` root editable, keep every entry outside the plan with its hash, and contain
+exactly the planned entries. Otherwise the harness fails with `harness-edit-failed` (exit 3) and
+nothing is written.
+
+### Dry run and lock
+
+`sync` and `unmanage` fail on an uninitialized store before locking. `sync` holds the store lock
+for the whole run. `sync --dry-run` takes no lock, writes neither `state.toml` nor a harness file,
+creates no file or directory, and treats a settled `pending` record as owned for planning only.
+`unmanage --dry-run` only reports.
+
+### Output rules
+
+Until WP4, sync output (text, JSON and errors) names only the harness, scope, file path, entry
+name, operation, outcome, hold reason, gaps and positions, plus the hashes of owned entries. It
+never contains field values, hashes of foreign or unowned entries, child process output or
+`toml_edit` error text.
+
+### Sync exit codes
+
+| Exit | When |
+|---:|---|
+| 0 | Everything was applied, unchanged, held or re-added after `vanished`, or the harness is not present. `note` gaps do not change the code. |
+| 1 | `sync-blocked`: at least one entry is blocked by drift, a collision, a location change, an unsupported entry or root style, or an `important` gap. |
+| 3 | `harness-file-changed`, `harness-config-invalid`, `harness-edit-failed`, `harness-verify-failed`; also `state-corrupt` and `schema-unsupported` for `state.toml`. |
+| 4 | An environment problem (`io-error`, `home-unset`, `harness-path-not-utf8`). |
+
+Across harnesses the highest-priority code wins, in the order 3, 4, 1, 0. Global errors
+(`store-locked`, `config-corrupt`, `state-corrupt`, an uninitialized store, `unknown-take-over`)
+abort before any harness is touched; they carry no `data`.
+
+## Unmanage
+
+`unmanage <server> [--harness codex]` removes the server's write-state records (without
+`--harness`: for every harness with a record) and drops those harnesses from the server's
+selection. The harness entries are left as they are, so the next sync reports no collision.
+
+- A selection of `all` becomes an explicit list of the known harnesses (`claude`, `codex`) minus
+  the unmanaged ones; the conversion is reported. An empty result removes the selection.
+- The record is removed before the selection is written, so a crash in between can only cause a
+  collision on the next sync, never the removal of the entry.
+- A server without a record fails with `not-managed` (exit 1). A `--harness` value without an
+  adapter (`claude`) is a usage error (exit 2).
+
+## Codex mapping
+
+The Codex adapter edits `$CODEX_HOME/config.toml` directly. Its declarations: apply mode
+`direct-edit` (all operations of a sync in one atomic persist), discovery and write scope `user`,
+comparable sent and read-back hashes, no reserved names, entries never vanish on their own,
+verified against `codex-cli 0.165.0`.
+
+### Location and presence
+
+- `CODEX_HOME` (an empty value counts as unset; a relative value is resolved against the current
+  directory), otherwise `$HOME/.codex`. The recorded path is `$CODEX_HOME/config.toml` as resolved
+  *before* following symlinks, so retargeting a dotfile link is not a location change. A path
+  that is not valid UTF-8 is never stored lossily: Codex fails with `harness-path-not-utf8`
+  (exit 4).
+- Codex counts as present when its `config.toml` exists or a `codex` executable is on `PATH`
+  (looked up, never run). If neither exists, Codex is skipped with "harness not present" (exit 0)
+  and nothing is created. If only the file is missing, it is created with mode `0600`, and its
+  directory with `0700`.
+- Profile files (`$CODEX_HOME/<profile>.config.toml`) and project scope are not handled in v1.
+
+### Rendering
+
+| Definition | Codex entry |
+|---|---|
+| stdio `command`, `args` | `command`, `args` (omitted when empty) |
+| `env` forwards | `env_vars` (sorted names) |
+| `env` literals | `[mcp_servers.<name>.env]` |
+| http `url` | `url` |
+| `bearer_env` `var` | `bearer_token_env_var` |
+| `header_env` | `[mcp_servers.<name>.env_http_headers]` `<header> = "<var>"` |
+| `oauth` `client_id` | `[mcp_servers.<name>.oauth]` `client_id` |
+| `oauth` `scopes` | `scopes` (omitted when empty) |
+| `oauth` | `auth` is omitted (Codex's default) |
+| `harness.codex` allowed keys | copied as they are, except Codex's defaults (`enabled = true`, `required = false`, `disabled_tools = []`) |
+
+- `client_secret_env`: Codex has no environment form for the OAuth client secret (verified against
+  Codex 0.165.0). d-mcp treats `oauth.client_secret` as a harness-local preserved key: it never
+  writes, reads, hashes or shows it, and keeps it on Update. While it is missing, sync reports a
+  manual step (`note` gap): enter it once into the Codex table. `oauth.callback_url` (which Codex
+  writes itself next to a client secret given to `codex mcp add`) and `oauth.callback_port` are
+  harness-local preserved keys in the same way.
+- An Update keeps a preserved key only while it fits the new rendering, because Codex refuses to
+  load its whole configuration otherwise (verified against Codex 0.165.0): `oauth.client_secret`
+  stays only next to a rendered `oauth.client_id`; `oauth.callback_url` and `oauth.callback_port`
+  stay only on an http entry that authenticates through OAuth (`oauth`, with or without
+  `client_id`, or `none`, which falls back to OAuth discovery). A switch to stdio, `bearer_env` or
+  `header_env`, or dropping `client_id`, removes the keys that no longer fit. Each removed key is
+  reported as a `note` gap on the entry, by name only: `oauth.client_secret removed: no longer
+  used by this definition`. Its value is never shown or recorded.
+- d-mcp never writes a value Codex treats as its default. Codex drops such keys when it re-saves
+  its file (for example for `codex mcp add` of another server), and the entry hash ignores them,
+  so such a re-save is no drift.
+- `auth = none`: Codex then falls back to OAuth discovery; reported as a `note` gap.
+
+### Write rules
+
+1. A symlinked `config.toml` is resolved to its target. The target is opened without following
+   further links and without blocking; it must be a regular UTF-8 file. Its bytes stay in memory.
+2. Only the managed `mcp_servers.<name>` subtrees are touched. d-mcp splices new text into the
+   original bytes, so every byte outside the managed subtrees stays unchanged, including comments,
+   CRLF line endings and a missing trailing newline. An entry's region starts at its header and
+   ends where the next foreign header's prefix begins, or, for the last table of the file, where
+   the file's trailing blank lines and comments begin; comments above a managed header and after
+   the last table stay in place on Update and Remove. Add appends standard tables, separated by a
+   blank line, using the file's line ending. d-mcp writes no marker comments.
+3. Right before the persist, d-mcp re-resolves the link and re-reads the target. If the link target
+   or the bytes changed, it aborts that harness with `harness-file-changed` (exit 3); nothing is
+   written.
+4. The new content is persisted atomically into the target's directory; the link is kept, and the
+   file keeps its mode (a new file gets `0600`). A failed directory fsync after the rename is a
+   `warning:` line. The replace does not keep the owner, group, extended attributes or ACLs; a
+   file owned by another user or group gets a `warning:` line (see
+   [Locking and atomic writes](#locking-and-atomic-writes)).
+5. The file is read back and the expected hashes are verified. If that fails and the file still
+   holds what d-mcp wrote, the original bytes are restored atomically, with
+   `harness-verify-failed` (exit 3); a failed restore is reported with the same code.
+
+d-mcp keeps no backup copy of harness files anywhere, so no file it writes can contain foreign
+secrets. An owned entry rewritten in an inline or dotted-key style is `unsupported`. An
+`mcp_servers` root defined as an inline table or through dotted keys makes the whole harness
+unsupported for writing (exit 1). Invalid TOML, non-UTF-8 content or a non-regular file is
+`harness-config-invalid` (exit 3), reported by position only.
+
+### Login state
+
+The adapter can read the login state of its entries from `codex mcp list --json` (`auth_status`),
+run without a shell, with a timeout and an output cap, and with the resolved `CODEX_HOME`:
+
+| `auth_status` | State |
+|---|---|
+| `o_auth` | `logged-in` |
+| `not_logged_in` | `needs-login` |
+| `unsupported`, `bearer_token` | `not-applicable` |
+| anything else, a missing binary, a failure, a timeout or oversized output | `unknown` |
+
+`sync` never calls it; `status --auth` (WP4) is its first consumer. d-mcp never reads Codex token
+storage, and child output is never printed: it is parsed in memory only, because a harness CLI can
+echo foreign secrets. On a timeout only the direct child is killed; a grandchild (such as the native
+binary behind the npm shim) may outlive it.
+
+## `state.toml`
+
+```toml
+schema_version = 1
+
+[[records]]
+harness = "codex"
+scope = "user"
+name = "github"
+file = "/home/me/.codex/config.toml"
+status = "owned"
+sent = "<64 hex>"
+readback = "<64 hex>"
+definition_hash = "<64 hex>"
+time = 1793145600
+version = "0.1.0"
+```
+
+- A record is keyed by `harness`, `scope` and `name`. `file` is the harness file as resolved before
+  following symlinks, always valid UTF-8. `sent` is the hash of the entry as rendered, `readback`
+  the semantic hash of the entry as read back, `definition_hash` the source definition hash (WP5
+  binds approvals to it). `time` is in Unix epoch seconds; `version` is the d-mcp version that
+  wrote the record.
+- `status` is `owned` or `pending`. A `pending` record has `op` (`add`, `update` or `remove`), the
+  expected `sent`, `readback` and `definition_hash` (not for `remove`), and the previous owned
+  `prev_sent`, `prev_readback` and `prev_definition_hash` (not for an `add` of a new entry).
+- d-mcp writes the file atomically and in canonical form, records sorted by harness, scope and
+  name. Any deviation makes it corrupt: `state-corrupt` (exit 3), reported by line, column and
+  field path; another schema version fails with `schema-unsupported` (exit 3). d-mcp never
+  rewrites a corrupt file.
 
 ## Exit codes
 
 | Code | Meaning | Cases |
 |---|---|---|
-| 0 | Success | Including resolution problems, holds and warnings |
-| 1 | Expected failure | Store not initialized; invalid arguments; rejected `source add`; `init` into a non-empty directory that is not a store |
-| 2 | Usage error | clap usage errors (unknown flags, missing arguments, non-integer priority); clap prints them as text on stderr, also with `--json` |
-| 3 | Unsafe state | Corrupt or hand-broken `config.toml`; unsupported schema version; `store-locked` |
-| 4 | Environment problem | A missing `HOME`; an unknown current directory; a failed file-system operation |
+| 0 | Success | Including resolution problems, holds, `note` gaps and warnings |
+| 1 | Expected failure | Store not initialized; invalid arguments; rejected `source add`; `init` into a non-empty directory that is not a store; a blocked sync entry; `unmanage` of an unmanaged server |
+| 2 | Usage error | clap usage errors (unknown flags, missing arguments, non-integer priority, a `--harness` without an adapter); clap prints them as text on stderr, also with `--json` |
+| 3 | Unsafe state | Corrupt or hand-broken `config.toml` or `state.toml`; unsupported schema version; `store-locked`; a harness file that changed, is invalid, could not be edited or did not verify |
+| 4 | Environment problem | A missing `HOME`; an unknown current directory; a harness path that is not UTF-8; a failed file-system operation |
 
 ## Error codes
 
@@ -446,6 +759,15 @@ codes, never values.
 | `config-corrupt` | 3 | `config.toml` breaks a rule; it is never rewritten. |
 | `schema-unsupported` | 3 | A persisted file has a `schema_version` other than 1. |
 | `store-locked` | 3 | Another process holds the store lock after all retries. |
+| `harness-file-changed` | 3 | A harness file or its link target changed between read and persist; nothing was written. |
+| `harness-config-invalid` | 3 | A harness file is not valid TOML, not UTF-8 or not a regular file; reported by position only. |
+| `harness-verify-failed` | 3 | A harness file did not read back as written; the original was restored (or the restore failed, as the hint says). |
+| `harness-edit-failed` | 3 | d-mcp could not produce a valid edit of a harness file (the spliced text did not parse, or it changed something outside the plan); nothing was written. |
+| `harness-path-not-utf8` | 4 | A harness configuration path (such as `$CODEX_HOME/config.toml`) is not valid UTF-8, so the write state cannot record it; that harness is skipped. |
+| `state-corrupt` | 3 | `state.toml` breaks a rule; it is never rewritten. |
+| `sync-blocked` | 1 | At least one sync entry is blocked (drift, collision, location change, unsupported style, important gap). |
+| `not-managed` | 1 | `unmanage` of a server without a write-state record. |
+| `unknown-take-over` | 1 | `sync --take-over` names a server that is neither selected nor recorded. |
 | `home-unset` | 4 | `HOME` is unset or empty but needed. |
 | `cwd-unavailable` | 4 | The current directory cannot be determined. |
 | `io-error` | 4 | A file-system operation failed; only the error kind is reported. |
@@ -486,6 +808,9 @@ Rule codes appear in `rule` of problems and in `config-corrupt` hints.
 | `secret-jwt` | file | A JWT. |
 | `secret-hex` | file | A hex run of at least 32 characters outside digest contexts. |
 | `secret-entropy` | file | A high-entropy token. |
+| `override-key` | file | A `harness.<id>` key that the adapter does not allow, or deliberately excludes (`validate`). |
+| `override-type` | file | A `harness.<id>` value of the wrong type or outside its range (`validate`). |
+| `override-transport` | file | A `harness.<id>` key that is not valid for the definition's transport, such as `harness.codex.cwd` on http (`validate`). |
 | `invalid-value` | config | A value outside its allowed set or range. |
 | `duplicate-entry` | config | A duplicate id, path, priority, selection or harness. |
 | `hidden-file` | notice | A hidden entry in `servers/`. |
@@ -510,8 +835,11 @@ With `--json`, stdout carries exactly one JSON document:
 
 - `schema_version`: always `1`.
 - `ok`: `true` on exit 0, `false` otherwise.
-- `data`: the command's document on success, `null` on failure.
-- `problems`: an array of problems; only `resolve` reports any.
+- `data`: the command's document on success, `null` on failure. `sync` is the exception: on exit 1
+  and 3 (and 4 for a harness-level environment problem) it still carries its document with the
+  per-entry outcome, together with `ok: false` and the aggregate `error`. Global errors carry
+  `data: null`.
+- `problems`: an array of problems; only `resolve` and `sync` report any.
 - `error`: `null` on success, otherwise `{ "code": "<error code>", "hint": "<text>" }`.
 
 Warnings go to stderr as `warning: ...` lines, never to stdout. Usage errors (exit 2) are printed
@@ -628,3 +956,44 @@ both hashes. It never shows literal values, `args` or override contents. `forwar
 env forwards of a stdio server, or the auth variables (`var`, `client_secret_env`) of an HTTP
 server. For `hold`, `source` names the source that causes the hold; the definition fields are
 `null` unless the status is `resolved`.
+
+### `sync`
+
+```json
+{ "store": "/home/me/.d-mcp", "dry_run": false, "harnesses": [
+  { "harness": "codex", "scope": "user", "file": "/home/me/.codex/config.toml", "status": "synced",
+    "created": false, "error": null, "notices": ["harness not present"],
+    "entries": [
+      { "name": "linear", "operation": "add", "outcome": "applied", "reason": null, "notice": null,
+        "hash": "<64 hex>",
+        "gaps": [ { "field": "auth.client_secret_env", "severity": "note", "reason": "manual step: ..." } ] }
+    ] }
+] }
+```
+
+- `status`: `synced`, `not-present` (nothing created), `location-changed`, `unsupported` (an inline
+  or dotted `mcp_servers` root) or `failed` (with `error`).
+- `error`: `null`, or the harness's `{ "code", "hint" }`.
+- `operation`: see [Operations](#operations). `outcome`: `applied` (written), `planned` (a dry run
+  would write or record it), `failed` (the harness write failed), `recorded` (only the write state
+  changed: take-over, refresh, relocate, orphaned), `unchanged`, `blocked` (counts toward exit 1)
+  or `kept` (held).
+- `reason`: the hold reason for `held`: `invalid-winner`, `source-unavailable` or `not-offered`.
+- `notice`: a hint such as how to resolve drift, or `null`.
+- `hash`: the read-back hash of an owned entry, `null` otherwise (never the hash of a foreign
+  entry).
+- `gaps`: `field`, `severity` (`note` or `important`) and `reason`.
+
+Harnesses and entries are sorted; problems are the resolver's (see [Problems](#problems)). In text
+mode each harness prints one line, then one line per entry (`operation`, name, outcome), then its
+notices and gaps; a dry run ends with "Dry run: nothing was written."
+
+### `unmanage`
+
+```json
+{ "server": "github", "harnesses": ["codex"], "selection": ["claude"], "converted_from_all": true, "selection_removed": false, "dry_run": false }
+```
+
+`harnesses` lists the harnesses whose records were removed; `selection` is the server's harness list
+afterwards (`null` when the server is not selected any more); `converted_from_all` tells whether an
+`all` selection became an explicit list.

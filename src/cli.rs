@@ -1,9 +1,9 @@
 //! Command-line definitions, dispatch and rendering.
 //!
 //! Mutating commands (`init`, `source add`, `source remove`, `select`,
-//! `unselect`) take the store lock, then read `config.toml`, then write.
-//! Read-only commands (`resolve`, `source list`) and every `--dry-run` take
-//! no lock and write nothing.
+//! `unselect`, `sync`, `unmanage`) take the store lock, then read
+//! `config.toml`, then write. Read-only commands (`resolve`, `source list`)
+//! and every `--dry-run` take no lock and write nothing.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 
+use crate::adapter::registry;
 use crate::config::{
     Config, Harness, HarnessSet, LOCAL_SOURCE_ID, Selection, SourceEntry, SourceKind,
 };
@@ -22,6 +23,8 @@ use crate::output::{Report, Ui};
 use crate::resolver::{ServerResolution, resolve};
 use crate::source::{SourceSpec, is_available, offered_names, scan, source_specs};
 use crate::store::{self, Environment, StoreLock, StorePaths};
+use crate::sync::{SyncOptions, sync, unmanage};
+use crate::validate::validate;
 
 /// Manage MCP server definitions once and sync them into every coding-agent
 /// harness.
@@ -33,7 +36,8 @@ use crate::store::{self, Environment, StoreLock, StorePaths};
     long_about = None,
     arg_required_else_help = true,
     after_help = "Examples:\n  d-mcp init\n  d-mcp source add ~/team-mcp --id team --priority 10\n  \
-                  d-mcp select github --harness claude\n  d-mcp resolve --json"
+                  d-mcp select github --harness claude\n  d-mcp resolve --json\n  \
+                  d-mcp sync --dry-run\n  d-mcp unmanage github --harness codex"
 )]
 pub struct Cli {
     /// Store directory. Overrides `D_MCP_STORE` and the default `~/.d-mcp`.
@@ -78,6 +82,48 @@ pub enum Command {
     },
     /// Resolve every selection against the sources (read-only).
     Resolve,
+    /// Write the selected servers into the harnesses (Codex in this
+    /// version), at user scope.
+    Sync {
+        /// Sync only this harness; repeat for several. Without it, every
+        /// harness with an adapter is synced.
+        #[arg(long = "harness", value_enum, value_name = "HARNESS")]
+        harnesses: Vec<AdapterArg>,
+        /// Accept the current harness entry of this server as managed
+        /// (resolves Drift and Collision); repeat for several.
+        #[arg(long = "take-over", value_name = "SERVER")]
+        take_over: Vec<String>,
+        /// Manage the recorded entries at the newly resolved harness file,
+        /// for example after `CODEX_HOME` changed. The old file is not
+        /// edited.
+        #[arg(long)]
+        relocate: bool,
+    },
+    /// Stop managing a server's harness entries and drop those harnesses
+    /// from its selection. The entries are left as they are.
+    Unmanage {
+        /// The server name.
+        server: String,
+        /// Only this harness; repeat for several. Without it, every harness
+        /// with a record.
+        #[arg(long = "harness", value_enum, value_name = "HARNESS")]
+        harnesses: Vec<AdapterArg>,
+    },
+}
+
+/// A harness with an adapter, on the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AdapterArg {
+    /// Codex.
+    Codex,
+}
+
+impl From<AdapterArg> for Harness {
+    fn from(arg: AdapterArg) -> Self {
+        match arg {
+            AdapterArg::Codex => Harness::Codex,
+        }
+    }
 }
 
 /// The `source` subcommands.
@@ -126,12 +172,12 @@ impl From<HarnessArg> for Harness {
 pub fn execute(cli: &Cli, env: &Environment, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
     let mut ui = Ui::new(cli.json, out, err);
     match dispatch(cli, env, &mut ui) {
-        Ok(report) => ui.success(&report),
+        Ok((report, error)) => ui.finish(&report, error.as_ref()),
         Err(error) => ui.failure(&error),
     }
 }
 
-fn dispatch(cli: &Cli, env: &Environment, ui: &mut Ui<'_>) -> Result<Report> {
+fn dispatch(cli: &Cli, env: &Environment, ui: &mut Ui<'_>) -> Result<(Report, Option<Error>)> {
     let command = &cli.command;
     let read_only = matches!(
         command,
@@ -145,7 +191,35 @@ fn dispatch(cli: &Cli, env: &Environment, ui: &mut Ui<'_>) -> Result<Report> {
     }
     let paths = StorePaths::new(env.store_root(cli.store.as_deref())?);
     let dry_run = cli.dry_run;
-    match command {
+    let report = match command {
+        Command::Sync {
+            harnesses,
+            take_over,
+            relocate,
+        } => {
+            let options = SyncOptions {
+                dry_run,
+                harnesses: harnesses.iter().copied().map(Harness::from).collect(),
+                take_over: take_over.iter().cloned().collect(),
+                relocate: *relocate,
+                ..SyncOptions::default()
+            };
+            let mut warnings = Vec::new();
+            let result = sync(&paths, env, &options, &mut warnings);
+            for warning in &warnings {
+                ui.warn(warning);
+            }
+            return result;
+        }
+        Command::Unmanage { server, harnesses } => {
+            let harnesses = harnesses.iter().copied().map(Harness::from).collect();
+            let mut warnings = Vec::new();
+            let result = unmanage(&paths, server, &harnesses, dry_run, &mut warnings);
+            for warning in &warnings {
+                ui.warn(warning);
+            }
+            result
+        }
         Command::Init => init(&paths, ui, dry_run),
         Command::Source { command } => match command {
             SourceCommand::Add { path, id, priority } => {
@@ -157,7 +231,8 @@ fn dispatch(cli: &Cli, env: &Environment, ui: &mut Ui<'_>) -> Result<Report> {
         Command::Select { server, harnesses } => select(&paths, ui, server, harnesses, dry_run),
         Command::Unselect { server } => unselect(&paths, ui, server, dry_run),
         Command::Resolve => resolve_command(&paths),
-    }
+    }?;
+    Ok((report, None))
 }
 
 /// Runs a mutation: fails on an uninitialized store before locking, then
@@ -485,7 +560,8 @@ fn server_json(server: &ServerResolution) -> Value {
 
 fn resolve_command(paths: &StorePaths) -> Result<Report> {
     let config = paths.load_config()?;
-    let snapshots: Vec<_> = source_specs(paths, &config).iter().map(scan).collect();
+    let mut snapshots: Vec<_> = source_specs(paths, &config).iter().map(scan).collect();
+    validate(&mut snapshots, registry());
     let resolution = resolve(&snapshots, &config.selections);
     let servers: Vec<Value> = resolution.servers.iter().map(server_json).collect();
     let mut text = String::new();
@@ -550,6 +626,7 @@ mod tests {
                 home: Some(OsString::from(&home)),
                 store: Some(OsString::from(temp.path().join("store"))),
                 cwd: Some(work),
+                ..Environment::default()
             };
             Self { temp, env }
         }

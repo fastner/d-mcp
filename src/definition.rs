@@ -37,6 +37,60 @@ pub struct Definition {
     pub overrides: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
 }
 
+/// The TOML kind of a top-level override value, as written in the file. It
+/// keeps what the JSON form loses: a datetime is not a string.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OverrideKind {
+    /// A string.
+    String,
+    /// An integer.
+    Integer(i64),
+    /// A finite float.
+    Float(f64),
+    /// A boolean.
+    Boolean,
+    /// A datetime.
+    Datetime,
+    /// An array; `all_strings` is true when every item is a string.
+    Array {
+        /// Whether every item is a string (also true for an empty array).
+        all_strings: bool,
+    },
+    /// A table.
+    Table,
+}
+
+/// Where a top-level override key was written.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OverrideSite {
+    /// The harness table: `codex` or `claude`.
+    pub harness: String,
+    /// The key.
+    pub key: String,
+    /// The value's TOML kind.
+    pub kind: OverrideKind,
+    /// 1-based line of the key.
+    pub line: usize,
+    /// 1-based column of the key.
+    pub column: usize,
+}
+
+/// The override sites of a definition, in file order.
+///
+/// Positions are diagnostics, not part of the model, so they are kept apart
+/// from [`Definition`]: [`parse_definition_with_sites`] returns them next to
+/// it, and two definitions that differ only in formatting stay equal. Their
+/// contents never enter a hash.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OverrideSites(pub Vec<OverrideSite>);
+
+impl OverrideSites {
+    /// The sites of one harness table.
+    pub fn of<'a>(&'a self, harness: &'a str) -> impl Iterator<Item = &'a OverrideSite> + 'a {
+        self.0.iter().filter(move |site| site.harness == harness)
+    }
+}
+
 /// The transport of a definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Transport {
@@ -200,6 +254,19 @@ impl std::error::Error for DefinitionError {}
 ///
 /// Returns the first broken rule in walk order.
 pub fn parse_definition(text: &str, stem: &str) -> Result<Definition, DefinitionError> {
+    walk::walk(text, stem).map(|(definition, _)| definition)
+}
+
+/// Like [`parse_definition`], and also returns the TOML kind and position of
+/// every top-level override key, for the adapter-specific `validate` step.
+///
+/// # Errors
+///
+/// The same as [`parse_definition`].
+pub fn parse_definition_with_sites(
+    text: &str,
+    stem: &str,
+) -> Result<(Definition, OverrideSites), DefinitionError> {
     walk::walk(text, stem)
 }
 
@@ -323,6 +390,40 @@ mod tests {
             error.to_string(),
             "line 3, column 9: breaks rule `secret-prefix`"
         );
+    }
+
+    #[test]
+    fn override_sites_keep_kind_and_position() {
+        let (definition, sites) = parse_definition_with_sites(
+            "name = \"a\"\n[transport]\ntype = \"stdio\"\ncommand = \"x\"\n\
+             [harness.codex]\ncwd = 1979-05-27T07:32:00Z\nn = 1\nf = 1.5\nb = true\n\
+             s = \"v\"\nt = [\"x\"]\nm = [1]\nsub = { k = 1 }\n[harness.claude]\nk = 1\n",
+            "a",
+        )
+        .unwrap();
+        let codex: Vec<_> = sites.of("codex").collect();
+        assert_eq!(codex.len(), 8);
+        assert_eq!(codex[0].kind, OverrideKind::Datetime);
+        assert_eq!((codex[0].line, codex[0].column), (6, 1));
+        assert_eq!(codex[1].kind, OverrideKind::Integer(1));
+        assert_eq!(codex[2].kind, OverrideKind::Float(1.5));
+        assert_eq!(codex[3].kind, OverrideKind::Boolean);
+        assert_eq!(codex[4].kind, OverrideKind::String);
+        assert_eq!(codex[5].kind, OverrideKind::Array { all_strings: true });
+        assert_eq!(codex[6].kind, OverrideKind::Array { all_strings: false });
+        assert_eq!(codex[7].kind, OverrideKind::Table);
+        assert_eq!(sites.of("claude").count(), 1);
+        // Positions are not part of the definition: the same model written
+        // on other lines is equal, while its sites differ.
+        let (moved, moved_sites) = parse_definition_with_sites(
+            "name = \"a\"\n\n[transport]\ntype = \"stdio\"\ncommand = \"x\"\n\
+             [harness.codex]\n\ncwd = 1979-05-27T07:32:00Z\nn = 1\nf = 1.5\nb = true\n\
+             s = \"v\"\nt = [\"x\"]\nm = [1]\nsub = { k = 1 }\n[harness.claude]\nk = 1\n",
+            "a",
+        )
+        .unwrap();
+        assert_eq!(moved, definition);
+        assert_ne!(moved_sites, sites);
     }
 
     #[test]
