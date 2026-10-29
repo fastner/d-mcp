@@ -1,10 +1,12 @@
 //! The sync report: its model, the entry notices and the text and JSON
 //! rendering.
 //!
-//! Output rules until WP4: reports name only harness, scope, file path, entry
-//! name, operation, outcome, gaps, hold reasons and positions, plus hashes of
-//! owned entries. They never contain field values, hashes of foreign
-//! entries, child process output, or `toml_edit` or `serde_json` error text.
+//! Output rules: reports name only harness, scope, file path, entry name,
+//! operation, outcome, gaps, hold reasons and positions, plus the plain
+//! hashes of entries d-mcp wrote itself and the keyed display hashes of
+//! taken-over ones (see [`crate::hashkey`]). They never contain field
+//! values, plain hashes of foreign entries, child process output, or
+//! `toml_edit` or `serde_json` error text.
 
 use std::path::PathBuf;
 
@@ -79,7 +81,11 @@ pub(super) struct EntryReport {
     pub(super) gaps: Vec<Gap>,
     pub(super) reason: Option<HeldReason>,
     pub(super) notice: Option<String>,
+    /// The plain owned hash, only for an entry d-mcp wrote itself.
     pub(super) hash: Option<String>,
+    /// The keyed display hash of an owned hash d-mcp did not write (a
+    /// take-over), when the store has a key.
+    pub(super) display_hash: Option<String>,
     pub(super) error: Option<Error>,
 }
 
@@ -147,6 +153,7 @@ impl HarnessReport {
                 "reason": entry.reason.map(HeldReason::as_str),
                 "notice": entry.notice,
                 "hash": entry.hash,
+                "display_hash": entry.display_hash,
                 "gaps": entry.gaps,
                 "error": entry.error.as_ref().map(|error| json!({ "code": error.code(), "hint": error.hint() })),
             })).collect::<Vec<_>>(),
@@ -257,7 +264,7 @@ pub(super) fn notice(
 }
 
 /// The priority of an exit code, in the order 3, 4, 1, 0.
-pub(super) fn rank(code: u8) -> u8 {
+pub(crate) fn rank(code: u8) -> u8 {
     match code {
         EXIT_UNSAFE => 4,
         EXIT_ENVIRONMENT => 3,

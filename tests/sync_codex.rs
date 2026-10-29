@@ -1290,6 +1290,22 @@ fn login_state_maps_the_listing() {
     assert_eq!(states["missing"], LoginState::Unknown);
     let log = fs::read_to_string(env.codex_home().join("fake-codex.log")).unwrap();
     assert_eq!(log, "called: mcp list --json\n");
+    // From a neutral directory, never d-mcp's own working directory: the
+    // default store does not exist, so a fresh temporary directory, removed
+    // afterwards.
+    let cwd = fs::read_to_string(env.codex_home().join("fake-codex-cwd.log")).unwrap();
+    let cwd = Path::new(cwd.trim_end());
+    assert_ne!(cwd, env.work());
+    assert!(!cwd.exists(), "{}", cwd.display());
+    // An existing, neutral store root is used as it is.
+    fs::create_dir_all(env.default_store()).unwrap();
+    fs::remove_file(env.codex_home().join("fake-codex-cwd.log")).unwrap();
+    CodexAdapter.login_state(&env.environment(), &ProcessRunner::default(), &names);
+    let cwd = fs::read_to_string(env.codex_home().join("fake-codex-cwd.log")).unwrap();
+    assert_eq!(
+        fs::canonicalize(cwd.trim_end()).unwrap(),
+        fs::canonicalize(env.default_store()).unwrap()
+    );
 }
 
 #[test]
@@ -1385,6 +1401,46 @@ fn sync_never_calls_codex_and_never_prints_its_output() {
     let (_, text, text_err) = env.text(&["sync"]);
     assert!(!env.codex_home().join("fake-codex.log").exists());
     assert!(!format!("{value}{stderr}{text}{text_err}").contains("CANARY"));
+}
+
+#[test]
+fn the_fake_codex_refuses_to_run_outside_a_test_root() {
+    let env = TestEnv::new();
+    let fake = env.fake_codex_dir().join("codex");
+    let unmarked = tempfile::tempdir().unwrap();
+    fs::create_dir_all(unmarked.path().join("codex")).unwrap();
+    let run = |codex_home: Option<&Path>| {
+        let mut command = std::process::Command::new(&fake);
+        command.arg("--version").env_remove("CODEX_HOME");
+        if let Some(home) = codex_home {
+            command.env("CODEX_HOME", home);
+        }
+        command.output().unwrap()
+    };
+    let deep = env.root().join("a/b/c");
+    fs::create_dir_all(&deep).unwrap();
+    for home in [
+        None,
+        Some(unmarked.path().join("codex")),
+        Some(PathBuf::from("/")),
+        Some(deep),
+    ] {
+        let output = run(home.as_deref());
+        assert_eq!(output.status.code(), Some(97), "{home:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("fake codex refuses to run"));
+    }
+    assert!(!unmarked.path().join("codex/fake-codex.log").exists());
+    assert!(!env.codex_home().join("fake-codex.log").exists());
+    // `<root>/codex` and `$HOME/.codex` (also before it exists) are inside
+    // the test root.
+    for home in [env.codex_home(), env.home().join(".codex")] {
+        let output = run(Some(&home));
+        assert_eq!(output.status.code(), Some(0), "{}", home.display());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "codex-cli 0.165.0\n"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

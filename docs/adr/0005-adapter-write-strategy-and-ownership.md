@@ -1,9 +1,10 @@
 # ADR 0005: Adapter Write Strategy and Ownership
 
 - Status: Accepted
-- Date: 2026-10-27 (Codex half), 2026-10-28 (Claude Code half)
+- Date: 2026-10-27 (Codex half), 2026-10-28 (Claude Code half), amended 2026-10-29 (WP4 discovery)
 - Source: concept `docs/concept/2026-10-26-d-mcp.md`, WP2 plan "Adapter contract, sync engine and
-  Codex adapter", WP3 plan "Claude Code adapter"
+  Codex adapter", WP3 plan "Claude Code adapter", WP4 plan "Discovery, adoption, redaction, status
+  and doctor"
 
 ## Context
 
@@ -68,8 +69,9 @@ A key that no longer fits is removed and reported by name as a `note` gap, never
 running Claude Code sessions and holds account data, caches and history. d-mcp never opens it for
 writing (a structural test guards this): it adds entries with `claude mcp add-json -s user`,
 removes them with `claude mcp remove -s user`, and updates by removing and adding. It reads the
-file only to plan and verify, deserializing just the user-scope `mcpServers` values and the names
-of local-scope entries, and keeps no bytes. Every call runs from a neutral working directory with
+file only to plan, verify and discover, deserializing just the user-scope `mcpServers` values, the
+names of local-scope entries and, per project, the trust and legacy approval flags (see the
+amendment below), and keeps no bytes. Every call runs from a neutral working directory with
 an explicit child environment (`PATH`, `HOME`, `CLAUDE_CONFIG_DIR`, `DISABLE_AUTOUPDATER=1`, no
 inherited `MCP_CLIENT_SECRET`); the client secret of `client_secret_env` is passed only through
 `MCP_CLIENT_SECRET` of that child. When not even a fresh temporary directory is neutral, nothing
@@ -96,6 +98,31 @@ pending record: a new entry stays unowned, a replaced one keeps its previous has
 the next sync. A CLI timeout is "unknown": d-mcp settles from the file and
 never rolls back blindly.
 
+**Amendment 2026-10-29 (WP4): what d-mcp reads besides user-scope entries.** The decision stays:
+`~/.claude.json` is never opened for writing, and its values are read only for user-scope entries.
+Discovery of the other scopes adds these reads, all by explicit allow-list with every other key
+skipped unread:
+
+- *Local scope* (`projects.<path>.mcpServers`): entry names and the project path only. The values
+  are never deserialized, hashed, compared, shown or adopted; `adopt` refuses a local-scope entry.
+- *Project trust and legacy approval flags*, per project in `.claude.json`:
+  `hasTrustDialogAccepted`, `enabledMcpjsonServers`, `disabledMcpjsonServers` and
+  `enableAllProjectMcpServers`, as a boolean or a list of server names. Any other type is read as
+  absent. They decide whether an entry of the repository's `.mcp.json` counts as approved.
+- *Repository and settings files*, which are not `.claude.json`: `<repository>/.mcp.json` is read
+  with its entry values (it belongs to the repository, not to a running session) and imported
+  through the same redacted path as user-scope entries, and the three approval keys are read from
+  Claude Code's user settings and, in a trusted workspace, the project's `.claude/settings.json`
+  and `.claude/settings.local.json`. Every other key of a settings file, such as `env`, is skipped
+  unread. These files are opened through the size-capped, no-follow read used for definitions.
+  Managed settings are not read.
+- *Codex project layers* (`.codex/config.toml`) and the Codex trust level of the repository root are
+  read the same way, read-only, with entry values.
+
+Discovery never runs a harness CLI and never writes. Entry content from any scope reaches output
+only through the redacted view, and a hash of an entry d-mcp does not own is shown only keyed (see
+`docs/reference.md`, Redaction and Display hashes).
+
 ## Consequences
 
 - Users can keep editing harness files by hand; d-mcp reports drift instead of fighting it, and
@@ -121,5 +148,9 @@ never rolls back blindly.
   second as an unowned entry.
 - Replacing a Claude Code entry clears its stored OAuth tokens and client secret (verified against
   2.1.310), so an Update of an OAuth server reports that a new login is needed.
+- Reading trust and approval flags lets d-mcp report whether a repository's `.mcp.json` entry is
+  approved, pending or disabled and whether it shadows a managed user entry, at the cost of
+  depending on Claude Code's settings keys (verified against 2.1.312 for the approval rules). A
+  settings file d-mcp cannot read makes the approval `unknown`, never a guess.
 - d-mcp depends on the `claude` CLI being on `PATH` to write Claude Code entries. Without it, a sync
   with operations fails for that harness (`harness-cli-not-found`) before anything is journaled.

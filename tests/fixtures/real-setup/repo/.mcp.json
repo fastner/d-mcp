@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "notes": {"command": "/usr/local/bin/notes-mcp", "env": {"NOTES_TOKEN": "${NOTES_TOKEN}"}},
+    "review": {
+      "type": "http",
+      "url": "https://review.example.test/mcp",
+      "headers": {"Authorization": "Bearer ${REVIEW_TOKEN}"}
+    },
+    "build": {
+      "command": "/opt/CANARY_PROJECT_COMMAND/build-mcp",
+      "args": ["--token", "CANARY_PROJECT_ARGS"],
+      "env": {"BUILD_TOKEN": "CANARY_PROJECT_ENV"}
+    },
+    "deploy": {
+      "type": "http",
+      "url": "https://u:CANARY_URL_USERINFO@deploy.example.test/CANARY_URL_PATH#CANARY_URL_FRAGMENT",
+      "headers": {"X-Deploy-Key": "CANARY_PROJECT_HEADER"}
+    }
+  }
+}

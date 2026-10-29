@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use toml_edit::{ArrayOfTables, DocumentMut, Table, value};
+use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Table, value};
 
 use crate::adapter::{Scope, WriteKind};
 use crate::canonical::is_digest;
@@ -68,6 +68,75 @@ pub enum RecordState {
     },
 }
 
+/// The scope an adopted entry came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OriginScope {
+    /// The harness's user scope (the write scope).
+    User,
+    /// The project scope of a repository; the origin entry is left there.
+    Project {
+        /// The absolute repository root.
+        root: PathBuf,
+    },
+}
+
+/// Where `d-mcp adopt` took an entry from (WP4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptedFrom {
+    /// The harness of the origin entry.
+    pub harness: Harness,
+    /// The scope of the origin entry.
+    pub scope: OriginScope,
+}
+
+impl AdoptedFrom {
+    /// `<harness>:<scope>`, such as `codex:user`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        let scope = match self.scope {
+            OriginScope::User => "user",
+            OriginScope::Project { .. } => "project",
+        };
+        format!("{}:{scope}", self.harness.as_str())
+    }
+}
+
+/// A native field whose literal adoption replaced with a variable reference.
+/// Names only: the literal is never stored.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ReplacedField {
+    /// The native field, such as `env.TOKEN` or `headers.Authorization`.
+    pub field: String,
+    /// The variable the entry reads instead.
+    pub var: String,
+}
+
+/// What a record keeps across its hash changes: the adoption provenance and
+/// the vanish history. Carried over by every take-over, refresh, write and
+/// settlement; lost only when the record is dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RecordMeta {
+    /// Where `d-mcp adopt` took the entry from; `None` for entries d-mcp
+    /// added or `sync --take-over` accepted.
+    pub adopted_from: Option<AdoptedFrom>,
+    /// The fields whose literals adoption replaced, sorted. Only with
+    /// `adopted_from`.
+    pub replaced_fields: Vec<ReplacedField>,
+    /// How often a `vanished` re-add of the entry was promoted. Never reset.
+    pub vanish_count: u64,
+    /// When the last `vanished` re-add was promoted, in Unix epoch seconds;
+    /// set exactly when `vanish_count` is not 0.
+    pub last_vanish: Option<u64>,
+}
+
+impl RecordMeta {
+    /// Counts one promoted `vanished` re-add, now.
+    pub fn count_vanish(&mut self) {
+        self.vanish_count = self.vanish_count.saturating_add(1);
+        self.last_vanish = Some(now());
+    }
+}
+
 /// A write-state record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
@@ -79,17 +148,28 @@ pub struct Record {
     pub version: String,
     /// The status.
     pub state: RecordState,
+    /// The adoption provenance and the vanish history.
+    pub meta: RecordMeta,
 }
 
 impl Record {
-    /// A new owned record stamped with the current time and version.
+    /// A new owned record stamped with the current time and version, without
+    /// provenance or history.
     #[must_use]
     pub fn owned(file: PathBuf, hashes: Hashes) -> Self {
+        Self::owned_with(file, hashes, RecordMeta::default())
+    }
+
+    /// A new owned record stamped with the current time and version that
+    /// keeps `meta` (of the record it replaces).
+    #[must_use]
+    pub fn owned_with(file: PathBuf, hashes: Hashes, meta: RecordMeta) -> Self {
         Self {
             file,
             time: now(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
             state: RecordState::Owned(hashes),
+            meta,
         }
     }
 
@@ -132,7 +212,8 @@ pub enum Settled {
 
 /// Settles a pending record against the actual read-back hash of its entry
 /// (`None` when the entry is absent). Returns the new record, if any, and
-/// what happened.
+/// what happened. A promoted `vanished` re-add (an Add with previous hashes)
+/// counts in the record's vanish history.
 #[must_use]
 pub fn settle(record: &Record, actual: Option<&str>) -> (Option<Record>, Settled) {
     let RecordState::Pending {
@@ -153,7 +234,11 @@ pub fn settle(record: &Record, actual: Option<&str>) -> (Option<Record>, Settled
         _ => false,
     };
     if took_effect && let Some(expected) = expected {
-        return (Some(with(expected)), Settled::Promoted);
+        let mut promoted = with(expected);
+        if *op == WriteKind::Add && previous.is_some() {
+            promoted.meta.count_vanish();
+        }
+        return (Some(promoted), Settled::Promoted);
     }
     match previous {
         Some(previous) => (Some(with(previous)), Settled::Reverted),
@@ -199,9 +284,18 @@ const RECORD_KEYS: &[&str] = &[
     "prev_definition_hash",
     "written",
     "prev_written",
+    "adopted_from",
+    "replaced_fields",
+    "vanish_count",
+    "last_vanish",
     "time",
     "version",
 ];
+
+/// The keys of an `adopted_from` table.
+const ORIGIN_KEYS: &[&str] = &["harness", "scope", "root"];
+/// The keys of a `replaced_fields` item.
+const REPLACED_KEYS: &[&str] = &["field", "var"];
 
 fn find<'e>(entries: &'e [Entry], key: &str) -> Option<&'e Entry> {
     entries.iter().find(|entry| entry.key == key)
@@ -269,6 +363,121 @@ fn optional_hashes(
     }))
 }
 
+fn non_negative(entries: &[Entry], key: &str, field: &str) -> Parse<Option<u64>> {
+    match find(entries, key) {
+        None => Ok(None),
+        Some(entry) => match entry.value.kind {
+            NodeKind::Integer(number) => u64::try_from(number).map(Some).map_or_else(
+                |_| corrupt(&format!("{field}.{key}"), entry.value_offset()),
+                Ok,
+            ),
+            _ => corrupt(&format!("{field}.{key}"), entry.value_offset()),
+        },
+    }
+}
+
+fn parse_origin(entry: &Entry, field: &str) -> Parse<AdoptedFrom> {
+    let field = format!("{field}.adopted_from");
+    let offset = entry.value_offset();
+    let NodeKind::Table(items) = &entry.value.kind else {
+        return corrupt(&field, offset);
+    };
+    if let Some(item) = items
+        .iter()
+        .find(|item| !ORIGIN_KEYS.contains(&item.key.as_str()))
+    {
+        return corrupt(&field, item.key_offset());
+    }
+    let harness = match string(items, "harness", &format!("{field}.harness"), offset)? {
+        "codex" => Harness::Codex,
+        "claude" => Harness::Claude,
+        _ => return corrupt(&format!("{field}.harness"), offset),
+    };
+    let root = match find(items, "root") {
+        None => None,
+        Some(_) => Some(PathBuf::from(string(
+            items,
+            "root",
+            &format!("{field}.root"),
+            offset,
+        )?)),
+    };
+    let scope = match (
+        string(items, "scope", &format!("{field}.scope"), offset)?,
+        root,
+    ) {
+        ("user", None) => OriginScope::User,
+        ("project", Some(root)) if root.is_absolute() => OriginScope::Project { root },
+        _ => return corrupt(&format!("{field}.scope"), offset),
+    };
+    Ok(AdoptedFrom { harness, scope })
+}
+
+fn parse_replaced(entry: &Entry, field: &str) -> Parse<Vec<ReplacedField>> {
+    let field = format!("{field}.replaced_fields");
+    let NodeKind::Array(items) = &entry.value.kind else {
+        return corrupt(&field, entry.value_offset());
+    };
+    let mut replaced = Vec::new();
+    for (position, item) in items.iter().enumerate() {
+        let item_field = format!("{field}[{position}]");
+        let NodeKind::Table(pairs) = &item.kind else {
+            return corrupt(&item_field, item.offset());
+        };
+        if pairs
+            .iter()
+            .any(|pair| !REPLACED_KEYS.contains(&pair.key.as_str()))
+        {
+            return corrupt(&item_field, item.offset());
+        }
+        let name = string(
+            pairs,
+            "field",
+            &format!("{item_field}.field"),
+            item.offset(),
+        )?;
+        let var = string(pairs, "var", &format!("{item_field}.var"), item.offset())?;
+        if name.is_empty() || !crate::definition::is_valid_variable_name(var) {
+            return corrupt(&item_field, item.offset());
+        }
+        replaced.push(ReplacedField {
+            field: name.to_owned(),
+            var: var.to_owned(),
+        });
+    }
+    // Written sorted and non-empty; anything else is not d-mcp's.
+    if replaced.is_empty() || !replaced.is_sorted() {
+        return corrupt(&field, entry.value_offset());
+    }
+    Ok(replaced)
+}
+
+fn parse_meta(entries: &[Entry], field: &str, offset: Option<usize>) -> Parse<RecordMeta> {
+    let adopted_from = find(entries, "adopted_from")
+        .map(|entry| parse_origin(entry, field))
+        .transpose()?;
+    let replaced_fields = match find(entries, "replaced_fields") {
+        None => Vec::new(),
+        // Replaced fields belong to an adoption.
+        Some(entry) if adopted_from.is_some() => parse_replaced(entry, field)?,
+        Some(entry) => return corrupt(&format!("{field}.replaced_fields"), entry.key_offset()),
+    };
+    let vanish_count = non_negative(entries, "vanish_count", field)?;
+    let last_vanish = non_negative(entries, "last_vanish", field)?;
+    let (vanish_count, last_vanish) = match (vanish_count, last_vanish) {
+        (None, None) => (0, None),
+        // Only a positive count is written, always with its time.
+        (Some(count), Some(time)) if count > 0 => (count, Some(time)),
+        _ => return corrupt(&format!("{field}.vanish_count"), offset),
+    };
+    Ok(RecordMeta {
+        adopted_from,
+        replaced_fields,
+        vanish_count,
+        last_vanish,
+    })
+}
+
 fn parse_record(
     entries: &[Entry],
     field: &str,
@@ -304,6 +513,7 @@ fn parse_record(
     };
     let current = optional_hashes(entries, "", field, offset)?;
     let previous = optional_hashes(entries, "prev_", field, offset)?;
+    let meta = parse_meta(entries, field, offset)?;
     let status = string(entries, "status", &format!("{field}.status"), offset)?;
     let op = match find(entries, "op") {
         None => None,
@@ -350,6 +560,7 @@ fn parse_record(
             time,
             version,
             state,
+            meta,
         },
     ))
 }
@@ -392,6 +603,38 @@ fn parse_state(text: &str) -> Parse<State> {
         }
     }
     Ok(state)
+}
+
+fn put_meta(table: &mut Table, meta: &RecordMeta) {
+    if let Some(origin) = &meta.adopted_from {
+        let mut inline = InlineTable::new();
+        inline.insert("harness", origin.harness.as_str().into());
+        match &origin.scope {
+            OriginScope::User => {
+                inline.insert("scope", "user".into());
+            }
+            OriginScope::Project { root } => {
+                inline.insert("scope", "project".into());
+                // `save` refuses a non-UTF-8 root, so this is never lossy.
+                inline.insert("root", root.to_string_lossy().as_ref().into());
+            }
+        }
+        table["adopted_from"] = value(inline);
+    }
+    if !meta.replaced_fields.is_empty() {
+        let mut array = Array::new();
+        for replaced in &meta.replaced_fields {
+            let mut inline = InlineTable::new();
+            inline.insert("field", replaced.field.as_str().into());
+            inline.insert("var", replaced.var.as_str().into());
+            array.push(inline);
+        }
+        table["replaced_fields"] = value(array);
+    }
+    if let (count @ 1.., Some(time)) = (meta.vanish_count, meta.last_vanish) {
+        table["vanish_count"] = value(i64::try_from(count).unwrap_or(i64::MAX));
+        table["last_vanish"] = value(i64::try_from(time).unwrap_or(i64::MAX));
+    }
 }
 
 fn put_hashes(table: &mut Table, prefix: &str, hashes: &Hashes) {
@@ -461,6 +704,7 @@ impl State {
                         }
                     }
                 }
+                put_meta(&mut table, &record.meta);
                 table["time"] = value(i64::try_from(record.time).unwrap_or(i64::MAX));
                 table["version"] = value(record.version.as_str());
                 array.push(table);
@@ -509,11 +753,14 @@ pub fn load(paths: &StorePaths) -> Result<State> {
 /// (paths are never stored lossily), and [`Error::Io`] when the write fails;
 /// the old file then stays intact in both cases.
 pub fn save(paths: &StorePaths, _lock: &StoreLock, state: &State) -> Result<Option<StoreWarning>> {
-    if let Some((key, _)) = state
-        .records
-        .iter()
-        .find(|(_, record)| record.file.to_str().is_none())
-    {
+    let lossy = |record: &Record| {
+        record.file.to_str().is_none()
+            || matches!(
+                &record.meta.adopted_from,
+                Some(AdoptedFrom { scope: OriginScope::Project { root }, .. }) if root.to_str().is_none()
+            )
+    };
+    if let Some((key, _)) = state.records.iter().find(|(_, record)| lossy(record)) {
         return Err(Error::HarnessPathNotUtf8 {
             harness: key.harness.as_str(),
         });
@@ -542,11 +789,34 @@ mod tests {
         }
     }
 
+    fn adopted() -> RecordMeta {
+        RecordMeta {
+            adopted_from: Some(AdoptedFrom {
+                harness: Harness::Claude,
+                scope: OriginScope::Project {
+                    root: PathBuf::from("/work/app"),
+                },
+            }),
+            replaced_fields: vec![
+                ReplacedField {
+                    field: "env.A".to_owned(),
+                    var: "A".to_owned(),
+                },
+                ReplacedField {
+                    field: "headers.Authorization".to_owned(),
+                    var: "API_TOKEN".to_owned(),
+                },
+            ],
+            vanish_count: 2,
+            last_vanish: Some(9),
+        }
+    }
+
     fn sample() -> State {
         let mut state = State::default();
         state.records.insert(
             key("a"),
-            Record::owned(PathBuf::from("/c/config.toml"), hashes('a')),
+            Record::owned_with(PathBuf::from("/c/config.toml"), hashes('a'), adopted()),
         );
         for (name, op, expected, previous) in [
             ("b", WriteKind::Add, Some(hashes('b')), None),
@@ -564,9 +834,22 @@ mod tests {
                         expected,
                         previous,
                     },
+                    meta: RecordMeta::default(),
                 },
             );
         }
+        let mut user = adopted();
+        user.adopted_from = Some(AdoptedFrom {
+            harness: Harness::Codex,
+            scope: OriginScope::User,
+        });
+        user.replaced_fields.clear();
+        user.vanish_count = 0;
+        user.last_vanish = None;
+        state.records.insert(
+            key("e"),
+            Record::owned_with(PathBuf::from("/c/config.toml"), hashes('e'), user),
+        );
         state
     }
 
@@ -616,6 +899,28 @@ mod tests {
                 "version = \"0.1.0\"\nprev_written = true",
                 1,
             ),
+            good.replacen("harness = \"claude\"", "harness = \"x\"", 1),
+            good.replacen("scope = \"project\"", "scope = \"user\"", 1),
+            good.replacen("root = \"/work/app\"", "root = \"rel\"", 1),
+            good.replacen("root = \"/work/app\"", "other = \"x\"", 1),
+            good.replacen("adopted_from = {", "adopted_from = 1\nx = {", 1),
+            good.replacen("adopted_from = {", "adopted_from = { extra = 1, ", 1),
+            good.replacen("var = \"A\"", "var = \"1A\"", 1),
+            good.replacen("field = \"env.A\"", "field = \"\"", 1),
+            good.replacen("field = \"env.A\"", "field = \"z\"", 1),
+            good.replacen("var = \"A\" }", "var = \"A\", x = 1 }", 1),
+            good.replacen("replaced_fields = [", "replaced_fields = [1, ", 1),
+            good.replacen("replaced_fields = [", "replaced_fields = 1\nx = [", 1),
+            good.replacen("vanish_count = 2", "vanish_count = 0", 1),
+            good.replacen("vanish_count = 2", "vanish_count = -1", 1),
+            good.replacen("vanish_count = 2", "vanish_count = \"2\"", 1),
+            good.replacen("last_vanish = 9\n", "", 1),
+            // Replaced fields without an adoption.
+            good.replacen(
+                "adopted_from = { harness = \"codex\", scope = \"user\" }\n",
+                "replaced_fields = [{ field = \"env.A\", var = \"A\" }]\n",
+                1,
+            ),
         ];
         for text in &cases {
             let error = State::parse(text, path).unwrap_err();
@@ -661,8 +966,65 @@ mod tests {
         assert_eq!(settle(remove, Some(&e)).1, Settled::Reverted);
         let owned = &state.records[&key("a")];
         assert_eq!(settle(owned, None).0.as_ref(), Some(owned));
-        assert_eq!(state.of(Harness::Codex).count(), 4);
+        assert_eq!(state.of(Harness::Codex).count(), 5);
         assert_eq!(state.of(Harness::Claude).count(), 0);
+    }
+
+    #[test]
+    fn promoted_vanish_re_adds_are_counted_and_kept() {
+        let mut readd = Record {
+            file: PathBuf::from("/c/config.toml"),
+            time: 7,
+            version: "0.1.0".to_owned(),
+            state: RecordState::Pending {
+                op: WriteKind::Add,
+                expected: Some(hashes('b')),
+                previous: Some(hashes('c')),
+            },
+            meta: adopted(),
+        };
+        let (promoted, outcome) = settle(&readd, Some(&"b".repeat(64)));
+        assert_eq!(outcome, Settled::Promoted);
+        let promoted = promoted.unwrap();
+        assert_eq!(promoted.meta.vanish_count, 3);
+        assert!(promoted.meta.last_vanish.unwrap() > 9);
+        assert_eq!(promoted.meta.adopted_from, adopted().adopted_from);
+        // A re-add that did not take effect is not counted.
+        let (reverted, _) = settle(&readd, None);
+        assert_eq!(reverted.unwrap().meta.vanish_count, 2);
+        // An Add of a new entry is not a re-add.
+        readd.state = RecordState::Pending {
+            op: WriteKind::Add,
+            expected: Some(hashes('b')),
+            previous: None,
+        };
+        readd.meta = RecordMeta::default();
+        let (added, _) = settle(&readd, Some(&"b".repeat(64)));
+        assert_eq!(added.unwrap().meta, RecordMeta::default());
+        let mut text = State::default();
+        let mut counted = RecordMeta::default();
+        counted.count_vanish();
+        text.records.insert(
+            key("v"),
+            Record::owned_with(PathBuf::from("/c"), hashes('b'), counted.clone()),
+        );
+        let rendered = text.render();
+        assert!(
+            rendered.contains("vanish_count = 1\nlast_vanish = "),
+            "{rendered}"
+        );
+        assert_eq!(
+            State::parse(&rendered, Path::new("/s")).unwrap().records[&key("v")].meta,
+            counted
+        );
+        assert_eq!(
+            AdoptedFrom {
+                harness: Harness::Codex,
+                scope: OriginScope::User
+            }
+            .label(),
+            "codex:user"
+        );
     }
 
     #[test]
@@ -688,6 +1050,22 @@ mod tests {
             assert_eq!(error.code(), "harness-path-not-utf8");
             assert_eq!(error.exit_code(), 4);
             assert_eq!(load(&paths).unwrap(), sample());
+            let mut lossy_root = sample();
+            let mut meta = adopted();
+            meta.adopted_from = Some(AdoptedFrom {
+                harness: Harness::Claude,
+                scope: OriginScope::Project {
+                    root: PathBuf::from(std::ffi::OsStr::from_bytes(b"/w/\xff")),
+                },
+            });
+            lossy_root.records.insert(
+                key("z"),
+                Record::owned_with(PathBuf::from("/c"), hashes('a'), meta),
+            );
+            assert_eq!(
+                save(&paths, &lock, &lossy_root).unwrap_err().code(),
+                "harness-path-not-utf8"
+            );
         }
         std::fs::write(&paths.state, b"\xff").unwrap();
         assert!(matches!(load(&paths), Err(Error::StateCorrupt { .. })));

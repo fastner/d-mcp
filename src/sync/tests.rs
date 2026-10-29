@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use super::*;
 use crate::adapter::{
     AdapterTexts, ApplyContext, ApplyMode, ApplyResult, HarnessPlan, Hooks, Journal, Location,
-    LoginState, OverrideKey, PrivateRead, Scope, foreign_security_gaps,
+    LoginState, OverrideKey, PrivateRead, Scope, ScopeRead, foreign_security_gaps,
 };
 use crate::config::Harness;
 use crate::definition::{Definition, parse_definition};
@@ -55,6 +55,9 @@ impl Adapter for TestAdapter {
     fn verified_versions(&self) -> &'static [&'static str] {
         &[]
     }
+    fn program(&self) -> &'static str {
+        "test-harness"
+    }
     fn texts(&self) -> &'static AdapterTexts {
         &crate::adapter::claude::TEXTS
     }
@@ -94,6 +97,29 @@ impl Adapter for TestAdapter {
             .iter()
             .map(|name| (name.clone(), LoginState::Unknown))
             .collect()
+    }
+    fn discover(&self, _env: &Environment, _repo_root: &std::path::Path) -> Vec<ScopeRead> {
+        Vec::new()
+    }
+    fn import(
+        &self,
+        read: &ScopeRead,
+        name: &str,
+    ) -> std::result::Result<crate::adapter::Imported, Vec<crate::adapter::ImportGap>> {
+        Err(crate::adapter::ImportGap::for_scope(read, name).unwrap_or_default())
+    }
+    fn canonical_entry(&self, value: &serde_json::Value) -> serde_json::Value {
+        value.clone()
+    }
+    fn entry_hash(&self, value: &serde_json::Value) -> String {
+        hash(&value.to_string()[..1])
+    }
+    fn normalized_entry(
+        &self,
+        raw: &crate::adapter::RawEntry,
+        _imported: &crate::adapter::Imported,
+    ) -> serde_json::Value {
+        raw.value().clone()
     }
 }
 
@@ -505,7 +531,17 @@ fn an_important_gap_blocks_the_entry() {
         LoginState::Unknown
     );
     assert_eq!(adapter.apply_mode(), ApplyMode::HarnessCli);
-    assert!(adapter.import(&read, "a").is_none());
+    assert!(
+        adapter
+            .discover(&env, std::path::Path::new("/r"))
+            .is_empty()
+    );
+    let scope = ScopeRead::new(
+        Harness::Claude,
+        crate::adapter::DiscoveredScope::User,
+        read.location.file,
+    );
+    assert_eq!(adapter.import(&scope, "a").unwrap_err().len(), 1);
 }
 
 #[test]

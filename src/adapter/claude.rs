@@ -23,16 +23,21 @@
 //! the two are comparable.
 
 mod cli;
+mod discover;
 mod file;
+mod import;
+mod settings;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value, json};
 
+use std::path::Path;
+
 use super::{
     ActualEntry, Adapter, AdapterTexts, ApplyContext, ApplyMode, ApplyResult, Gap, GapSeverity,
-    HarnessPlan, HarnessRead, Hooks, Journal, Location, LoginState, OverrideKey, OverrideType,
-    PrivateRead, Rendered, Scope,
+    HarnessPlan, HarnessRead, Hooks, ImportGap, Imported, Journal, Location, LoginState,
+    OverrideKey, OverrideType, PrivateRead, RawEntry, Rendered, Scope, ScopeRead,
 };
 use crate::config::Harness;
 use crate::definition::{Auth, Definition, EnvValue, Transport};
@@ -40,8 +45,11 @@ use crate::error::{Error, Result};
 use crate::process::{ProcessRunner, find_program};
 use crate::store::Environment;
 
-pub use cli::{PROGRAM, WRITE_TIMEOUT};
-pub use file::{ENTRY_HASH_TAG, Parsed, ReadOnlyFile, canonical_entry, entry_hash, parse};
+pub use cli::{PROGRAM, WRITE_TIMEOUT, uses_oauth};
+pub use file::{
+    Approvals, ENTRY_HASH_TAG, Parsed, ProjectFlags, ReadOnlyFile, canonical_entry, entry_hash,
+    parse,
+};
 
 /// The Claude Code versions this adapter was verified against.
 pub const VERIFIED_VERSIONS: &[&str] = &["2.1.310 (Claude Code)"];
@@ -148,6 +156,31 @@ fn credential_gap(var: &str) -> Gap {
              Code's own credential or proxy variables); use another variable name"
         ),
     )
+}
+
+/// The [`HarnessRead`] of the user scope from a parsed configuration file.
+fn harness_read(location: &Location, parsed: &Parsed) -> HarnessRead {
+    HarnessRead {
+        location: location.clone(),
+        entries: parsed
+            .entries
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    ActualEntry {
+                        hash: entry_hash(value),
+                        supported_style: value.is_object(),
+                        preserved: BTreeSet::new(),
+                    },
+                )
+            })
+            .collect(),
+        root_supported: parsed.root_supported,
+        // No file bytes are kept.
+        private: PrivateRead::default(),
+        shadowed: parsed.local.clone(),
+    }
 }
 
 impl ClaudeAdapter {
@@ -319,6 +352,10 @@ impl Adapter for ClaudeAdapter {
         VERIFIED_VERSIONS
     }
 
+    fn program(&self) -> &'static str {
+        PROGRAM
+    }
+
     fn texts(&self) -> &'static AdapterTexts {
         &TEXTS
     }
@@ -340,27 +377,31 @@ impl Adapter for ClaudeAdapter {
 
     fn read(&self, location: &Location) -> Result<HarnessRead> {
         let parsed = file::read(&location.file)?;
-        Ok(HarnessRead {
-            location: location.clone(),
-            entries: parsed
-                .entries
-                .iter()
-                .map(|(name, value)| {
-                    (
-                        name.clone(),
-                        ActualEntry {
-                            hash: entry_hash(value),
-                            supported_style: value.is_object(),
-                            preserved: BTreeSet::new(),
-                        },
-                    )
-                })
-                .collect(),
-            root_supported: parsed.root_supported,
-            // No file bytes are kept.
-            private: PrivateRead::default(),
-            shadowed: parsed.local,
-        })
+        Ok(harness_read(location, &parsed))
+    }
+
+    fn discover(&self, env: &Environment, repo_root: &Path) -> Vec<ScopeRead> {
+        discover::discover(self, env, repo_root)
+    }
+
+    fn import(
+        &self,
+        read: &ScopeRead,
+        name: &str,
+    ) -> std::result::Result<Imported, Vec<ImportGap>> {
+        import::import(read, name)
+    }
+
+    fn canonical_entry(&self, value: &Value) -> Value {
+        canonical_entry(value)
+    }
+
+    fn entry_hash(&self, value: &Value) -> String {
+        entry_hash(value)
+    }
+
+    fn normalized_entry(&self, raw: &RawEntry, imported: &Imported) -> Value {
+        import::normalized(raw.value(), imported)
     }
 
     fn render(&self, definition: &Definition) -> Rendered {

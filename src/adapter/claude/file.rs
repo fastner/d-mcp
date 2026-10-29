@@ -8,6 +8,13 @@
 //! for every `projects.<path>` only the *names* of its local-scope
 //! `mcpServers`; every other key is skipped with [`IgnoredAny`]. Parse errors
 //! are reported by line and column only, never with serde's message.
+//!
+//! For project-scope discovery (WP4) it also reads two kinds of flags of a
+//! project, names and booleans only: the workspace trust
+//! (`hasTrustDialogAccepted`) and the legacy `.mcp.json` approval keys
+//! (`enabledMcpjsonServers`, `disabledMcpjsonServers`,
+//! `enableAllProjectMcpServers`), which Claude Code 2.1.312 moves into the
+//! project's `.claude/settings.local.json` on its next run.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -121,6 +128,29 @@ pub struct Parsed {
     pub local: BTreeMap<String, BTreeSet<String>>,
     /// Every project path of the file.
     pub projects: BTreeSet<String>,
+    /// The trust and legacy approval flags of every project, by path.
+    pub flags: BTreeMap<String, ProjectFlags>,
+}
+
+/// The `.mcp.json` approval keys of one settings source: names and a flag.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Approvals {
+    /// `enabledMcpjsonServers`.
+    pub enabled: BTreeSet<String>,
+    /// `disabledMcpjsonServers`.
+    pub disabled: BTreeSet<String>,
+    /// `enableAllProjectMcpServers = true`.
+    pub enable_all: bool,
+}
+
+/// What d-mcp reads of a project entry besides its local-scope names.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectFlags {
+    /// `hasTrustDialogAccepted = true`: the user trusted the workspace, so
+    /// Claude Code honours the project's own settings files.
+    pub trusted: bool,
+    /// The legacy approval keys of the project entry.
+    pub approvals: Approvals,
 }
 
 impl fmt::Debug for Parsed {
@@ -131,6 +161,7 @@ impl fmt::Debug for Parsed {
             .field("entries", &self.entries.keys().collect::<Vec<_>>())
             .field("local", &self.local)
             .field("projects", &self.projects)
+            .field("flags", &self.flags)
             .finish()
     }
 }
@@ -196,10 +227,166 @@ impl<'de> Deserialize<'de> for Names {
     }
 }
 
-/// One project: only the names of its local-scope servers.
+/// A JSON value read as a flag: `true` only for the boolean `true`; any
+/// other value is skipped and reads as `false`.
+#[derive(Default)]
+pub(super) struct Flag(pub(super) bool);
+
+impl<'de> Deserialize<'de> for Flag {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct FlagVisitor;
+        impl<'de> Visitor<'de> for FlagVisitor {
+            type Value = Flag;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_bool<E>(self, value: bool) -> std::result::Result<Flag, E> {
+                Ok(Flag(value))
+            }
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Flag, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(Flag(false))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Flag, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(Flag(false))
+            }
+            fn visit_i64<E>(self, _: i64) -> std::result::Result<Flag, E> {
+                Ok(Flag(false))
+            }
+            fn visit_u64<E>(self, _: u64) -> std::result::Result<Flag, E> {
+                Ok(Flag(false))
+            }
+            fn visit_f64<E>(self, _: f64) -> std::result::Result<Flag, E> {
+                Ok(Flag(false))
+            }
+            fn visit_str<E>(self, _: &str) -> std::result::Result<Flag, E> {
+                Ok(Flag(false))
+            }
+            fn visit_unit<E>(self) -> std::result::Result<Flag, E> {
+                Ok(Flag(false))
+            }
+        }
+        deserializer.deserialize_any(FlagVisitor)
+    }
+}
+
+/// A string read leniently: any other JSON value is skipped unread (maps
+/// and arrays are drained with [`IgnoredAny`], never built as values).
+struct MaybeName(Option<String>);
+
+impl<'de> Deserialize<'de> for MaybeName {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct MaybeNameVisitor;
+        impl<'de> Visitor<'de> for MaybeNameVisitor {
+            type Value = MaybeName;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_str<E>(self, value: &str) -> std::result::Result<MaybeName, E> {
+                Ok(MaybeName(Some(value.to_owned())))
+            }
+            fn visit_string<E>(self, value: String) -> std::result::Result<MaybeName, E> {
+                Ok(MaybeName(Some(value)))
+            }
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<MaybeName, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(MaybeName(None))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<MaybeName, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(MaybeName(None))
+            }
+            fn visit_bool<E>(self, _: bool) -> std::result::Result<MaybeName, E> {
+                Ok(MaybeName(None))
+            }
+            fn visit_i64<E>(self, _: i64) -> std::result::Result<MaybeName, E> {
+                Ok(MaybeName(None))
+            }
+            fn visit_u64<E>(self, _: u64) -> std::result::Result<MaybeName, E> {
+                Ok(MaybeName(None))
+            }
+            fn visit_f64<E>(self, _: f64) -> std::result::Result<MaybeName, E> {
+                Ok(MaybeName(None))
+            }
+            fn visit_unit<E>(self) -> std::result::Result<MaybeName, E> {
+                Ok(MaybeName(None))
+            }
+        }
+        deserializer.deserialize_any(MaybeNameVisitor)
+    }
+}
+
+/// A JSON array read as a set of names; anything else, and every item that
+/// is not a string, is skipped.
+#[derive(Default)]
+pub(super) struct NameList(pub(super) BTreeSet<String>);
+
+impl<'de> Deserialize<'de> for NameList {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct NameListVisitor;
+        impl<'de> Visitor<'de> for NameListVisitor {
+            type Value = NameList;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<NameList, A::Error> {
+                let mut names = BTreeSet::new();
+                while let Some(MaybeName(name)) = seq.next_element::<MaybeName>()? {
+                    names.extend(name);
+                }
+                Ok(NameList(names))
+            }
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<NameList, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(NameList::default())
+            }
+            fn visit_bool<E>(self, _: bool) -> std::result::Result<NameList, E> {
+                Ok(NameList::default())
+            }
+            fn visit_i64<E>(self, _: i64) -> std::result::Result<NameList, E> {
+                Ok(NameList::default())
+            }
+            fn visit_u64<E>(self, _: u64) -> std::result::Result<NameList, E> {
+                Ok(NameList::default())
+            }
+            fn visit_f64<E>(self, _: f64) -> std::result::Result<NameList, E> {
+                Ok(NameList::default())
+            }
+            fn visit_str<E>(self, _: &str) -> std::result::Result<NameList, E> {
+                Ok(NameList::default())
+            }
+            fn visit_unit<E>(self) -> std::result::Result<NameList, E> {
+                Ok(NameList::default())
+            }
+        }
+        deserializer.deserialize_any(NameListVisitor)
+    }
+}
+
+/// One project: the names of its local-scope servers and its flags.
 #[derive(Default)]
 struct Project {
     servers: BTreeSet<String>,
+    flags: ProjectFlags,
 }
 
 impl<'de> Deserialize<'de> for Project {
@@ -216,10 +403,23 @@ impl<'de> Deserialize<'de> for Project {
             ) -> std::result::Result<Project, A::Error> {
                 let mut project = Project::default();
                 while let Some(key) = map.next_key::<String>()? {
-                    if key == "mcpServers" {
-                        project.servers = map.next_value::<Names>()?.0;
-                    } else {
-                        map.next_value::<IgnoredAny>()?;
+                    match key.as_str() {
+                        "mcpServers" => project.servers = map.next_value::<Names>()?.0,
+                        "hasTrustDialogAccepted" => {
+                            project.flags.trusted = map.next_value::<Flag>()?.0;
+                        }
+                        "enabledMcpjsonServers" => {
+                            project.flags.approvals.enabled = map.next_value::<NameList>()?.0;
+                        }
+                        "disabledMcpjsonServers" => {
+                            project.flags.approvals.disabled = map.next_value::<NameList>()?.0;
+                        }
+                        "enableAllProjectMcpServers" => {
+                            project.flags.approvals.enable_all = map.next_value::<Flag>()?.0;
+                        }
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
                     }
                 }
                 Ok(project)
@@ -301,6 +501,9 @@ pub fn parse(bytes: &[u8]) -> std::result::Result<Parsed, (usize, usize)> {
         for name in project.servers {
             parsed.local.entry(name).or_default().insert(path.clone());
         }
+        if project.flags != ProjectFlags::default() {
+            parsed.flags.insert(path.clone(), project.flags);
+        }
         parsed.projects.insert(path);
     }
     Ok(parsed)
@@ -315,7 +518,7 @@ pub fn parse(bytes: &[u8]) -> std::result::Result<Parsed, (usize, usize)> {
 /// [`Error::HarnessConfigInvalid`] (by position only) and [`Error::Io`].
 pub fn read(path: &Path) -> Result<Parsed> {
     let attempt = || -> Result<std::result::Result<Parsed, (usize, usize)>> {
-        if fs::symlink_metadata(path).is_err() {
+        if !crate::adapter::path_exists(path)? {
             return Ok(Ok(Parsed {
                 root_supported: true,
                 ..Parsed::default()
@@ -436,6 +639,38 @@ mod tests {
         assert_eq!(parse(b"{\n  \"a\": ,\n}").unwrap_err(), (2, 8));
         assert_eq!(parse(b"\n  []").unwrap_err(), (2, 3));
         assert!(parse(b"").is_err());
+    }
+
+    #[test]
+    fn parse_keeps_trust_and_legacy_approvals_as_names_and_flags() {
+        let parsed = parse(
+            br#"{"projects":{"/p":{"hasTrustDialogAccepted":true,"enabledMcpjsonServers":["a",1,-1,1.5,true,null,[["CANARY"]],{"CANARY":[2]},"b"],
+                "disabledMcpjsonServers":"CANARY","enableAllProjectMcpServers":"yes","history":["CANARY"]},
+                "/q":{"hasTrustDialogAccepted":{"CANARY":[1]},"enableAllProjectMcpServers":true,
+                "disabledMcpjsonServers":{"CANARY":1}},
+                "/r":{"hasTrustDialogAccepted":[true],"enabledMcpjsonServers":[[1]],"x":1}}}"#,
+        )
+        .unwrap();
+        let p = &parsed.flags["/p"];
+        assert!(p.trusted);
+        assert_eq!(
+            p.approvals.enabled,
+            BTreeSet::from(["a".to_owned(), "b".to_owned()])
+        );
+        assert!(p.approvals.disabled.is_empty());
+        assert!(!p.approvals.enable_all);
+        let q = &parsed.flags["/q"];
+        assert!(!q.trusted);
+        assert!(q.approvals.enable_all);
+        assert!(!parsed.flags.contains_key("/r"));
+        let text = format!("{parsed:?}");
+        assert!(!text.contains("CANARY"), "{text}");
+        for scalar in ["1", "1.5", "-1", "null", "\"s\""] {
+            let text = format!(
+                r#"{{"projects":{{"/p":{{"hasTrustDialogAccepted":{scalar},"enabledMcpjsonServers":{scalar}}}}}}}"#
+            );
+            assert!(parse(text.as_bytes()).unwrap().flags.is_empty(), "{scalar}");
+        }
     }
 
     #[test]

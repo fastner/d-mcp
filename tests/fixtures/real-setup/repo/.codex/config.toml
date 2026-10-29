@@ -1,0 +1,19 @@
+# The repository's own Codex layer; it shadows the user's `github`.
+[mcp_servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+
+# Literals in a project layer: a command, arguments, an env literal and a
+# header literal, all canaries.
+[mcp_servers.build]
+command = "/opt/CANARY_PROJECT_COMMAND/build-mcp"
+args = ["--token", "CANARY_PROJECT_ARGS"]
+
+[mcp_servers.build.env]
+BUILD_TOKEN = "CANARY_PROJECT_ENV"
+
+[mcp_servers.deploy]
+url = "https://deploy.example.test/mcp"
+
+[mcp_servers.deploy.http_headers]
+X-Deploy-Key = "CANARY_PROJECT_HEADER"

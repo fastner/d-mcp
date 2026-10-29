@@ -12,12 +12,24 @@
 //! journals each intent right before its call, and reports a separate
 //! [`EntryOutcome`] per entry.
 //!
-//! A native-to-neutral import function is part of the contract as well; it
-//! is implemented in WP4, where adoption and duplicate detection need it, so
-//! the default [`Adapter::import`] returns `None`.
+//! Discovery and import are part of the contract as well (WP4, see
+//! `discovery`): [`Adapter::discover`] reads every scope the adapter can see
+//! (user, Claude Code's local scope by name only, and the project scope of
+//! the current repository) into [`ScopeRead`]s, and [`Adapter::import`] turns
+//! one discovered entry into a neutral candidate definition, or names the
+//! fields it cannot express as [`ImportGap`]s. Adoption and duplicate
+//! detection build on them.
 
 pub mod claude;
 pub mod codex;
+mod discovery;
+
+pub use discovery::{
+    Approval, DiscoveredEntry, DiscoveredScope, ImportGap, ImportGapReason, Imported, Literal,
+    MAX_REPOSITORY_FILE_BYTES, Normalization, NormalizationKind, RawEntry, Replacement,
+    ReplacementKind, ScopeRead, Trust, proposed_variable, read_repository_file, repository_root,
+};
+pub(crate) use discovery::{is_absent, path_exists};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -187,6 +199,19 @@ pub enum LoginState {
     NotApplicable,
     /// The state could not be determined.
     Unknown,
+}
+
+impl LoginState {
+    /// The stable string form.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LoginState::LoggedIn => "logged-in",
+            LoginState::NeedsLogin => "needs-login",
+            LoginState::NotApplicable => "not-applicable",
+            LoginState::Unknown => "unknown",
+        }
+    }
 }
 
 /// Where a harness keeps its configuration for one scope.
@@ -474,7 +499,9 @@ pub trait Adapter: Sync {
     fn harness(&self) -> Harness;
     /// The apply mode.
     fn apply_mode(&self) -> ApplyMode;
-    /// The scopes it can discover.
+    /// The scopes it can discover as write-state scopes (sync reads them);
+    /// [`Adapter::discover`] reads further, read-only scopes
+    /// ([`DiscoveredScope`]).
     fn discover_scopes(&self) -> &'static [Scope];
     /// The scopes it can write.
     fn write_scopes(&self) -> &'static [Scope];
@@ -493,8 +520,13 @@ pub trait Adapter: Sync {
     fn reserved_names(&self) -> &'static [&'static str];
     /// Whether entries can disappear without anyone removing them.
     fn entries_can_vanish(&self) -> bool;
-    /// The harness versions this adapter was verified against.
+    /// The harness versions this adapter was verified against, as the
+    /// harness CLI prints them for `--version`.
     fn verified_versions(&self) -> &'static [&'static str];
+    /// The program name of the harness CLI, looked up on `PATH` (presence
+    /// detection, `doctor`'s version probe, and the CLI writes of a
+    /// harness-CLI adapter).
+    fn program(&self) -> &'static str;
     /// The adapter's report texts.
     fn texts(&self) -> &'static AdapterTexts;
     /// Resolves where the harness keeps the scope's configuration. Never
@@ -549,10 +581,40 @@ pub trait Adapter: Sync {
         runner: &ProcessRunner,
         names: &[String],
     ) -> BTreeMap<String, LoginState>;
-    /// Imports a native entry as a neutral definition (WP4).
-    fn import(&self, _read: &HarnessRead, _name: &str) -> Option<Definition> {
-        None
-    }
+    /// Discovers every scope the adapter can read, for the repository at
+    /// `repo_root` (see [`repository_root`]): the user scope first, then the
+    /// local and project scopes. Read-only; never creates anything. A scope
+    /// that cannot be read carries its error and never hides the others.
+    fn discover(&self, env: &Environment, repo_root: &Path) -> Vec<ScopeRead>;
+    /// Imports one discovered entry as a neutral candidate definition: every
+    /// env and header literal becomes a variable reference (listed in
+    /// [`Imported::replacements`]), and `${NAME}` or `${NAME:-}` under the
+    /// key `NAME` is a forward. Pure: no I/O.
+    ///
+    /// # Errors
+    ///
+    /// Every field the neutral model cannot express losslessly, as
+    /// [`ImportGap`]s (names only), including an entry of a names-only or
+    /// unreadable scope.
+    fn import(&self, read: &ScopeRead, name: &str)
+    -> std::result::Result<Imported, Vec<ImportGap>>;
+    /// The canonical form of a native entry value that the entry hash is
+    /// computed over (defaults removed, numbers unified, ...).
+    fn canonical_entry(&self, value: &Value) -> Value;
+    /// The entry hash of a native entry value, comparable with
+    /// [`Rendered::sent_hash`] and [`ActualEntry::hash`].
+    fn entry_hash(&self, value: &Value) -> String;
+    /// The native entry as the import's candidate claims it: `raw` with
+    /// every replaced literal turned into its reference and every declared
+    /// normalization applied. Adoption's lossless round trip compares its
+    /// entry hash with the rendering of `imported.definition`. Pure.
+    fn normalized_entry(&self, raw: &RawEntry, imported: &Imported) -> Value;
+}
+
+/// A rendered entry as one native value (an object of its keys).
+#[must_use]
+pub fn rendered_value(rendered: &Rendered) -> Value {
+    Value::Object(rendered.entry.iter().cloned().collect())
 }
 
 /// The registry of adapters, in a stable order.
@@ -653,21 +715,28 @@ mod tests {
     }
 
     #[test]
-    fn codex_imports_nothing_until_wp4() {
+    fn imports_from_unusable_scopes_are_gaps() {
         let adapter = adapter_for(Harness::Codex).unwrap();
-        let read = HarnessRead {
-            location: Location {
-                scope: Scope::User,
-                file: PathBuf::from("/c"),
-                file_exists: false,
-                binary_found: false,
+        let read = ScopeRead::new(Harness::Codex, DiscoveredScope::User, PathBuf::from("/c"));
+        let gaps = adapter.import(&read, "x").unwrap_err();
+        assert_eq!(gaps[0].reason, ImportGapReason::NotFound);
+        let failed = read.failed(Error::HomeUnset);
+        assert_eq!(
+            adapter.import(&failed, "x").unwrap_err()[0].reason,
+            ImportGapReason::ScopeUnreadable
+        );
+        let local = ScopeRead::new(
+            Harness::Claude,
+            DiscoveredScope::Local {
+                project: PathBuf::from("/p"),
             },
-            entries: BTreeMap::new(),
-            root_supported: true,
-            private: PrivateRead::default(),
-            shadowed: BTreeMap::new(),
-        };
-        assert!(adapter.import(&read, "x").is_none());
+            PathBuf::from("/c"),
+        );
+        let claude = adapter_for(Harness::Claude).unwrap();
+        assert_eq!(
+            claude.import(&local, "x").unwrap_err()[0].reason,
+            ImportGapReason::LocalScope
+        );
         let definition = parse_definition(
             "name = \"a\"\n[transport]\ntype = \"stdio\"\ncommand = \"x\"\n",
             "a",

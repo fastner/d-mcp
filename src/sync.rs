@@ -2,7 +2,9 @@
 //! actual entries, and (in `executor`) the executor that applies a plan
 //! through an adapter, verifies it and promotes or reverts the write state.
 //! `report` holds the report model and its rendering, `unmanage` the
-//! `unmanage` command.
+//! `unmanage` command, and `location` the read-only plan of one harness
+//! location that `status` and `uninstall` build on (what a dry-run sync
+//! plans, without a report).
 //!
 //! Operations per harness and entry:
 //!
@@ -23,21 +25,73 @@
 //! The planner never compares a rendered entry with the read-back entry
 //! directly, except for identical-collision detection in adapters that
 //! declare the two hashes comparable.
+//!
+//! Adoption (WP4) runs the executor as a *scoped sync*: under the caller's
+//! store lock ([`sync_under_lock`]), limited to the adopted servers
+//! ([`SyncOptions::only`]), and with take-overs bound to the entry hash the
+//! caller saw ([`BoundTakeOver`]); an entry that changed since is refused
+//! with `adopt-entry-changed` before anything is journaled.
 
 mod executor;
+mod location;
 mod report;
 mod unmanage;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
 use crate::adapter::{ActualEntry, Adapter, Gap, GapSeverity, HarnessRead, Rendered, WriteKind};
-use crate::state::{Hashes, Record};
+use crate::state::{AdoptedFrom, Hashes, Record, RecordMeta, ReplacedField};
 
-pub use executor::{SyncHooks, SyncOptions, sync};
+pub(crate) use executor::desired_for;
+pub use executor::{SyncHooks, SyncOptions, sync, sync_under_lock};
+pub(crate) use location::{LocationPlan, plan_location};
+pub(crate) use report::rank;
 pub use unmanage::unmanage;
+pub(crate) use unmanage::{drop_from_selection, release_selections_under_lock, release_under_lock};
+
+/// The adapter entry hash a caller saw for an entry it takes over. It is the
+/// plain hash of a foreign entry, so it is never printed: its [`fmt::Debug`]
+/// form is redacted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExpectedHash(String);
+
+impl ExpectedHash {
+    /// Wraps an adapter entry hash.
+    #[must_use]
+    pub fn new(hash: impl Into<String>) -> Self {
+        Self(hash.into())
+    }
+
+    /// Whether the actual entry hash is the expected one.
+    #[must_use]
+    pub fn matches(&self, actual: &str) -> bool {
+        self.0 == actual
+    }
+}
+
+impl fmt::Debug for ExpectedHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ExpectedHash(<redacted>)")
+    }
+}
+
+/// A take-over bound to what the caller saw, with the adoption provenance
+/// the record gets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundTakeOver {
+    /// The entry hash the caller saw. `None` when the caller expects no
+    /// entry (adoption from a project scope adds a new user entry); there
+    /// is nothing to take over then.
+    pub expected: Option<ExpectedHash>,
+    /// Where the entry was adopted from.
+    pub adopted_from: AdoptedFrom,
+    /// The fields whose literals adoption replaced.
+    pub replaced_fields: Vec<ReplacedField>,
+}
 
 /// Why a server is held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -179,6 +233,9 @@ pub struct PlannedEntry {
     pub record: RecordChange,
     /// The owned read-back hash to show, if the entry is owned.
     pub owned_hash: Option<String>,
+    /// Whether d-mcp wrote the owned entry itself (`written`): only then is
+    /// `owned_hash` shown plain, otherwise as a keyed display hash.
+    pub owned_written: bool,
     /// The owned hashes the entry was planned from: the recorded ones, or
     /// the effective ones after a take-over or relocation. A write journals
     /// them as its previous hashes, so a failed or interrupted write reverts
@@ -186,6 +243,9 @@ pub struct PlannedEntry {
     pub previous: Option<Hashes>,
     /// Whether the resolver wants a rendered entry for this name.
     pub desired: bool,
+    /// The provenance and history the entry's record keeps (and any record
+    /// a write of it creates).
+    pub meta: RecordMeta,
 }
 
 impl PlannedEntry {
@@ -201,8 +261,10 @@ impl PlannedEntry {
             taken_over: false,
             record: RecordChange::Keep,
             owned_hash: None,
+            owned_written: false,
             previous: None,
             desired: false,
+            meta: RecordMeta::default(),
         }
     }
 }
@@ -271,6 +333,8 @@ pub fn plan_harness(input: &PlanInput<'_>) -> Planned {
                 .map(|(name, record)| {
                     let mut entry = PlannedEntry::new(name, Operation::LocationChanged);
                     entry.owned_hash = record.hashes().map(|hashes| hashes.readback.clone());
+                    entry.owned_written = record.hashes().is_some_and(|hashes| hashes.written);
+                    entry.meta = record.meta.clone();
                     entry
                 })
                 .collect();
@@ -309,7 +373,11 @@ pub fn plan_harness(input: &PlanInput<'_>) -> Planned {
                     .map(|hashes| hashes.definition_hash.clone()),
             };
             if let Some(definition_hash) = definition_hash {
-                record = Some(Record::owned(
+                let meta = record
+                    .as_ref()
+                    .map(|record| record.meta.clone())
+                    .unwrap_or_default();
+                record = Some(Record::owned_with(
                     file.clone(),
                     Hashes {
                         sent: actual.hash.clone(),
@@ -318,6 +386,7 @@ pub fn plan_harness(input: &PlanInput<'_>) -> Planned {
                         // A taken-over entry was not written by d-mcp.
                         written: false,
                     },
+                    meta,
                 ));
                 taken_over = true;
             }
@@ -326,6 +395,14 @@ pub fn plan_harness(input: &PlanInput<'_>) -> Planned {
         entry.taken_over = taken_over;
         entry.previous = record.as_ref().and_then(Record::hashes).cloned();
         entry.desired = matches!(desired, Some(Desired::Render { .. }));
+        entry.meta = record
+            .as_ref()
+            .map(|record| record.meta.clone())
+            .unwrap_or_default();
+        // A refreshed record keeps the provenance and history.
+        if let RecordChange::Set(changed) = &mut entry.record {
+            changed.meta.clone_from(&entry.meta);
+        }
         // A changed record (take-over, relocate) is persisted unless a
         // write or a drop replaces it anyway.
         if entry.record == RecordChange::Keep
@@ -350,6 +427,7 @@ fn plan_entry(
 ) -> PlannedEntry {
     let hashes = record.and_then(Record::hashes);
     let owned_hash = hashes.map(|hashes| hashes.readback.clone());
+    let owned_written = hashes.is_some_and(|hashes| hashes.written);
     let mut entry = match desired {
         Some(Desired::Held(reason)) => {
             let mut entry = PlannedEntry::new(name, Operation::Held);
@@ -390,6 +468,7 @@ fn plan_entry(
     };
     if entry.owned_hash.is_none() && entry.operation != Operation::Orphaned {
         entry.owned_hash = owned_hash;
+        entry.owned_written = owned_written;
     }
     entry
 }

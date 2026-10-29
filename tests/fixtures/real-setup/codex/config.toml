@@ -1,0 +1,56 @@
+# A Codex user configuration like a real one. Every CANARY string stands for
+# a secret that must never reach d-mcp's output or store. `@REPO@` is
+# replaced by the test repository root.
+model = "o3"
+
+[mcp_servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github", "--token-file", "/srv/CANARY_ARGS/token"]
+env_vars = ["GITHUB_TOKEN"]
+cwd = "/srv/CANARY_CWD"
+
+[mcp_servers.github.env]
+GITHUB_API_URL = "https://user:CANARY_USERINFO@api.github.test/CANARY_PATH?key=CANARY_QUERY#CANARY_FRAGMENT"
+
+# OAuth with a client id; the client secret is a harness-local preserved key.
+[mcp_servers.linear]
+url = "https://mcp.linear.test/mcp"
+scopes = ["read", "write"]
+
+[mcp_servers.linear.oauth]
+client_id = "CANARY_CLIENT_ID"
+client_secret = "CANARY_CLIENT_SECRET"
+
+[mcp_servers.search]
+url = "https://search.example.test/mcp/CANARY_PATH?token=CANARY_QUERY"
+
+[mcp_servers.search.http_headers]
+X-Api-Key = "CANARY_HEADER"
+
+# Excluded from the mapping: it runs a local command.
+[mcp_servers.helper]
+url = "https://helper.example.test/mcp"
+http_headers_helper = "/usr/local/bin/CANARY_COMMAND"
+
+# Taken over by the tests: its definition renders identically.
+[mcp_servers.time]
+command = "uvx"
+args = ["mcp-server-time"]
+
+# Adopted by the tests together with Claude Code's `tasks` (a duplicate):
+# its literal token becomes a forward, so the canary never reaches a store
+# file.
+[mcp_servers.tasks]
+command = "tasks-mcp"
+args = ["--stdio"]
+env_vars = ["TASKS_HOME"]
+
+[mcp_servers.tasks.env]
+TASKS_TOKEN = "CANARY_ENV"
+
+# An inline entry, a style d-mcp does not edit.
+[mcp_servers]
+inline = { command = "/opt/CANARY_COMMAND/run", args = ["CANARY_ARGS"] }
+
+[projects."@REPO@"]
+trust_level = "trusted"

@@ -1,0 +1,6 @@
+name = "wiki"
+description = "CANARY_DESCRIPTION"
+
+[transport]
+type = "stdio"
+command = "wiki-mcp"

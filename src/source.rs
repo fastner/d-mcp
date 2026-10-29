@@ -9,14 +9,13 @@
 //! nothing.
 
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::config::{Config, LOCAL_SOURCE_ID, SourceKind};
 use crate::definition::{OverrideSites, is_valid_name, parse_definition_with_sites};
 use crate::resolver::{FileEntry, FileProblem, Notice, SourceSnapshot};
 use crate::rule::Rule;
-use crate::store::StorePaths;
+use crate::store::{CappedReadError, StorePaths, read_regular_capped};
 
 /// Maximum size of a definition file.
 pub const MAX_DEFINITION_BYTES: u64 = 64 * 1024;
@@ -176,33 +175,14 @@ fn read_definition(
         return Err(FileProblem::file(Rule::FileTooLarge));
     }
     // `O_NOFOLLOW | O_NONBLOCK`: a file swapped for a symlink after the first
-    // check is not followed, and one swapped for a FIFO does not block.
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    crate::store::no_follow(&mut options, true);
-    let file = options.open(path).map_err(|_| {
-        // A refused symlink is reported as such; anything else is unreadable.
-        if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-            FileProblem::file(Rule::NotRegularFile)
-        } else {
-            FileProblem::file(Rule::Unreadable)
-        }
+    // check is not followed, and one swapped for a FIFO does not block. The
+    // handle is re-checked and the read capped, so a file swapped or grown
+    // after the first check is still caught.
+    let bytes = read_regular_capped(path, MAX_DEFINITION_BYTES).map_err(|error| match error {
+        CappedReadError::NotRegular => FileProblem::file(Rule::NotRegularFile),
+        CappedReadError::TooLarge => FileProblem::file(Rule::FileTooLarge),
+        CappedReadError::Io(_) => FileProblem::file(Rule::Unreadable),
     })?;
-    // Re-check through the opened handle and cap the read, so a file swapped
-    // or grown after the first check is still caught.
-    let handle_metadata = file
-        .metadata()
-        .map_err(|_| FileProblem::file(Rule::Unreadable))?;
-    if !handle_metadata.is_file() {
-        return Err(FileProblem::file(Rule::NotRegularFile));
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_DEFINITION_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| FileProblem::file(Rule::Unreadable))?;
-    if bytes.len() as u64 > MAX_DEFINITION_BYTES {
-        return Err(FileProblem::file(Rule::FileTooLarge));
-    }
     let text = String::from_utf8(bytes).map_err(|_| FileProblem::file(Rule::NotUtf8))?;
     parse_definition_with_sites(&text, stem).map_err(FileProblem::from)
 }
