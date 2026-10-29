@@ -31,7 +31,13 @@ pub const TEST_ROOT_MARKER: &str = ".d-mcp-test-root";
 
 /// An isolated environment for running `d-mcp`.
 pub struct TestEnv {
-    dir: TempDir,
+    /// Keeps the temporary directory alive; removed on drop.
+    _dir: TempDir,
+    /// The canonical form of the temporary directory: d-mcp sees the
+    /// working directory through `getcwd`, which resolves symlinks (on
+    /// macOS the temp dir lies under `/var`, a symlink to `/private/var`),
+    /// so every path a test compares against must be canonical too.
+    root: PathBuf,
     path: OsString,
     codex_home: bool,
     claude_config_dir: bool,
@@ -41,6 +47,10 @@ impl TestEnv {
     /// Creates the isolated directories.
     pub fn new() -> Self {
         let dir = tempfile::tempdir().expect("create a temp dir");
+        let root = dir
+            .path()
+            .canonicalize()
+            .expect("canonicalize the temp dir");
         for sub in [
             "home",
             "claude",
@@ -51,14 +61,15 @@ impl TestEnv {
             "xdg/cache",
             "work",
         ] {
-            fs::create_dir_all(dir.path().join(sub)).expect("create isolation dirs");
+            fs::create_dir_all(root.join(sub)).expect("create isolation dirs");
         }
-        fs::write(dir.path().join(TEST_ROOT_MARKER), "").expect("write the test root marker");
-        let empty = dir.path().join("empty-bin");
+        fs::write(root.join(TEST_ROOT_MARKER), "").expect("write the test root marker");
+        let empty = root.join("empty-bin");
         fs::create_dir_all(&empty).expect("create empty bin dir");
         Self {
             path: std::env::join_paths([&empty]).expect("join PATH"),
-            dir,
+            _dir: dir,
+            root,
             codex_home: true,
             claude_config_dir: true,
         }
@@ -189,9 +200,9 @@ impl TestEnv {
         }
     }
 
-    /// The temporary root.
+    /// The temporary root, canonicalized.
     pub fn root(&self) -> &Path {
-        self.dir.path()
+        &self.root
     }
 
     /// The isolated `HOME`.
