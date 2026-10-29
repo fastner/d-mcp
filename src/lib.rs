@@ -16,23 +16,41 @@
 //! (or under `CLAUDE_CONFIG_DIR`), which d-mcp never writes, and written
 //! through the `claude` CLI. Harness CLIs run only through [`process`]. [`cli`]
 //! parses, dispatches and renders through [`output`].
+//!
+//! [`inventory`] discovers every harness scope through the adapter contract
+//! and classifies the user scope with the sync planner, read-only. [`adopt`]
+//! turns discovered entries into definitions of the `local` source and takes
+//! them over through a scoped sync. Harness
+//! entry content is rendered only through [`redact`], and hashes of entries
+//! d-mcp does not own only as display hashes keyed by [`hashkey`].
+//! [`status`] and [`uninstall`] build on the sync planner's read-only plan
+//! of a harness location; [`doctor`] runs health checks over the store, the
+//! harness CLIs and the inventory. `uninstall --apply` removes entries only
+//! through a scoped sync and releases adopted ones as `unmanage` does.
 
 pub mod adapter;
+pub mod adopt;
 pub mod canonical;
 pub mod cli;
 pub mod config;
 pub mod credential;
 pub mod definition;
+pub mod doctor;
 pub mod error;
+pub mod hashkey;
+pub mod inventory;
 pub mod output;
 pub mod process;
+pub mod redact;
 pub mod resolver;
 pub mod rule;
 pub mod source;
 pub mod spanned;
 pub mod state;
+pub mod status;
 pub mod store;
 pub mod sync;
+pub mod uninstall;
 pub mod validate;
 
 use std::ffi::OsString;

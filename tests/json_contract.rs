@@ -516,3 +516,392 @@ fn claude_sync_and_unmanage_documents_match_the_reference() {
         assert_eq!(value["data"]["harnesses"], serde_json::json!(["claude"]));
     }
 }
+
+/// The text of a section of the reference: from its heading line to the
+/// next heading, with every run of whitespace collapsed to one space.
+fn section(heading: &str) -> String {
+    let after = REFERENCE
+        .split_once(&format!("\n{heading}\n"))
+        .unwrap_or_else(|| panic!("heading `{heading}` not found in docs/reference.md"))
+        .1;
+    let body = after.split("\n#").next().unwrap_or_default();
+    body.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The values the reference lists after `prefix` in a section: a run of
+/// backticked values separated by `, ` and ending after the value that
+/// follows `or` (`` `a`, `b` or `c` ``); a parenthetical after a value is
+/// skipped. `null` is left out.
+fn listed(heading: &str, prefix: &str) -> Vec<String> {
+    let text = section(heading);
+    let start = text
+        .find(prefix)
+        .unwrap_or_else(|| panic!("`{prefix}` not found in `{heading}`"));
+    let mut rest = &text[start + prefix.len()..];
+    let mut values = Vec::new();
+    let mut last = false;
+    while let Some(after) = rest.strip_prefix('`') {
+        let (value, after) = after.split_once('`').expect("a closing backtick");
+        if value != "null" {
+            values.push(value.to_owned());
+        }
+        rest = after;
+        if let Some(inner) = rest.strip_prefix(" (") {
+            let mut depth = 1;
+            let close = inner
+                .char_indices()
+                .find(|(_, c)| {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                    depth == 0
+                })
+                .expect("a closing parenthesis")
+                .0;
+            rest = &inner[close + 1..];
+        }
+        if last {
+            break;
+        }
+        if let Some(after) = rest
+            .strip_prefix(", or ")
+            .or_else(|| rest.strip_prefix(" or "))
+        {
+            rest = after;
+            last = true;
+        } else if let Some(after) = rest.strip_prefix(", ") {
+            rest = after;
+        } else {
+            break;
+        }
+    }
+    assert!(
+        !values.is_empty(),
+        "no values after `{prefix}` in `{heading}`"
+    );
+    values
+}
+
+/// The backticked first column of the first table in a section.
+fn table_column(heading: &str) -> Vec<String> {
+    let after = REFERENCE
+        .split_once(&format!("\n{heading}\n"))
+        .unwrap_or_else(|| panic!("heading `{heading}` not found in docs/reference.md"))
+        .1;
+    let values: Vec<String> = after
+        .lines()
+        .skip_while(|line| !line.starts_with('|'))
+        .take_while(|line| line.starts_with('|'))
+        .filter_map(|line| line.strip_prefix("| `")?.split_once('`'))
+        .map(|(value, _)| value.to_owned())
+        .collect();
+    assert!(!values.is_empty(), "no table in `{heading}`");
+    values
+}
+
+fn strs(values: &[String]) -> Vec<&str> {
+    values.iter().map(String::as_str).collect()
+}
+
+#[test]
+fn documented_value_lists_are_parsed() {
+    assert_eq!(
+        listed("### `inventory`", "`trust`: "),
+        ["trusted", "untrusted", "unknown-trust"]
+    );
+    assert_eq!(
+        listed("### `adopt`", "`verdict`: "),
+        ["single", "duplicate", "conflict"]
+    );
+    assert_eq!(
+        listed("### `uninstall`", "`outcome`: "),
+        ["planned", "applied", "failed", "left"]
+    );
+    assert_eq!(table_column("## Inventory")[0], "managed");
+}
+
+/// The inventory of the fixture after a sync, a take-over and a hand edit,
+/// so managed, drifted, unmanaged and local entries are all checked.
+#[test]
+fn inventory_matches_the_reference() {
+    let env = TestEnv::new();
+    let bin = env.fake_claude_dir();
+    let env = env.with_path(&[bin]);
+    let setup = env.install_real_setup();
+    for args in [
+        &["select", "fetch"][..],
+        &["select", "time", "--harness", "codex"],
+        &["sync", "--take-over", "time"],
+    ] {
+        let (code, value, _) = env.json_in(&setup.cwd, args);
+        assert_eq!(code, 0, "{args:?}: {value:#}");
+    }
+    let config = fs::read_to_string(env.codex_config()).unwrap();
+    fs::write(
+        env.codex_config(),
+        config.replace(
+            "args = [\"mcp-server-fetch\"]",
+            "args = [\"mcp-server-fetch\", \"--edited\"]",
+        ),
+    )
+    .unwrap();
+    let (code, value, _) = env.json_in(&setup.cwd, &["inventory"]);
+    assert_eq!(code, 0, "{value:#}");
+    check_success(&value, "### `inventory`");
+    let heading = "### `inventory`";
+    let classes = table_column("## Inventory");
+    let scopes = listed(heading, "`scope`: ");
+    let trusts = listed(heading, "`trust`: ");
+    let approvals = listed(heading, "`approval`: ");
+    let verdicts = listed(heading, "`verdict` ");
+    let kinds = listed("### `adopt`", "`replaced[].kind`: ");
+    let mut seen = BTreeSet::new();
+    for harness in value["data"]["harnesses"].as_array().unwrap() {
+        for scope in harness["scopes"].as_array().unwrap() {
+            assert_in(&strs(&scopes), &scope["scope"], "scope");
+            assert_in_or_null(&strs(&trusts), &scope["trust"], "trust");
+            for entry in scope["entries"].as_array().unwrap() {
+                assert_in(&strs(&classes), &entry["class"], "class");
+                assert_in_or_null(&strs(&approvals), &entry["approval"], "approval");
+                for replaced in entry["import"]["replaced"].as_array().into_iter().flatten() {
+                    assert_in(&strs(&kinds), &replaced["kind"], "kind");
+                }
+                for gap in entry["import"]["gaps"].as_array().into_iter().flatten() {
+                    let reason = gap["reason"].as_str().unwrap();
+                    assert!(
+                        section("### Import").contains(&format!("`{reason}`")),
+                        "gap reason `{reason}` is not documented"
+                    );
+                }
+                seen.insert(entry["class"].as_str().unwrap().to_owned());
+            }
+        }
+    }
+    for class in ["managed", "drifted", "unmanaged", "local"] {
+        assert!(seen.contains(class), "{class} not seen: {seen:?}");
+    }
+    for group in value["data"]["same_name"].as_array().unwrap() {
+        assert_in(&strs(&verdicts), &group["verdict"], "verdict");
+    }
+}
+
+/// Checks the envelope of a run that exits non-zero and still carries its
+/// documented `data` (`adopt`, `uninstall`, `doctor`).
+fn check_failure_with_data(value: &Value, heading: &str, error: &str) {
+    assert_shape(&documented("### Envelope"), value, "envelope");
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], error, "{value:#}");
+    assert_shape(&documented(heading), &value["data"], heading);
+}
+
+fn assert_in(allowed: &[&str], value: &Value, what: &str) {
+    let text = value
+        .as_str()
+        .unwrap_or_else(|| panic!("{what} is not a string: {value}"));
+    assert!(allowed.contains(&text), "{what}: unexpected `{text}`");
+}
+
+fn assert_in_or_null(allowed: &[&str], value: &Value, what: &str) {
+    if !value.is_null() {
+        assert_in(allowed, value, what);
+    }
+}
+
+#[test]
+fn adopt_matches_the_reference() {
+    let env = TestEnv::new();
+    let (claude, codex) = (env.fake_claude_dir(), env.fake_codex_dir());
+    let env = env.with_path(&[claude, codex]);
+    let setup = env.install_real_setup();
+    let vars = [("TASKS_TOKEN", "CANARY_ENV")];
+    let mut cmd = env.cmd_in(&setup.cwd);
+    for (name, value) in vars {
+        cmd.env(name, value);
+    }
+    let output = cmd
+        .args(["--json", "adopt", "claude:user:tasks", "codex:user:tasks"])
+        .output()
+        .unwrap();
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{value:#}");
+    check_success(&value, "### `adopt`");
+    // Refusals exit 1 and still carry the document.
+    let (code, refused, _) = env.json_in(
+        &setup.cwd,
+        &[
+            "adopt",
+            "claude:user:github",
+            "codex:user:github",
+            "claude:local:notes",
+        ],
+    );
+    assert_eq!(code, 1);
+    check_failure_with_data(&refused, "### `adopt`", "adopt-refused");
+    let heading = "### `adopt`";
+    let verdicts = listed(heading, "`verdict`: ");
+    let scopes = listed(heading, "`scope`: ");
+    let writes = listed(heading, "`write`: ");
+    let kinds = listed(heading, "`replaced[].kind`: ");
+    let normalizations = listed(heading, "`normalizations[].kind`: ");
+    let statuses = listed(heading, "`variables[].status`: ");
+    for document in [&value, &refused] {
+        for server in document["data"]["servers"].as_array().unwrap() {
+            assert_in_or_null(&strs(&verdicts), &server["verdict"], "verdict");
+            for entry in server["entries"].as_array().unwrap() {
+                assert_in(&strs(&scopes), &entry["scope"], "scope");
+                assert_in_or_null(&strs(&writes), &entry["write"], "write");
+            }
+            for replaced in server["replaced"].as_array().unwrap() {
+                assert_in(&strs(&kinds), &replaced["kind"], "kind");
+            }
+            for normalization in server["normalizations"].as_array().unwrap() {
+                assert_in(
+                    &strs(&normalizations),
+                    &normalization["kind"],
+                    "normalization",
+                );
+            }
+            for variable in server["variables"].as_array().unwrap() {
+                assert_in(&strs(&statuses), &variable["status"], "variable");
+            }
+            for refusal in server["refusals"].as_array().unwrap() {
+                let reason = refusal["reason"].as_str().unwrap();
+                assert!(
+                    REFERENCE.contains(&format!("`{reason}`")),
+                    "refusal `{reason}` is not documented"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn status_matches_the_reference() {
+    let env = TestEnv::new();
+    let setup = env.install_real_setup();
+    for args in [
+        &["select", "fetch"][..],
+        &["select", "ghost", "--harness", "codex"],
+        &["select", "broken"],
+    ] {
+        let (code, value, _) = env.json_in(&setup.cwd, args);
+        assert_eq!(code, 0, "{value:#}");
+    }
+    env.json_in(&setup.cwd, &["sync"]);
+    let (code, value, _) = env.json_in(&setup.cwd, &["status", "--auth"]);
+    assert_eq!(code, 0, "{value:#}");
+    check_success(&value, "### `status`");
+    let heading = "### `status`";
+    // The operations of sync, and `unchanged`.
+    let mut operations = table_column("### Operations");
+    operations.extend(listed(heading, "such as "));
+    let statuses = listed(heading, "`status` of a harness: ");
+    let desired = listed(heading, "`desired`: ");
+    let reasons = listed(heading, "`reason` (for `held`): ");
+    let recorded = listed(heading, "`recorded`: ");
+    let actual = listed(heading, "`actual`: ");
+    let logins = listed(heading, "`login`: ");
+    let mut seen = BTreeSet::new();
+    for harness in value["data"]["harnesses"].as_array().unwrap() {
+        assert_in(&strs(&statuses), &harness["status"], "status");
+        for entry in harness["entries"].as_array().unwrap() {
+            assert_in(&strs(&desired), &entry["desired"], "desired");
+            assert_in_or_null(&strs(&reasons), &entry["reason"], "reason");
+            assert_in(&strs(&recorded), &entry["recorded"], "recorded");
+            assert_in(&strs(&actual), &entry["actual"], "actual");
+            assert_in_or_null(&strs(&operations), &entry["operation"], "operation");
+            assert_in(&strs(&logins), &entry["login"], "login");
+            seen.insert(entry["desired"].as_str().unwrap().to_owned());
+        }
+    }
+    assert!(
+        seen.contains("resolved") && seen.contains("held"),
+        "{seen:?}"
+    );
+}
+
+#[test]
+fn doctor_matches_the_reference() {
+    let heading = "### `doctor`";
+    let checks = listed(heading, "`check`: ");
+    // The table of the checks lists the same ones.
+    assert_eq!(
+        table_column("## Doctor")
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        checks.iter().cloned().collect::<BTreeSet<_>>()
+    );
+    let severities = listed(heading, "`severity`: ");
+    let check_all = |value: &Value| {
+        for check in value["data"]["checks"].as_array().unwrap() {
+            assert_in(&strs(&checks), &check["check"], "check");
+            assert_in(&strs(&severities), &check["severity"], "severity");
+            assert_in_or_null(&["claude", "codex"], &check["harness"], "harness");
+        }
+    };
+    let env = TestEnv::new();
+    let setup = env.install_real_setup();
+    let (code, value, _) = env.json_in(&setup.cwd, &["doctor", "--auth"]);
+    assert_eq!(code, 0, "{value:#}");
+    check_success(&value, "### `doctor`");
+    check_all(&value);
+    // An error check exits 1 with the document.
+    let env = TestEnv::new();
+    let (code, value, _) = env.json(&["doctor"]);
+    assert_eq!(code, 1);
+    check_failure_with_data(&value, "### `doctor`", "doctor-failed");
+    check_all(&value);
+}
+
+#[test]
+fn uninstall_matches_the_reference() {
+    let env = TestEnv::new();
+    env.init();
+    fs::write(env.codex_config(), "").unwrap();
+    env.write_local("github", &stdio("github", "npx"));
+    env.write_local("wiki", &stdio("wiki", "w"));
+    env.json(&["select", "github", "--harness", "codex"]);
+    env.json(&["select", "wiki", "--harness", "codex"]);
+    env.json(&["sync"]);
+    let heading = "### `uninstall`";
+    let statuses = listed(heading, "`status` of a harness: ");
+    let actions = listed(heading, "`action`: ");
+    assert_eq!(table_column("## Uninstall"), actions);
+    let outcomes = listed(heading, "`outcome`: ");
+    let blocked_reasons = listed(heading, "`reason` ");
+    let check_all = |value: &Value| {
+        for harness in value["data"]["harnesses"].as_array().unwrap() {
+            assert_in(&strs(&statuses), &harness["status"], "status");
+            for entry in harness["entries"].as_array().unwrap() {
+                assert_in(&strs(&actions), &entry["action"], "action");
+                assert_in(&strs(&outcomes), &entry["outcome"], "outcome");
+            }
+        }
+        for blocked in value["data"]["purge"]["blocked"].as_array().unwrap() {
+            assert_in(&strs(&blocked_reasons), &blocked["reason"], "blocked");
+        }
+        if value["data"]["sync"].is_object() {
+            assert_shape(&documented("### `sync`"), &value["data"]["sync"], "sync");
+        }
+    };
+    let (code, value, _) = env.json(&["uninstall", "--purge"]);
+    assert_eq!(code, 0, "{value:#}");
+    check_success(&value, "### `uninstall`");
+    check_all(&value);
+    // A drifted entry is left: exit 1 with the document and the sync of
+    // the removal.
+    let text = fs::read_to_string(env.codex_config()).unwrap();
+    fs::write(
+        env.codex_config(),
+        text.replace("command = \"w\"", "command = \"x\""),
+    )
+    .unwrap();
+    let (code, value, _) = env.json(&["uninstall", "--apply"]);
+    assert_eq!(code, 1, "{value:#}");
+    check_failure_with_data(&value, "### `uninstall`", "uninstall-incomplete");
+    check_all(&value);
+    assert!(value["data"]["sync"].is_object());
+}

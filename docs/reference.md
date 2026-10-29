@@ -2,8 +2,9 @@
 
 This is the reference for d-mcp: the store, the definition format, the secret rules, sources,
 selections, resolution, override validation, sync with the Codex and Claude Code adapters, the
-write state, exit and error codes, and the JSON documents. Later work packages (adoption,
-approvals) build on it.
+write state, exit and error codes, and the JSON documents. It also covers the discovery of every
+harness scope, the inventory, the redacted view, display hashes, adoption, status, doctor and
+uninstall. Later work packages (approvals) build on it.
 
 ## Commands
 
@@ -16,8 +17,13 @@ approvals) build on it.
 | `d-mcp select <server> [--harness claude\|codex]...` | mutating | Select a server for harnesses. |
 | `d-mcp unselect <server>` | mutating | Remove a selection. |
 | `d-mcp resolve` | read-only | Resolve every selection against the sources. |
+| `d-mcp inventory [--harness claude\|codex]...` | read-only | List every entry of every harness scope d-mcp can read, classified, with duplicates and conflicts (see [Inventory](#inventory)). |
+| `d-mcp adopt <harness>:<scope>:<name>... [flags]` | read-only; mutating with `--apply` | Take existing harness entries over as definitions of the `local` source, preview first (see [Adoption](#adoption)). |
 | `d-mcp sync [--harness claude\|codex]... [--take-over <server>]... [--relocate]` | mutating | Write the selected servers into the harnesses (see [Sync](#sync)). |
 | `d-mcp unmanage <server> [--harness claude\|codex]...` | mutating | Stop managing a server's harness entries (see [Unmanage](#unmanage)). |
+| `d-mcp status [--auth] [--harness claude\|codex]... [<server>...]` | read-only | Show the desired, recorded and actual state, the next sync operation, missing variables and, with `--auth`, the login state (see [Status](#status)). |
+| `d-mcp doctor [--auth]` | read-only | Check the store, the harnesses and the managed entries; exit 1 on an `error` check (see [Doctor](#doctor)). |
+| `d-mcp uninstall [--apply] [--purge [--follow-store-link]]` | read-only; mutating with `--apply` | Remove the entries d-mcp created, release adopted ones, and optionally delete the store (see [Uninstall](#uninstall)). |
 
 Global options, accepted before or after the command:
 
@@ -28,8 +34,9 @@ Global options, accepted before or after the command:
   effect and prints a warning on stderr; stdout stays valid JSON.
 
 Mutating commands take the store lock, then read `config.toml`, then write. A mutating command on
-an uninitialized store fails before it tries to lock. Read-only commands take no lock and succeed
-while another process holds it.
+an uninitialized store fails before it tries to lock. Every mutating command (not a dry run)
+creates a missing `.hash-key` under the lock (see [Display hashes](#display-hashes)). Read-only
+commands take no lock, create nothing, and succeed while another process holds it.
 
 ## Store
 
@@ -52,6 +59,7 @@ command fails with `home-unset` (exit 4).
 <store>/
 ├── config.toml        schema version, user sources, selections
 ├── state.toml         write state of `sync` (created on first write)
+├── .hash-key          key of the display hashes (created by `init` or any mutating command)
 ├── .lock              advisory lock file
 └── local/             root of the built-in local source
     └── servers/       definitions of the built-in local source
@@ -59,14 +67,17 @@ command fails with `home-unset` (exit 4).
 
 Directories are created with mode `0700`, files with mode `0600`. `sync` creates `state.toml` on
 its first write; later work packages create `lock.toml` and `approvals.toml`. Every persisted file carries
-`schema_version = 1`; another version fails with `schema-unsupported` (exit 3).
+`schema_version = 1`; another version fails with `schema-unsupported` (exit 3). `uninstall --apply --purge` deletes exactly
+these entries (see [Uninstall](#uninstall)).
 
 `init`:
 
 - creates the missing parts of the layout and reports each created path, in creation order;
 - is idempotent: on a complete store it creates nothing and succeeds;
+- creates `.hash-key` with a fresh random key when it is missing, and never replaces an existing
+  one (a corrupt one fails with `hash-key-corrupt`, exit 3);
 - completes a partial store: a directory that holds only known store entries (`config.toml`,
-  `local`, `.lock`, `state.toml`, `lock.toml`, `approvals.toml`);
+  `local`, `.lock`, `state.toml`, `.hash-key`, `lock.toml`, `approvals.toml`);
 - refuses a non-empty directory that is not a store with `foreign-directory` (exit 1);
 - never rewrites an existing `config.toml`; a corrupt one fails with exit 3;
 - follows a store root that is a symlink to a directory, as every other command does, so a
@@ -175,7 +186,7 @@ client_secret_env = "LINEAR_CLIENT_SECRET"
 | `transport.url` | http | The server URL. |
 | `env` | no | stdio only. Table of variable name to `{ forward = true }` or `{ value = "..." }`. |
 | `auth` | no | http only. The auth method. |
-| `harness.codex`, `harness.claude` | no | Per-harness override tables. `harness.codex` is checked against the Codex allow-list (see [Override validation](#override-validation)); `harness.claude` stays opaque until the Claude Code adapter. |
+| `harness.codex`, `harness.claude` | no | Per-harness override tables; each is checked against its adapter's allow-list (see [Override validation](#override-validation)). |
 
 The `auth` forms:
 
@@ -368,7 +379,7 @@ defaults, as 64 lowercase hex characters.
 - `definition_hash`: tag `d-mcp-definition-v1`, the full model including `description` and the
   override tables. WP5 binds approvals to it.
 - `core_hash`: tag `d-mcp-core-v1`, the model without `description` and without the override
-  tables. WP4 uses it to detect duplicates across harnesses.
+  tables. `inventory` and `adopt` use it to detect duplicates across harnesses.
 
 Canonical JSON has keys sorted byte-wise (d-mcp sorts them itself, independent of `serde_json`
 features) and no whitespace. Its shape mirrors the TOML:
@@ -417,6 +428,26 @@ normalization Claude Code applies when it writes an entry (verified against Clau
 Claude Code also drops keys it does not know; d-mcp never renders such keys. A normalization the
 canonical form does not absorb makes the read-back verification fail (`harness-verify-failed`)
 instead of silently losing ownership.
+
+### Display hashes
+
+The entry hash of an entry d-mcp does not own could be used to guess a low-entropy secret in it by
+hashing candidates. Such hashes are therefore shown only *keyed*, as a display hash:
+HMAC-SHA-256 under a random 32-byte key over the tag `d-mcp-display-v1`, a newline and the
+adapter's entry hash, as 64 lowercase hex characters.
+
+- The key lives in `<store>/.hash-key` (mode `0600`) as 64 lowercase hex characters and a newline.
+  `init` creates it, and every mutating command creates it under the store lock when it is
+  missing. Read-only commands never create it: without a key they show no display hashes and say
+  to run `d-mcp init`. A key that is not a regular file or not 64 hex characters is
+  `hash-key-corrupt` (exit 3) for mutating commands and is never replaced; read-only commands
+  warn and show no display hashes.
+- A plain entry hash (`hash` in JSON) is shown only for an owned record that d-mcp wrote itself
+  (`written`). A record created by `--take-over` holds the foreign entry's hash and is shown keyed
+  (`display_hash`), like every unmanaged and project-scope entry. A drifted entry shows its
+  recorded `hash` and the `display_hash` of its changed content.
+- A display hash changes when the key changes; it is meant to compare entries and to bind a later
+  apply to a preview, never to be stored elsewhere.
 
 ## Sources and selections
 
@@ -540,7 +571,8 @@ Without `--take-over`, a drifted entry is never modified.
   the actual hash), then plans normally in the same run: an identical collision becomes
   `unchanged` without a write; any other content becomes an `update`. It applies to drift,
   collision and identical collision. A name that is neither selected nor recorded fails with
-  `unknown-take-over` (exit 1). WP4 adoption reuses this operation.
+  `unknown-take-over` (exit 1). Adoption reuses this operation, bound to the entry it
+  previewed (see [Apply](#apply)).
 - `--relocate` rewrites the recorded paths of a harness to the newly resolved file, then plans
   normally, which usually re-adds the entries. It reports that the old file still contains the
   formerly managed tables and that d-mcp no longer owns them; it never edits the old file.
@@ -588,8 +620,14 @@ with a failed entry has the status `failed` and carries the most severe entry er
 entries keep their own outcomes.
 
 Every record carries a provenance marker (`written` in `state.toml`): it is set when d-mcp's own
-write is promoted and cleared by `--take-over` (and by WP4 adoption). The Claude Code adapter rolls
+write is promoted and cleared by `--take-over` (and by adoption). The Claude Code adapter rolls
 back only entries with the marker, so foreign content never reaches a command line.
+
+A record also keeps what outlives its hashes: the adoption provenance (`adopted_from`,
+`replaced_fields`) and the vanish history (`vanish_count`, `last_vanish`). Take-overs, refreshes,
+writes and settlements carry them over; only a dropped record loses them. `vanish_count` grows by
+one whenever a `vanished` re-add is promoted (right after the write, or when a `pending` re-add is
+settled) and is never reset; doctor warns from 2 on.
 
 ### Dry run and lock
 
@@ -600,11 +638,12 @@ creates no file or directory, and treats a settled `pending` record as owned for
 
 ### Output rules
 
-Until WP4, sync output (text, JSON and errors) names only the harness, scope, file path, entry
-name, operation, outcome, hold reason, gaps and positions, plus the hashes of owned entries. It
-never contains field values, hashes of foreign or unowned entries, child process output, or
-`toml_edit` or `serde_json` error text. Shadowing notices name the entry and the project path
-only.
+Sync output (text, JSON and errors) names only the harness, scope, file path, entry name,
+operation, outcome, hold reason, gaps and positions, plus the hashes of owned entries: plain
+(`hash`) only for an entry d-mcp wrote itself (`written`), keyed (`display_hash`) for a taken-over
+one (see [Display hashes](#display-hashes)). It never contains field values, plain hashes of
+foreign or unowned entries, child process output, or `toml_edit` or `serde_json` error text.
+Shadowing notices name the entry and the project path only.
 
 ### Sync exit codes
 
@@ -612,7 +651,7 @@ only.
 |---:|---|
 | 0 | Everything was applied, unchanged, held or re-added after `vanished`, or the harness is not present. `note` gaps do not change the code. |
 | 1 | `sync-blocked`: at least one entry is blocked by drift, a collision, a location change, an unsupported entry or root style, or an `important` gap; `harness-cli-failed`: a harness CLI call of an entry failed; `harness-no-neutral-dir`: no neutral working directory for a harness CLI, so nothing was run for that harness. |
-| 3 | `harness-file-changed`, `harness-config-invalid`, `harness-edit-failed`, `harness-verify-failed`; also `state-corrupt` and `schema-unsupported` for `state.toml`. |
+| 3 | `harness-file-changed`, `harness-config-invalid`, `harness-edit-failed`, `harness-verify-failed`; also `state-corrupt` and `schema-unsupported` for `state.toml`; `adopt-entry-changed` in the scoped sync of an adoption (an entry changed after adopt checked it). |
 | 4 | An environment problem (`io-error`, `home-unset`, `harness-path-not-utf8`, `harness-cli-not-found`, `harness-cli-timeout`). |
 
 Across harnesses the highest-priority code wins, in the order 3, 4, 1, 0. Global errors
@@ -632,6 +671,458 @@ selection. The harness entries are left as they are, so the next sync reports no
 - A server without a record fails with `not-managed` (exit 1). An unknown `--harness` value is a
   usage error (exit 2).
 
+## Discovery
+
+d-mcp writes user scope only, but it reads every scope a harness loads, so it can show what is
+already configured. Discovery is read-only: it opens no file for writing, runs no harness CLI and
+creates nothing. Each scope is read on its own; a file that cannot be read is that scope's error
+(by path and position only) and never hides the other scopes.
+
+- **Current repository**: the nearest ancestor of the working directory (itself included) that
+  holds `.git` (a directory, or a file for worktrees and submodules), otherwise the working
+  directory. No `git` process is run.
+- **Repository files** (`.mcp.json`, `.codex/config.toml`, Claude Code settings files) are read
+  through the same size-capped, no-follow open as definition files: a symlink, a non-regular file
+  or a file over 1 MiB is that scope's `harness-config-invalid` error.
+- **Absent** means not found (or a parent that is not a directory). Any other error while looking
+  for a file, such as a directory that cannot be searched, is not absence: for a harness or
+  repository file it is that scope's `io-error`, for a settings file the approval is `unknown`,
+  and a local-scope project path is not reported as orphaned.
+
+| Harness | Scope | File | Read |
+|---|---|---|---|
+| Codex | `user` | `$CODEX_HOME/config.toml` | every entry, as for sync |
+| Codex | `project` | `.codex/config.toml` of every directory from the repository root down to the working directory, root first | every entry, with the root's trust |
+| Claude Code | `user` | the configuration file (see [Location and presence](#location-and-presence-1)) | every entry, as for sync |
+| Claude Code | `local` | `projects.<path>.mcpServers` of the configuration file, one scope per project path | entry names and the project path only; never values (ADR 0005). A path that no longer exists is *orphaned* |
+| Claude Code | `project` | `<repository>/.mcp.json` | every entry, with its approval |
+
+**Codex project trust** (verified against Codex 0.165.0 with isolated `HOME` and `CODEX_HOME`,
+through `codex mcp list --json`): Codex loads the `.codex/config.toml` layers only when the user
+configuration trusts the repository root, `[projects."<root>"] trust_level = "trusted"`, keyed by
+the root, not by a subdirectory. Without the key, or with `"untrusted"`, they are ignored. A
+project entry replaces a user entry of the same name, and one unparsable layer makes Codex fail as
+a whole. d-mcp reports the trust as `trusted`, `untrusted` (also for an absent key) or
+`unknown-trust` (any other value, or an unreadable user configuration).
+
+**Claude Code project approval** (verified against Claude Code 2.1.312 with isolated `HOME` and
+`CLAUDE_CONFIG_DIR`, through `claude mcp list` in a temporary project with a `.mcp.json` stdio
+server; no login, no network server; this covers the approval rules only, the version the
+adapter writes against stays `2.1.310`, see [Doctor](#doctor)): an `.mcp.json` entry is loaded
+only when approved. The keys
+are `enabledMcpjsonServers`, `disabledMcpjsonServers` (arrays of names) and
+`enableAllProjectMcpServers` (a boolean). They count from the user settings
+(`$CLAUDE_CONFIG_DIR/settings.json`, else `$HOME/.claude/settings.json`) always, and from the
+project's `.claude/settings.json`, `.claude/settings.local.json` and the legacy keys of the project
+entry in the configuration file only once the workspace is trusted (`hasTrustDialogAccepted =
+true` in `projects.<path>`); Claude Code moves the legacy keys into `.claude/settings.local.json`
+on its next run. The project is Claude Code's working directory, so d-mcp uses its own. A
+disabled name wins; an entry that is neither enabled nor disabled is pending. d-mcp reports each
+entry's `approval` as `approved`, `disabled`, `pending` or `unknown` (a settings file that cannot
+be read, an empty `CLAUDE_CONFIG_DIR`, or an unreadable configuration file), and the scope's trust
+as `trusted`, `untrusted` or `unknown-trust`. Only these keys are deserialized; every other key of
+a settings file, such as `env`, is skipped unread. Managed settings are not read; they can change
+the outcome without d-mcp seeing it.
+
+### Import
+
+Every value-read entry is also imported into a neutral candidate definition, the inverse of the
+rendering ([Codex mapping](#codex-mapping), [Claude Code mapping](#claude-code-mapping)). The
+candidate is not validated yet; [adoption](#adoption) validates it.
+
+- Every env and header literal becomes a variable reference: an env literal a forward of the same
+  key name; a literal `Authorization: Bearer <token>` header `bearer_env`, any other literal header
+  `header_env`, each with a proposed variable (`<SERVER>_TOKEN`, `<SERVER>_<HEADER>`, upper case,
+  other characters turned into `_`). Each is listed as a *replaced* field (field, kind, variable),
+  never with its value. The variable is shown as `<redacted-key>` when it does not look like a
+  name (see [Redaction](#redaction)).
+- Any name the definition would carry passes one name check, whether it comes from a literal, a
+  forward or a reference: every env key (a replaced literal's, a Claude Code `${NAME}` forward's, a
+  Codex `env_vars` name), every header name (literal or referenced, Codex `env_http_headers`
+  included), and every variable a header or bearer token reads (Claude Code `${VAR}` in a header,
+  Codex `env_http_headers` values and `bearer_token_env_var`). A name that does not look like a
+  name, and an env key or variable that is not a valid variable name, is not imported: the field
+  (shown as, for example, `env.<redacted-key>`, `headers.<redacted-key>`, `env_vars[0]`,
+  `bearer_token_env_var`) is an `invalid-name` gap, because the definition would carry the name.
+- A Claude Code value `${NAME}` or `${NAME:-}` under the env key `NAME` is a forward. Declared
+  *normalizations*: `empty-default` (`${NAME}` is rendered as `${NAME:-}`), `default-dropped` (a
+  header `${VAR:-}` is rendered as `${VAR}`), `scopes-sorted` (OAuth scopes are rendered sorted and
+  deduplicated), `env-vars-sorted` (Codex `env_vars` are rendered as names, sorted and
+  deduplicated).
+- Codex's preserved keys (`oauth.client_secret`, `oauth.callback_url`, `oauth.callback_port`) are
+  not literals to replace; they stay harness-local.
+- *Import gaps* name a field and a reason, never a value: `local-scope`, `scope-unreadable`,
+  `not-found`, `not-an-object`, `unsupported-style` (an inline or dotted Codex entry),
+  `unknown-key`, `excluded-key` (`headersHelper`, `http_headers_helper`, approval modes,
+  `experimental_environment`), `invalid-value`, `missing-transport`, `sse-transport`,
+  `multiple-headers`, `header-with-oauth`, `renamed-forward` (`${OTHER}` under `NAME`),
+  `forward-default` (`${VAR:-default}`), `embedded-variable` (variable syntax inside a longer
+  value, also in `command`, `args` and `url`), `env-source` (a Codex `env_vars` entry whose
+  source is not `local`) and `invalid-name` (see above). A key name that does not look like a name
+  is shown as `<redacted-key>`.
+
+## Inventory
+
+`d-mcp inventory [--harness claude|codex]...` lists every discovered scope of every harness (or the
+given ones) with its entries. It is read-only (no lock, no writes, no `.hash-key`, no harness CLI)
+and exits 0, also when a scope cannot be read; global errors (a corrupt `config.toml` or
+`state.toml`) fail as usual. On a store that is not initialized everything is `unmanaged`, with a
+notice.
+
+**Classes.** User-scope entries are classified by a read-only run of the sync planner against the
+write state (held servers are left out, so their records classify by content):
+
+| Class | Meaning |
+|---|---|
+| `managed` | Owned by d-mcp and unchanged since it was recorded. |
+| `drifted` | Owned, but changed outside d-mcp. |
+| `unmanaged` | Not owned by d-mcp; every project-scope entry. |
+| `vanished` | Owned, but no longer in the harness file. |
+| `pending` | A write of d-mcp was interrupted; the next sync settles it. |
+| `location-changed` | Owned at another file (after `CODEX_HOME` or `CLAUDE_CONFIG_DIR` changed). |
+| `local` | A Claude Code local-scope entry, by name only: never hashed, compared or adopted. |
+
+**`shadowed_in`** lists, for a user-scope entry, the narrower scopes with the same name that win in
+their project: a Claude Code local-scope entry (`local`, with the project path), an `.mcp.json`
+entry that is not disabled and a Codex project layer that is not untrusted (`project`, with the
+repository root).
+
+**Same name in several scopes.** A name found in more than one value-read scope (user and project
+scopes of both harnesses; local scope is names only) gets a verdict: `duplicate` when every import
+has an equal `core_hash` and the same replaced literals, `conflict` when they differ, and
+`undetermined` when one cannot be imported (within one harness, equal entry hashes still make a
+`duplicate`). The `core_hash` and the literals are compared in memory and never output.
+
+**Hashes** follow [Display hashes](#display-hashes).
+
+## Adoption
+
+`d-mcp adopt <harness>:<scope>:<name>...` takes existing harness entries over as d-mcp
+definitions. Entries with the same name become one definition, written to
+`local/servers/<name>.toml` of the built-in `local` source and selected for exactly the harnesses
+whose entries are adopted. The scope is `user` or `project` (`local` is always refused). Several
+names can be adopted in one run.
+
+| Flag | Meaning |
+|---|---|
+| `--apply` | Act instead of previewing; needs `--expect` for every entry. |
+| `--expect <harness>:<scope>:<name>=<display-hash>` | Binds an `--apply` to the preview (64 hex characters). |
+| `--keep-literal <NAME>` | Keep an env literal as a value (see [Literals and variables](#literals-and-variables)). |
+| `--var <field>=<NAME>` | Choose the variable of a replaced header literal. |
+| `--to-user-scope` | Adopt a project-scope entry into the user scope (see [Scope widening](#scope-widening)). |
+| `--from <harness>:<scope>` | Choose the origin whose content wins a conflict (see [Several origins](#several-origins)). |
+| `--prefer-oauth`, `--oauth-supported` | Choose OAuth for a static token (see [OAuth](#oauth)). |
+| `--accept-relogin`, `--client-secret-env <NAME>` | Accept the re-login of an OAuth-capable Claude Code entry and pass its client secret (see [OAuth](#oauth)). |
+| `--allow-missing-env`, `--allow-env-mismatch` | Accept a failed variable check (see [Apply](#apply)). |
+
+A malformed entry, `--expect`, `--var` or `--from` argument, and the combination of `--prefer-oauth`
+with `--oauth-supported`, is a usage error (exit 2).
+
+### Preview
+
+Without `--apply` (or with `--apply --dry-run`) `adopt` is read-only: no lock, no write, no
+`.hash-key`. It shows, per server:
+
+- the definition d-mcp would write, as a redacted view (see [Redaction](#redaction));
+- per origin entry: its `display_hash`, `write` (`none` when the rendering equals the entry, which
+  is then taken over without a write; `update`; `add` for a project-scope origin, which adds a new
+  user entry), a redacted `before` view of the entry, a redacted `after` view of the rendering, the
+  native fields that differ (`changed`, names only) and the rendering's `note` gaps;
+- the replaced literals (origin, field, kind, variable), the literals kept with `--keep-literal`,
+  the declared normalizations, the variable gate and every refusal;
+- notices: a project-scope origin that keeps its literals and shadows the adopted entry, an
+  accepted variable override, a Claude Code re-login.
+
+The text form ends with the `--expect` flags that bind an `--apply` to this preview.
+
+### Literals and variables
+
+- Every env and header literal becomes a variable reference (see [Import](#import)): an env literal
+  a forward of the same key name; a literal `Authorization: Bearer <token>` header `bearer_env`, any
+  other single literal header `header_env`.
+- `--keep-literal <NAME>` keeps an env literal as `{ value = "..." }`, only for env entries and only
+  when the value passes `secret_value_heuristic` (`keep-literal-secret` otherwise). Header values
+  are always references.
+- Env literals keep their key name. A header gets a proposed variable, `<SERVER>_TOKEN` for a bearer
+  token and `<SERVER>_<HEADER>` otherwise. A proposal must be a valid variable name that looks like
+  a name (it is not shown as `<redacted-key>`, see [Redaction](#redaction)) and must not be a
+  [credential name](#credential-names), so it works for both adapters and can be shown; otherwise
+  it is refused (`proposal-invalid`, `proposal-credential-name`) and `--var <field>=<NAME>` is
+  needed. `--var`
+  names the native field (`headers.Authorization` for Claude Code, `http_headers.<Header>` for
+  Codex), overrides any proposal for every origin of the server, and is checked the same way
+  (`variable-name`, `credential-name`).
+- Codex's preserved keys (`oauth.client_secret`, `oauth.callback_url`, `oauth.callback_port`) are
+  not literals; they stay harness-local.
+
+### Several origins
+
+- `duplicate`: the origins have the same `core_hash` and the same replaced literals. Their override
+  tables (each origin's own harness table) are merged.
+- `conflict`: they differ. `--from <harness>:<scope>` chooses the origin whose core the definition
+  takes; the other harness's entry is rewritten to that core, as the preview shows. Override tables
+  are merged as for duplicates. Without `--from` the server is refused (`conflict`). The literals of
+  the other origins pass the variable gate too (see [Apply](#apply)); a literal of another origin
+  that the chosen core does not carry is named in a notice, because it is unrecoverable after
+  apply, and is not recorded in that origin's `replaced_fields`.
+- At most one origin per harness (`duplicate-origin`). Every origin must import losslessly, also a
+  non-chosen one.
+
+### Scope widening
+
+A project-scope origin needs `--to-user-scope` (`project-origin` otherwise). Its entry is left
+where it is, because d-mcp writes user scope only; the adopted entry is added to the harness's
+user scope (`write: add`), and the notice says that the project entry keeps its literals and
+shadows the user entry in that project. Arguments that are relative paths (`./`, `../`) are
+refused (`relative-path`), and so is a user entry of the same name in that harness
+(`user-entry-exists`; adopt the user entry instead).
+
+### OAuth
+
+- `--prefer-oauth` replaces `bearer_env` or `header_env` with `auth = oauth`; the header and its
+  variable are dropped. `--oauth-supported` keeps `bearer_env` and sets `oauth_supported = true`.
+  Each is refused for other auth (`prefer-oauth-invalid`, `oauth-supported-invalid`); the two
+  cannot be combined (usage error).
+- Taking over an OAuth-capable Claude Code entry (a remote entry with `oauth` or without headers)
+  with `write: update` removes and re-adds it, which clears Claude Code's stored tokens and client
+  secret. It is refused unless `--accept-relogin` is given (`relogin-required`). When the entry has
+  `oauth.clientId` and the definition keeps OAuth with a client id, `--client-secret-env <NAME>` is
+  also required (`client-secret-env-required`); the variable must be set and non-empty, and d-mcp
+  passes it to `claude mcp add-json --client-secret`. d-mcp never proposes a `client_secret_env`
+  itself. `--client-secret-env` on a definition without an OAuth client id, or with a name that is
+  not a valid variable name or does not look like a name, is `client-secret-env-invalid`.
+
+### Refusals
+
+Any refusal blocks the whole run with `adopt-refused` (exit 1); the document lists every refusal
+with the `entry` (`<harness>:<scope>:<name>`, or `null` for the server or a flag), the `field` and
+the `reason`, never a value. Reasons:
+
+- every [import gap](#import) reason, among them `local-scope`, `not-found`, `unsupported-style`
+  (`supported_style = false`), `unknown-key`, `excluded-key`, `multiple-headers`,
+  `header-with-oauth`, `renamed-forward`, `forward-default`, `embedded-variable` and
+  `sse-transport`;
+- every [rule code](#rule-codes) of the candidate: it is serialized to TOML and must pass
+  `parse_definition` and `validate_definition` and parse back unchanged. This covers
+  `variable-syntax`, `url-scheme`, `url-query`, `url-userinfo`, `command-rule`, the secret rules on
+  `args`, the URL and override strings such as Codex's `cwd` (`secret-name`, `secret-prefix`, ...),
+  and the override rules;
+- `name-rule`: the native name is not a neutral name (there is no renaming);
+- `round-trip`: the import is not lossless. The adapter's entry hash of the rendered candidate must
+  equal the entry hash of the native entry after the replaced literals and the declared
+  normalizations (`empty-default`, `default-dropped`, `scopes-sorted`, `env-vars-sorted`);
+- `render-gap`: the rendering for a target harness has an `important` gap (a credential name, a
+  reserved name, Codex's `enabled_tools` or `disabled_tools` for Claude Code);
+- `relative-path`, `project-origin`, `user-entry-exists`, `harness-not-present` (no user scope to
+  add a project-scope origin to), `duplicate-origin`, `conflict`, `from-unknown`;
+- `local-exists` (`local/servers/<name>.toml` exists), `local-unavailable`, `not-winning` (with the
+  candidate in memory, another source wins the name or the resolution holds it),
+  `selection-differs` (the server is selected for another harness set, `all` included),
+  `already-managed` (d-mcp already has a record for the entry);
+- `keep-literal-secret`, `keep-literal-unknown`, `var-unknown-field`, `proposal-invalid`,
+  `proposal-credential-name`, `variable-name`, `credential-name`, `prefer-oauth-invalid`,
+  `oauth-supported-invalid`, `relogin-required`, `client-secret-env-required`,
+  `client-secret-env-invalid`;
+- `variable-missing`, `variable-mismatch` (see the variable gate below);
+- with `--apply`: `expect-missing` (an entry without `--expect`), `expect-unknown` (an `--expect`
+  for no adopted entry).
+
+### Apply
+
+`--apply` requires `--expect <harness>:<scope>:<name>=<display-hash>` for every origin entry, with
+the display hash of the preview. Under the store lock, in this order:
+
+1. the harnesses are read again, and every check above runs against that fresh read, with the
+   candidate in an in-memory snapshot of the sources. A display hash that differs from its
+   `--expect` is `adopt-entry-changed` (exit 3); a harness CLI that a write needs and that is not on
+   `PATH` is `harness-cli-not-found` (exit 4). Nothing is written then;
+2. the definition is written to `local/servers/<name>.toml` (atomically, mode `0600`), then the
+   selection to `config.toml`;
+3. the entries are taken over by a scoped sync: limited to the adopted servers (other servers are
+   not planned or reported, and their records stay unchanged), with each take-over bound to the
+   entry hash just read (an entry that changed in between fails its harness with
+   `adopt-entry-changed`, before anything is journaled).
+
+A failure in step 3 leaves the definition and the selection in place and is reported per entry
+with sync's outcomes (`outcome`, `error`). A Claude Code entry that was removed and could not be
+added again (`lost`) is named with the variables to restore; the original literals were never
+stored, so there is no rollback. The next sync re-adds it in reference form as `vanished`. A
+take-over record of a failed write stays, so the next `sync` completes the adoption.
+
+The adopted records carry `adopted_from` and `replaced_fields` (see [`state.toml`](#statetoml)).
+
+**Variable gate.** Every variable that replaces a literal must be set, non-empty and equal to the
+replaced literal in d-mcp's environment (the current shell), so the harness keeps working. This
+holds for the literals of every origin, not only the `--from` one: with a conflict, a variable
+that replaces different literals in two origins fails for one of them. The comparison happens in
+memory; neither value is ever printed. A failed check is refused (`variable-missing`,
+`variable-mismatch`, naming the origin entry and the field) unless `--allow-missing-env` or
+`--allow-env-mismatch` accepts it; the output then says that the original literal of that origin
+is unrecoverable after apply. The
+client secret variable of `--client-secret-env` must be set and non-empty.
+
+**Exit codes.** 0 complete; 1 `adopt-refused` or an entry failure of the scoped sync (such as
+`harness-cli-failed`); 3 `adopt-entry-changed` (or another unsafe state); 4
+`harness-cli-not-found` (or another environment problem). The precedence is 3, 4, 1, 0. `data` is
+present on every exit after planning.
+
+## Status
+
+`d-mcp status [--auth] [--harness claude|codex]... [<server>...]` shows, per harness location
+(user scope) and server, what d-mcp wants, what it recorded and what is there. It is read-only (no
+lock, no writes, no `.hash-key`) and exits 0, also when a harness file cannot be read (that
+harness's `status` is `failed`, with its error). Global errors (a corrupt `config.toml` or
+`state.toml`) fail as usual; on a store that is not initialized nothing is selected or managed,
+with a notice.
+
+- **Servers**: every server selected for the harness and every recorded one, or only the named
+  ones (an unknown name is a notice).
+- **Desired**: `resolved` (with its `source`), `held` (with the hold `reason`, as in
+  [Operations](#operations)) or `not-selected` (a record only). **Recorded**: `owned`, `pending`
+  (an interrupted write) or `none`, with `adopted_from` and `vanish_count`. **Actual**: `present`,
+  `absent`, or `unknown` when the harness could not be read or is not present.
+- **Operation**: what the next sync would do for the entry, from the same read-only plan a dry-run
+  sync makes (pending records settled in memory); see [Operations](#operations). `null` when the
+  harness was not planned.
+- **Hashes** follow [Display hashes](#display-hashes): `hash` only for a record d-mcp wrote itself.
+- **Missing variables**: the variables a resolved definition reads (`Definition::forwarded_env`:
+  stdio forwards, `bearer_env`, `header_env` and `client_secret_env`) that are unset or empty in
+  the current shell; a set but empty variable counts as missing. Only names are shown. The output
+  always notes that a harness launched from a GUI (a desktop app, a dock or a launcher) can see a
+  different environment.
+- **`--auth`** adds each present entry's login state through the adapter (see the Codex and Claude
+  Code [login state](#login-state)): `logged-in`, `needs-login`, `not-applicable` or `unknown` (also
+  without the harness CLI). It prints a warning, on stderr and as a notice, that Claude Code's
+  `claude mcp get` connects to each OAuth server.
+
+## Doctor
+
+`d-mcp doctor [--auth]` runs health checks. It is read-only (no lock, no writes, no `.hash-key`).
+Each check has a severity, `ok`, `warn` or `error`, a message and a hint. `doctor` exits 1 with
+`doctor-failed` when any check is `error`, and carries its document as `data`; `warn` keeps exit 0.
+A store that is not initialized or corrupt is reported as `error` checks instead of aborting. For
+an uninitialized store the harness checks still run on the harness files, with nothing managed; for
+a corrupt `config.toml` or `state.toml` every check that needs the store (`harness-config` to
+`name-length`) is left out. When discovery itself fails (such as an unknown current directory),
+a `discovery` `error` check names the error, the checks that build on the harness files
+(`harness-config`, `drift`, `location-changed`, `pending`, `shadowing`, `name-length`, `login`) are
+left out, and `recurring-vanish` and `static-token` still run on the store. A check that finds
+nothing reports one `ok`.
+
+| Check | `warn` or `error` when |
+|---|---|
+| `store` | `error`: the store is not initialized, or `config.toml` is corrupt or has another schema version. |
+| `state` | `error`: `state.toml` is corrupt or has another schema version. |
+| `hash-key` | `warn`: `.hash-key` is missing (no display hashes); `error`: it is corrupt. |
+| `harness-version` | Per harness. `warn`: the harness CLI is not on `PATH` although the harness file exists or d-mcp records or selects entries for it; its `--version` is not one of the verified versions (`2.1.310 (Claude Code)`, `codex-cli 0.165.0`, compared exactly); or the probe failed or printed no recognizable version. `ok` when the CLI is missing and nothing of the harness exists. |
+| `discovery` | Only when it fails. `error`: the harness files could not be discovered at all (such as an unknown current directory). |
+| `harness-config` | A discovered harness file cannot be read: `error` for the user scope (sync cannot plan it), `warn` for other scopes. |
+| `drift` | `warn`: a managed entry was changed outside d-mcp. |
+| `location-changed` | `warn`: a record is for another harness file. |
+| `pending` | `warn`: a write was interrupted; the next sync settles it. |
+| `recurring-vanish` | `warn`: a managed entry was removed outside d-mcp and re-added (`vanish_count`) at least twice. |
+| `shadowing` | `warn`: a managed entry is shadowed by a narrower scope (see `shadowed_in` in [Inventory](#inventory)), including an adopted entry whose project-scope origin still holds its literals. |
+| `static-token` | `warn`: a selected definition uses `bearer_env` with `oauth_supported = true`. |
+| `name-length` | `warn`: an unmanaged or local-scope entry name is longer than 32 characters, so d-mcp cannot adopt or manage it. |
+| `credential-names` | Never; informational: the [credential-name list](#credential-names) can be incomplete. |
+| `managed-policy` | Never; informational: managed-policy deny lists can block user servers, and d-mcp cannot see them. |
+| `login` | Only with `--auth`, per managed entry: `warn` for `needs-login` (the hint names `<cli> mcp login <name>`) and `unknown`; one `warn` when the store cannot be read or the harness files could not be discovered, so nothing was queried. |
+
+**Version probe.** `doctor` runs `<cli> --version` (`claude`, `codex`) through the same runner as
+every harness CLI call: without a shell, with the normal timeout (10 s) and output cap, from a fresh
+temporary directory (removed afterwards), with `DISABLE_AUTOUPDATER=1` and the resolved `HOME`,
+`CODEX_HOME` and `CLAUDE_CONFIG_DIR`. Its output is parsed only: a version is shown only when it has
+the shape of a verified version (the same text around a numeric version token); anything else is
+reported as unrecognized and never printed. A failure names the exit status or `timeout` only.
+
+## Uninstall
+
+`d-mcp uninstall [--apply] [--purge [--follow-store-link]]` stops managing every harness entry.
+Without `--apply` it is a read-only preview (no lock, no writes); `--apply --dry-run` equals the
+preview. Under the store lock, `--apply` first settles `pending` records as sync does, then plans
+every record as no longer desired and gives it one action:
+
+| Action | When | Effect |
+|---|---|---|
+| `remove` | d-mcp created the entry (`written`, not adopted) and it is unchanged | removed through a scoped sync (Remove), limited to these entries |
+| `release` | the entry was adopted (`adopted_from`) or taken over without a write | ownership dropped as by [`unmanage`](#unmanage); nothing is written, the entry keeps d-mcp's last rendering, and the output lists the variables it reads instead of the replaced literals |
+| `forget` | the entry is gone (or the harness is not present) | the record is dropped |
+| `drifted` | changed outside d-mcp | left, record kept unless `--purge`; exit 1 |
+| `location-changed` | recorded for another file | left, record kept; exit 1; blocks `--purge` |
+| `unsupported` | written in a style d-mcp does not edit | left, record kept unless `--purge`; exit 1 |
+
+- The harnesses of removed, released and forgotten entries leave their selections (an `all`
+  selection becomes an explicit list, as for `unmanage`); selections of entries that are left stay.
+  Records are released before the selections are written, and a removal's selection is dropped
+  before its scoped sync, so a crash in between never removes an entry d-mcp did not create.
+- A Claude Code harness with a `remove` and no `claude` on `PATH` fails with
+  `harness-cli-not-found` (exit 4): nothing is removed there, and `--purge` is blocked. A harness
+  whose file cannot be read keeps its records and blocks `--purge`.
+- **`--purge`** runs last and only when nothing blocks it (`purge.blocked`: `location-changed`,
+  `harness-cli-not-found`, `harness-failed` for a failed harness or removal, `store-root-symlink`).
+  It deletes only the known store entries (`config.toml`, `local`, `state.toml`, `.hash-key`,
+  `lock.toml`, `approvals.toml`, then `.lock`) inside the resolved store root, then the root itself
+  when it is empty. A symlink among them is unlinked, never followed, and nothing inside `local/` is
+  followed either; registered sources live outside the store and are never touched. Drifted and
+  unsupported entries stay in their harness, and their records go with `state.toml`.
+- **A symlinked store root** is purged only with `--follow-store-link`: without it `--purge` is
+  blocked (`store-root-symlink`, exit 1) with a warning naming the link target; with it a warning
+  names the target, the known entries inside the target are deleted, and the link and the target
+  directory are left.
+
+**Exit codes.** 0 complete; 1 `uninstall-incomplete` (entries left), `purge-blocked`, or an entry
+failure of the scoped sync; 3 an unsafe state (such as `harness-config-invalid`); 4
+`harness-cli-not-found` or another environment problem. The precedence is 3, 4, 1, 0. `data` is
+present on every exit after planning, also when the apply stops at an error (such as a store
+write that fails): the error is the aggregate error, and every step sets the outcomes of its
+entries as soon as it ends, so earlier steps keep theirs (`applied`, and the `sync` document of
+each harness whose removals ran). Entries whose outcome is still `planned` were not changed,
+entries `failed` were in the step that stopped and may be partly done, the purge did not run, and
+a notice says so. Global errors (an uninitialized
+store, the lock, a corrupt `config.toml` or `state.toml`) carry none.
+
+## Redaction
+
+Every place that renders the content of a harness entry goes through one redacted view, an
+allow-list with default deny:
+
+- **visible**: the entry name, the transport kind (`stdio`, `http`, `sse`, `unknown`), of a URL the
+  scheme, host and port, the *names* of env entries, headers and referenced variables, the auth
+  kind of the imported candidate, the override *keys*, whether an OAuth client id is present, and
+  project paths;
+- **redacted**: `command`, `args`, `cwd`, URL user info, path, query and fragment, env and header
+  values, `description`, the client id, scopes, override values, and any other key. A redacted part
+  that is present is named in `hidden` (`command`, `args`, `cwd`, `env.values`, `headers.values`,
+  `oauth.client_id`, `oauth.scopes`, `override.values`, `other`); the redacted parts of a URL are
+  named in `url.hidden`.
+
+The view is a JSON object with these keys (`view` in `inventory`, `definition`, `before` and
+`after` in `adopt`):
+
+| Key | Content |
+|---|---|
+| `transport` | `stdio`, `http`, `sse` or `unknown`. |
+| `url` | `null`, or `{ "scheme", "host", "port", "hidden" }`; `port` is a number or `null`, and `hidden` lists the redacted parts of the URL (`userinfo`, `path`, `query`, `fragment`, or `url` as a whole when it is not URL-shaped). |
+| `env`, `headers` | Sorted names. |
+| `variables` | Sorted names of the variables the entry reads. |
+| `auth` | The auth kind of the imported candidate (`oauth`, `bearer_env`, `header_env`, `none`), `null` when the import failed. |
+| `override_keys` | Sorted keys of the override tables (of the candidate, or the entry's native override-like keys). |
+| `oauth_client_id` | Whether a client id is present, never its value. |
+| `hidden` | The redacted parts of the entry that are present, sorted. |
+
+The text form is one line, `transport=... url=... env=... ...`, with the URL parts listed as
+`url.<part>` next to the hidden parts.
+
+A name or host that does not look like one (characters outside `[A-Za-z0-9_.-]`, longer than 64
+characters, or matching `secret_value_heuristic`) is shown as `<redacted-key>`, also a variable
+name in `inventory`, `adopt` and `uninstall` output. The existing
+invariants stay: harness CLI output is parsed in memory and never printed (stderr is drained and
+dropped), sync reports carry no field values, and parser errors carry file, line and column only.
+A canary suite (`tests/redaction.rs`) runs every command in text and JSON form on a fixture with
+canaries in every position and fails if one reaches stdout, stderr or a store file. It includes
+`adopt`, preview and apply: a replaced literal never reaches a file under `local/` or
+`state.toml`.
+
 ## Codex mapping
 
 The Codex adapter edits `$CODEX_HOME/config.toml` directly. Its declarations: apply mode
@@ -650,7 +1141,8 @@ verified against `codex-cli 0.165.0`.
   (looked up, never run). If neither exists, Codex is skipped with "harness not present" (exit 0)
   and nothing is created. If only the file is missing, it is created with mode `0600`, and its
   directory with `0700`.
-- Profile files (`$CODEX_HOME/<profile>.config.toml`) and project scope are not handled in v1.
+- Profile files (`$CODEX_HOME/<profile>.config.toml`) are not handled in v1. The project scope
+  (`.codex/config.toml`) is discovered read-only, never written (see [Discovery](#discovery)).
 
 ### Rendering
 
@@ -718,7 +1210,10 @@ unsupported for writing (exit 1). Invalid TOML, non-UTF-8 content or a non-regul
 ### Login state
 
 The adapter can read the login state of its entries from `codex mcp list --json` (`auth_status`),
-run without a shell, with a timeout and an output cap, and with the resolved `CODEX_HOME`:
+run without a shell, with a timeout and an output cap, with the resolved `CODEX_HOME`, and from a
+neutral working directory: the store root when no `.codex/config.toml` lies in it or above it up to
+its project root, otherwise a fresh temporary directory (removed afterwards), so no project
+configuration of d-mcp's own working directory is listed:
 
 | `auth_status` | State |
 |---|---|
@@ -727,7 +1222,7 @@ run without a shell, with a timeout and an output cap, and with the resolved `CO
 | `unsupported`, `bearer_token` | `not-applicable` |
 | anything else, a missing binary, a failure, a timeout or oversized output | `unknown` |
 
-`sync` never calls it; `status --auth` (WP4) is its first consumer. d-mcp never reads Codex token
+`sync` never calls it; `status --auth` and `doctor --auth` use it. d-mcp never reads Codex token
 storage, and child output is never printed: it is parsed in memory only, because a harness CLI can
 echo foreign secrets. On a timeout only the direct child is killed; a grandchild (such as the native
 binary behind the npm shim) may outlive it.
@@ -766,15 +1261,16 @@ Claude Code `2.1.310`.
   through it". Codex proceeds in
   both cases.
 - `claude` present, file missing: the first `add-json` creates it (`created: true`).
-- Only user-scope entries (top-level `mcpServers`) are written. Project scope (`.mcp.json`) is not
-  handled; local-scope entries (`projects.<path>.mcpServers`) are read by name only, to report
-  shadowing.
+- Only user-scope entries (top-level `mcpServers`) are written. The project scope (`.mcp.json`) is
+  discovered read-only (see [Discovery](#discovery)); local-scope entries
+  (`projects.<path>.mcpServers`) are read by name only, to report shadowing and for the inventory.
 
 ### Reading
 
 d-mcp deserializes only the user-scope `mcpServers.<name>` values (every key of each entry, for the
-hash) and the names of each project's local-scope `mcpServers`; every other key, such as account
-data, caches and history, is skipped unread, and no file bytes are kept. Invalid JSON (also a top
+hash), the names of each project's local-scope `mcpServers`, and, for discovery, each project's
+`hasTrustDialogAccepted` and legacy approval keys (names and booleans only); every other key, such
+as account data, caches and history, is skipped unread, and no file bytes are kept. Invalid JSON (also a top
 level that is not an object, or non-UTF-8 content) is retried once after a short delay, because a
 running Claude Code session can be in the middle of rewriting the file, and then fails with
 `harness-config-invalid` (exit 3), reported by line and column only. An `mcpServers` that is not a
@@ -801,7 +1297,7 @@ JSON object makes the harness `unsupported` (exit 1); an owned entry that is not
   literal text `${VAR}` (with a "missing environment variables" warning for that server only),
   while `${VAR:-}` reads as empty. This differs from Codex, which does not set an unset variable at
   all. Claude Code passes its own environment to stdio servers as well. Headers use `${VAR}`, so
-  Claude Code's own diagnostics name a missing variable. WP1's `variable-syntax` rule keeps `$` and
+  Claude Code's own diagnostics name a missing variable. The `variable-syntax` rule keeps `$` and
   `${` out of literals.
 - `client_secret_env`: on Add and Update, d-mcp calls `add-json --client-secret` and puts the
   variable's value into `MCP_CLIENT_SECRET` of the child environment only; it never appears in
@@ -899,9 +1395,9 @@ from a neutral working directory with the child environment above. Every other e
 | `! Needs authentication` | `needs-login` |
 | anything else (`✘ Failed to connect`), an absent entry, a missing binary, a failure, a timeout or oversized output | `unknown` |
 
-`sync` never calls it and never runs `--version`; `status --auth` (WP4) is its first consumer.
-`claude mcp get` connects to the server to check its health. d-mcp never reads Claude Code's token
-storage.
+`sync` never calls it and never runs `--version`; `status --auth` and `doctor --auth` use it, and
+warn that `claude mcp get` connects to the server to check its health. Only `doctor` runs
+`--version` (see [Doctor](#doctor)). d-mcp never reads Claude Code's token storage.
 
 ### Limits
 
@@ -911,7 +1407,8 @@ storage.
 - A same-name local-scope entry shadows the managed user entry in that project. `sync` reports it
   as a notice per project path. `add-json -s user` accepts a name that exists in local scope
   (verified against 2.1.310).
-- Managed-policy deny lists can block user servers; d-mcp does not see them.
+- Managed-policy deny lists can block user servers; d-mcp does not see them. `doctor` states this
+  as its informational `managed-policy` check.
 
 ## `state.toml`
 
@@ -928,6 +1425,10 @@ sent = "<64 hex>"
 readback = "<64 hex>"
 definition_hash = "<64 hex>"
 written = true
+adopted_from = { harness = "claude", scope = "project", root = "/home/me/work/app" }
+replaced_fields = [{ field = "env.GITHUB_TOKEN", var = "GITHUB_TOKEN" }]
+vanish_count = 2
+last_vanish = 1793145600
 time = 1793145600
 version = "0.1.0"
 ```
@@ -943,6 +1444,12 @@ version = "0.1.0"
 - `written = true` (and `prev_written = true` for the previous hashes) is the provenance marker:
   d-mcp itself wrote the entry with these hashes. It is absent after `--take-over`; `false` is
   never written. Records written before the marker existed have none.
+- `adopted_from` (only on records created by `d-mcp adopt`): the origin's `harness`, `scope`
+  (`user` or `project`) and, for `project`, the absolute repository `root`. `replaced_fields` (only
+  with `adopted_from`, non-empty, sorted): the native fields whose literals adoption replaced, each
+  with the variable the entry reads instead; never a value.
+- `vanish_count` (at least 1) and `last_vanish` (Unix epoch seconds), always together: how often a
+  `vanished` re-add of the entry was promoted, and when last. Absent until the first one.
 - There is no downgrade path before 1.0: `schema_version` stays 1 when keys are added, and an older
   d-mcp refuses a file with keys it does not know as `state-corrupt` (exit 3); for example, d-mcp
   builds before the Claude Code adapter reject `written` and `prev_written`. Downgrading means
@@ -957,9 +1464,9 @@ version = "0.1.0"
 | Code | Meaning | Cases |
 |---|---|---|
 | 0 | Success | Including resolution problems, holds, `note` gaps and warnings |
-| 1 | Expected failure | Store not initialized; invalid arguments; rejected `source add`; `init` into a non-empty directory that is not a store; a blocked sync entry; a failed harness CLI call; `unmanage` of an unmanaged server |
-| 2 | Usage error | clap usage errors (unknown flags, missing arguments, non-integer priority, an unknown `--harness` value); clap prints them as text on stderr, also with `--json` |
-| 3 | Unsafe state | Corrupt or hand-broken `config.toml` or `state.toml`; unsupported schema version; `store-locked`; a harness file that changed, is invalid, could not be edited or did not verify |
+| 1 | Expected failure | Store not initialized; invalid arguments; rejected `source add`; `init` into a non-empty directory that is not a store; a blocked sync entry; a failed harness CLI call; `unmanage` of an unmanaged server; a refused adoption (`adopt-refused`); an uninstall that left entries (`uninstall-incomplete`) or could not purge (`purge-blocked`); a doctor check at `error` (`doctor-failed`) |
+| 2 | Usage error | clap usage errors (unknown flags, missing arguments, non-integer priority, an unknown `--harness` value, a malformed `adopt` argument, `--follow-store-link` without `--purge`); clap prints them as text on stderr, also with `--json` |
+| 3 | Unsafe state | Corrupt or hand-broken `config.toml` or `state.toml`; unsupported schema version; `store-locked`; a harness file that changed, is invalid, could not be edited or did not verify; an entry that changed after the adoption preview (`adopt-entry-changed`) |
 | 4 | Environment problem | A missing `HOME`; an unknown current directory; a harness path that is not UTF-8; a harness CLI that is missing or timed out; a failed file-system operation |
 
 ## Error codes
@@ -1001,8 +1508,15 @@ codes, never values.
 | `sync-blocked` | 1 | At least one sync entry is blocked (drift, collision, location change, unsupported style, important gap). |
 | `not-managed` | 1 | `unmanage` of a server without a write-state record. |
 | `unknown-take-over` | 1 | `sync --take-over` names a server that is neither selected nor recorded. |
+| `adopt-refused` | 1 | `adopt` refused at least one entry (see [Adoption refusals](#refusals)); nothing was written. The `adopt` document names every refusal. |
+| `adopt-entry-changed` | 3 | An entry to adopt changed since the preview, or its `--expect` display hash does not match; nothing was written for it. |
+| `doctor-failed` | 1 | At least one `doctor` check is at `error`; the `doctor` document lists every check. |
+| `uninstall-incomplete` | 1 | `uninstall` left entries in the harnesses (drifted, location changed or unsupported); their records are kept unless `--purge`. |
+| `purge-blocked` | 1 | `uninstall --purge` was blocked (a location-changed record, a missing harness CLI, a failed harness or removal, or a symlinked store root without `--follow-store-link`); nothing was purged. |
 | `home-unset` | 4 | `HOME` is unset or empty but needed. |
 | `cwd-unavailable` | 4 | The current directory cannot be determined. |
+| `hash-key-corrupt` | 3 | `<store>/.hash-key` is not a regular file or does not hold a key; it is never replaced. Remove it and run `d-mcp init`. Read-only commands show no display hashes instead. |
+| `hash-key-unavailable` | 4 | The system random source is unavailable, so no display-hash key can be created. |
 | `io-error` | 4 | A file-system operation failed; only the error kind is reported. |
 <!-- error-codes:end -->
 
@@ -1068,10 +1582,11 @@ With `--json`, stdout carries exactly one JSON document:
 
 - `schema_version`: always `1`.
 - `ok`: `true` on exit 0, `false` otherwise.
-- `data`: the command's document on success, `null` on failure. `sync` is the exception: on exit 1
-  and 3 (and 4 for a harness-level environment problem) it still carries its document with the
-  per-entry outcome, together with `ok: false` and the aggregate `error`. Global errors carry
-  `data: null`.
+- `data`: the command's document on success, `null` on failure. `sync`, `adopt`, `uninstall` and
+  `doctor` are the exception: on a non-zero exit after planning (1, 3, or 4 for a harness-level
+  environment problem) they still carry their document, together with `ok: false` and the
+  aggregate `error`. Global errors carry `data: null`.
+- There are no per-document versions: documents only grow by added keys under `schema_version` 1.
 - `problems`: an array of problems; only `resolve` and `sync` report any.
 - `error`: `null` on success, otherwise `{ "code": "<error code>", "hint": "<text>" }`.
 
@@ -1117,11 +1632,11 @@ above. Messages are built from codes, names and paths only.
 ### `init`
 
 ```json
-{ "store": "/home/me/.d-mcp", "created": ["/home/me/.d-mcp", "/home/me/.d-mcp/.lock", "/home/me/.d-mcp/config.toml", "/home/me/.d-mcp/local", "/home/me/.d-mcp/local/servers"], "dry_run": false }
+{ "store": "/home/me/.d-mcp", "created": ["/home/me/.d-mcp", "/home/me/.d-mcp/.lock", "/home/me/.d-mcp/config.toml", "/home/me/.d-mcp/local", "/home/me/.d-mcp/local/servers", "/home/me/.d-mcp/.hash-key"], "dry_run": false }
 ```
 
 `created` lists absolute paths in creation order: root, `.lock`, `config.toml`, `local`,
-`local/servers`; empty when the store is complete. A dry run lists what would be created, in the
+`local/servers`, `.hash-key`; empty when the store is complete. A dry run lists what would be created, in the
 same order.
 
 ### Source object
@@ -1183,7 +1698,7 @@ source offers the name; `replaced` whether an existing selection was replaced.
 ] }
 ```
 
-Servers are sorted by name. Until WP4, `resolve` shows only name, status, reason, origin source
+Servers are sorted by name. `resolve` shows only name, status, reason, origin source
 and file, harnesses, transport kind, auth kind (`null` for stdio), forwarded variable names and
 both hashes. It never shows literal values, `args` or override contents. `forwarded_env` lists the
 env forwards of a stdio server, or the auth variables (`var`, `client_secret_env`) of an HTTP
@@ -1198,7 +1713,7 @@ server. For `hold`, `source` names the source that causes the hold; the definiti
     "created": false, "error": null, "notices": ["harness not present"],
     "entries": [
       { "name": "linear", "operation": "add", "outcome": "applied", "reason": null, "notice": null,
-        "hash": "<64 hex>", "error": null,
+        "hash": "<64 hex>", "display_hash": null, "error": null,
         "gaps": [ { "field": "auth.client_secret_env", "severity": "note", "reason": "manual step: ..." } ] }
     ] }
 ] }
@@ -1219,14 +1734,79 @@ server. For `hold`, `source` names the source that causes the hold; the definiti
   `harness-cli-timeout`, `harness-verify-failed`, ...).
 - `reason`: the hold reason for `held`: `invalid-winner`, `source-unavailable` or `not-offered`.
 - `notice`: a hint such as how to resolve drift, or `null`.
-- `hash`: the read-back hash of an owned entry, `null` otherwise (never the hash of a foreign
-  entry).
+- `hash`: the read-back hash of an owned entry that d-mcp wrote itself (`written`), `null`
+  otherwise. `display_hash`: the keyed display hash of an owned entry d-mcp did not write (a
+  take-over), `null` otherwise or without a `.hash-key` (see [Display hashes](#display-hashes)).
+  Never the plain hash of a foreign entry.
 - `gaps`: `field`, `severity` (`note` or `important`) and `reason`.
 
 Harnesses come in adapter order (`codex`, then `claude`), entries sorted by name; problems are the
 resolver's (see [Problems](#problems)). In text
 mode each harness prints one line, then one line per entry (`operation`, name, outcome), then its
 notices and gaps; a dry run ends with "Dry run: nothing was written."
+
+### `adopt`
+
+The `data` of a preview, also on exit 1 (refusals) and 3 or 4; after `--apply` it adds `written`
+and the `sync` document of the scoped sync.
+
+```json
+{ "store": "/home/me/.d-mcp", "repository": "/home/me/work/app", "apply": false,
+  "display_hashes": true,
+  "servers": [
+    { "name": "tasks", "harnesses": ["claude", "codex"], "verdict": "duplicate", "from": null,
+      "file": "/home/me/.d-mcp/local/servers/tasks.toml",
+      "definition": { "transport": "stdio", "url": null, "env": ["TASKS_TOKEN"], "headers": [],
+                      "variables": ["TASKS_TOKEN"], "auth": null, "override_keys": [],
+                      "oauth_client_id": false, "hidden": ["args", "command"] },
+      "entries": [
+        { "entry": "claude:user:tasks", "harness": "claude", "scope": "user", "path": null,
+          "file": "/home/me/.claude.json", "display_hash": "<64 hex>", "write": "update",
+          "before": { "transport": "stdio", "url": null, "env": ["TASKS_TOKEN"], "headers": [],
+                      "variables": [], "auth": null, "override_keys": [], "oauth_client_id": false,
+                      "hidden": ["args", "command", "env.values"] },
+          "after": { "transport": "stdio", "url": null, "env": ["TASKS_TOKEN"], "headers": [],
+                     "variables": ["TASKS_TOKEN"], "auth": null, "override_keys": [],
+                     "oauth_client_id": false, "hidden": ["args", "command"] },
+          "changed": ["env.TASKS_TOKEN"], "gaps": [],
+          "replaced_fields": [ { "field": "env.TASKS_TOKEN", "var": "TASKS_TOKEN" } ],
+          "outcome": null, "error": null }
+      ],
+      "replaced": [ { "origin": "claude:user:tasks", "field": "env.TASKS_TOKEN", "kind": "env", "var": "TASKS_TOKEN" } ],
+      "kept_literals": [],
+      "normalizations": [ { "origin": "claude:user:tasks", "field": "env.TASKS_HOME", "kind": "empty-default" } ],
+      "variables": [ { "name": "TASKS_TOKEN", "field": "env.TASKS_TOKEN", "origin": "claude:user:tasks",
+                       "status": "ok", "accepted": false } ],
+      "refusals": [], "notices": [] }
+  ],
+  "refusals": [], "notices": [], "written": null, "sync": null }
+```
+
+- `verdict`: `single`, `duplicate`, `conflict`, or `null` when an origin cannot be imported.
+  `from`: the `--from` origin, or `null`. `harnesses`: the selection the apply writes.
+  `definition`: the redacted view of the definition, `null` when it cannot be built.
+- `entries[]`: one per origin. `scope`: `user`, `local` or `project`; `path`: the repository root
+  of a project-scope origin. `write`: `none`, `update`, `add` or `null` (not planned).
+  `before`, `after`: redacted views (see [Redaction](#redaction)). `changed`: native field names.
+  `gaps`: the rendering's `note` gaps. `replaced_fields`: what the record will carry. `outcome`,
+  `error`: the scoped sync's outcome (see [`sync`](#sync-1)) and error after an apply, else
+  `null`; a harness that failed as a whole gives its status (such as `failed`) and error.
+- `replaced[].kind`: `env`, `bearer-header` or `header`. `normalizations[].kind`: `empty-default`,
+  `default-dropped`, `scopes-sorted` or `env-vars-sorted`. `variables[].status`: `ok`, `missing`
+  or `differs`; `origin` is the entry whose literal was compared (`null` for the client secret);
+  `accepted` tells whether an `--allow-*` flag accepted it. Variable names (`replaced[].var`,
+  `replaced_fields[].var`, `variables[].name`) are shown as `<redacted-key>` when they do not look
+  like a name.
+- `kept_literals`: the names of the env literals kept with `--keep-literal`.
+- `refusals[]` (per server, and at the top for flags): `entry` (or `null`), `field` (or `""`) and
+  `reason` (see [Refusals](#refusals)).
+- `written`: after an apply, `{ "definitions": [paths], "selections": [names] }`, also when the
+  scoped sync failed; `null` otherwise. `sync`: the scoped sync's `sync` document, or `null`.
+
+In text mode, each server prints one line (name, file, verdict, `from`, selection), the definition
+view, per origin a line with `write`, `display_hash` and the outcome, its `before`, `after`,
+`changed` and gaps, then the replaced literals, normalizations, variables, refusals and notices.
+A preview ends with the `--expect` flags for `--apply`.
 
 ### `unmanage`
 
@@ -1237,3 +1817,157 @@ notices and gaps; a dry run ends with "Dry run: nothing was written."
 `harnesses` lists the harnesses whose records were removed; `selection` is the server's harness list
 afterwards (`null` when the server is not selected any more); `converted_from_all` tells whether an
 `all` selection became an explicit list.
+
+### `inventory`
+
+```json
+{ "store": "/home/me/.d-mcp", "initialized": true, "repository": "/home/me/work/app",
+  "display_hashes": true, "notices": [],
+  "harnesses": [
+    { "harness": "codex", "notices": [], "scopes": [
+      { "scope": "user", "path": null, "file": "/home/me/.codex/config.toml", "present": true,
+        "trust": null, "orphaned": false, "error": null, "entries": [
+        { "name": "github", "class": "unmanaged", "hash": null, "display_hash": "<64 hex>",
+          "shadowed_in": [ { "scope": "project", "path": "/home/me/work/app" } ], "approval": null,
+          "view": { "transport": "stdio", "url": null, "env": ["GITHUB_TOKEN"], "headers": [],
+                    "variables": ["GITHUB_TOKEN"], "auth": null, "override_keys": [],
+                    "oauth_client_id": false, "hidden": ["args", "command", "env.values"] },
+          "import": { "ok": true, "gaps": [],
+                      "replaced": [ { "field": "env.GITHUB_TOKEN", "kind": "env", "var": "GITHUB_TOKEN" } ],
+                      "normalizations": [] } }
+      ] },
+      { "scope": "project", "path": "/home/me/work/app", "file": "/home/me/work/app/.codex/config.toml",
+        "present": true, "trust": "trusted", "orphaned": false, "error": null, "entries": [] }
+    ] }
+  ],
+  "same_name": [
+    { "name": "github", "verdict": "conflict", "places": [
+      { "harness": "codex", "scope": "user", "file": "/home/me/.codex/config.toml" },
+      { "harness": "claude", "scope": "user", "file": "/home/me/.claude.json" } ] }
+  ] }
+```
+
+- Harnesses come in adapter order (`codex`, then `claude`). Scopes: `user` first, then Claude
+  Code's `local` scopes by project path, then the `project` scopes (Codex layers root first);
+  entries are sorted by name.
+- `scope`: `user`, `local` or `project`; `path`: the project path (`local`) or repository root
+  (`project`), `null` for `user`. `present`: the file exists (for `user` also when only the
+  harness binary is on `PATH`). `trust`: `trusted`, `untrusted` or `unknown-trust` for a project
+  scope, `null` otherwise. `orphaned`: a local scope whose project path no longer exists.
+  `error`: `null` or `{ "code", "hint" }`, by path and position only.
+- `class`: see [Inventory](#inventory). `hash` and `display_hash`: see
+  [Display hashes](#display-hashes). `approval`: `approved`, `disabled`, `pending` or `unknown` for
+  a Claude Code `.mcp.json` entry, `null` otherwise. `view`: the redacted view (see
+  [Redaction](#redaction)), `null` for names-only and absent entries. `import`: `ok`, the import
+  `gaps` (`field`, `reason`), the `replaced` literals (`field`, `kind` `env`, `bearer-header` or
+  `header`, `var`) and the declared `normalizations` (`field`, `kind`), `null` for names-only and
+  absent entries.
+- `same_name`: `verdict` `duplicate`, `conflict` or `undetermined`, with the places in discovery
+  order.
+
+In text mode the inventory prints the repository, then per scope a heading (harness, scope,
+path, file, trust, orphaned), its error and one tab-separated line per entry (name, class, hashes,
+approval, view, import gaps, shadowing), then the same-name groups and the notices.
+
+### `status`
+
+```json
+{ "store": "/home/me/.d-mcp", "initialized": true, "display_hashes": true, "auth": true,
+  "missing_variables": ["GITHUB_TOKEN"],
+  "notices": ["variables are checked in this shell only; a harness launched from a GUI (a desktop app, a dock or a launcher) can see a different environment"],
+  "harnesses": [
+    { "harness": "codex", "scope": "user", "file": "/home/me/.codex/config.toml", "status": "read",
+      "error": null, "notices": [],
+      "entries": [
+        { "name": "github", "desired": "resolved", "reason": null, "source": "team",
+          "recorded": "owned", "adopted_from": null, "vanish_count": 0, "actual": "present",
+          "hash": "<64 hex>", "display_hash": null, "operation": "unchanged",
+          "missing_variables": ["GITHUB_TOKEN"], "login": "not-applicable" }
+      ] }
+  ] }
+```
+
+- Harnesses come in adapter order (`codex`, then `claude`), entries sorted by name.
+  `missing_variables` (top level) is the sorted union of the entries' lists. `notices` always
+  starts with the GUI caveat; with `--auth` it also holds the `claude mcp get` warning.
+- `status` of a harness: `read`, `not-present`, `failed` (with `error` `{ "code", "hint" }`),
+  `location-changed` or `unsupported`.
+- `desired`: `resolved`, `held` or `not-selected`; `reason` (for `held`): `invalid-winner`,
+  `source-unavailable` or `not-offered`; `source`: the source of the winning or holding definition.
+  `recorded`: `owned`, `pending` or `none`. `adopted_from`: `<harness>:<scope>` or `null`.
+  `actual`: `present`, `absent` or `unknown`. `hash`, `display_hash`: see
+  [Display hashes](#display-hashes). `operation`: an [operation](#operations) such as `add`,
+  `update`, `remove`, `drift`, `vanished`, `held` or `unchanged`, or `null` when the harness was not
+  planned. `login`: `logged-in`, `needs-login`, `not-applicable` or `unknown` with `--auth`, `null`
+  otherwise.
+
+In text mode each harness prints one line (harness, scope, file, status), its error and notices,
+then one tab-separated line per entry (`desired`, `recorded`, `actual`, the next sync operation,
+hashes, origin, vanishes, missing variables, login), then the missing variables and the notes.
+
+### `doctor`
+
+The `data` of every run, also on exit 1 (`doctor-failed`).
+
+```json
+{ "store": "/home/me/.d-mcp", "repository": "/home/me/work/app", "auth": false,
+  "summary": { "ok": 14, "warn": 1, "error": 0 },
+  "checks": [
+    { "check": "harness-version", "severity": "warn", "harness": "claude", "server": null, "code": null,
+      "message": "`claude --version` reports 2.1.312 (Claude Code), which d-mcp was not verified against (verified: 2.1.310 (Claude Code))",
+      "hint": "d-mcp may still work; check `d-mcp sync --dry-run` before writing" }
+  ] }
+```
+
+- `check`: `store`, `state`, `hash-key`, `harness-version`, `discovery`, `harness-config`, `drift`,
+  `location-changed`, `pending`, `recurring-vanish`, `shadowing`, `static-token`, `name-length`,
+  `credential-names`, `managed-policy` or `login`, in this order (see [Doctor](#doctor)).
+  `severity`: `ok`, `warn` or `error`. `harness`, `server`: what the check is about, or `null`.
+  `code`: the error code behind the check (such as `config-corrupt`), or `null`. `hint`: what to
+  do, or `null`.
+- `repository`: the current repository, `null` when the store could not be read. `summary`: the
+  number of checks per severity.
+
+In text mode each check prints one tab-separated line (severity, check, harness, message, error
+code) and its hint indented below, then the summary.
+
+### `uninstall`
+
+The `data` of every run after planning, also on exit 1, 3 and 4.
+
+```json
+{ "store": "/home/me/.d-mcp", "apply": true, "dry_run": false,
+  "harnesses": [
+    { "harness": "claude", "scope": "user", "file": "/home/me/.claude.json", "status": "ready",
+      "error": null, "notices": [],
+      "entries": [
+        { "name": "notes", "action": "release", "outcome": "applied", "adopted_from": "claude:project",
+          "replaced_fields": [ { "field": "env.NOTES_TOKEN", "var": "NOTES_TOKEN" } ],
+          "notice": "d-mcp drops its ownership and writes nothing; the entry stays as it is; it reads these variables instead of the literals adoption replaced: NOTES_TOKEN (env.NOTES_TOKEN)" }
+      ] }
+  ],
+  "purge": { "requested": true, "follow_store_link": false, "store_root_symlink": false,
+             "target": "/home/me/.d-mcp",
+             "entries": ["/home/me/.d-mcp/config.toml", "/home/me/.d-mcp/local", "/home/me/.d-mcp/.lock"],
+             "blocked": [ { "reason": "location-changed", "harness": "codex" } ], "deleted": false },
+  "sync": null, "notices": [] }
+```
+
+- `apply`: whether `--apply` was given; `dry_run`: whether nothing was written (a preview, or
+  `--apply --dry-run`).
+- `status` of a harness: `ready`, `not-present`, `failed` (with `error`, such as
+  `harness-cli-not-found`), `location-changed` or `unsupported`.
+- `action`: `remove`, `release`, `forget`, `drifted`, `location-changed` or `unsupported` (see
+  [Uninstall](#uninstall)). `outcome`: `planned` (preview), `applied`, `failed` (the removal failed;
+  see `sync`; or the step that removes or releases the entry stopped at an error) or `left` (the entry and its record are left). `adopted_from`: `<harness>:<scope>` or
+  `null`. `replaced_fields`: the fields whose literals adoption replaced, with their variables.
+- `purge`: `requested` (`--purge`), `follow_store_link`, `store_root_symlink`, `target` (the
+  directory the entries are deleted from), `entries` (the existing known entries, in deletion
+  order), `blocked` (`reason` `location-changed`, `harness-cli-not-found`, `harness-failed` or
+  `store-root-symlink`, with the `harness` or `null`) and `deleted`.
+- `sync`: after an apply with removals, the [`sync`](#sync-1) document of the scoped removals (one
+  entry in `harnesses` per harness with removals); `null` otherwise.
+
+In text mode each harness prints one line, its error and notices, then per entry a line (action,
+name, outcome, origin) with its notice; then the purge (`Purge would delete`, `Purged` or `Purge
+blocked`) and the notices.

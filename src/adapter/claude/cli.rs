@@ -232,7 +232,7 @@ pub(super) fn entry_object(entry: &[(String, Value)]) -> Value {
 
 /// Whether an entry can hold OAuth state in Claude Code: a remote entry with
 /// an `oauth` object, or without static headers.
-pub(super) fn uses_oauth(entry: &Value) -> bool {
+pub fn uses_oauth(entry: &Value) -> bool {
     let remote = matches!(
         entry.get("type").and_then(Value::as_str),
         Some("http" | "sse")

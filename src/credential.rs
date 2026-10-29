@@ -153,6 +153,9 @@ pub struct UrlShape<'a> {
     pub userinfo: Option<&'a str>,
     /// The host, without brackets for IPv6 literals.
     pub host: &'a str,
+    /// The port after the host, if one is written (possibly empty, as in
+    /// `host:`).
+    pub port: Option<&'a str>,
     /// The path, starting with `/` or empty.
     pub path: &'a str,
     /// The query after `?`, if any.
@@ -217,6 +220,7 @@ pub fn parse_url_shape(value: &str) -> Option<UrlShape<'_>> {
         scheme,
         userinfo,
         host,
+        port,
         path,
         query,
         fragment,

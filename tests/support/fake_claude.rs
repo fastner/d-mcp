@@ -41,12 +41,17 @@
 //! - `alter <subcommand> <name>`: write the entry with an extra key;
 //! - `sleep <subcommand> <name>`: sleep 30 s before doing anything;
 //! - `sleep-after <subcommand> <name>`: do the work, then sleep 30 s;
+//! - `clobber-after <subcommand> <name> <path>`: do the work, then overwrite
+//!   `<path>` (relative to the test root, without `..`) with text that is
+//!   neither TOML nor JSON, to fail a later step of the caller;
 //! - `edit-on <subcommand> <name> <target>`: also change `<target>`, as a
 //!   concurrent Claude Code session would;
-//! - `login <name> <connected|needs-authentication|failed>`: the `get` status.
+//! - `login <name> <connected|needs-authentication|failed>`: the `get` status;
+//! - `version <text>`: print `<text>` for `--version` instead of the
+//!   verified version (`version fail` exits 1).
 //!
 //! `<name>` may be `*`. It prints canary strings that must never reach
-//! d-mcp's output or store.
+//! d-mcp's output or store, and echoes its arguments to stderr.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -213,6 +218,14 @@ impl Directives {
         true
     }
 
+    /// The text of a `version <text>` directive.
+    fn version(&self) -> Option<String> {
+        self.lines
+            .iter()
+            .find(|words| words.len() >= 2 && words[0] == "version")
+            .map(|words| words[1..].join(" "))
+    }
+
     fn login(&self, name: &str) -> Option<&str> {
         self.lines
             .iter()
@@ -369,10 +382,22 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     log(&root, &args);
     eprintln!("CANARY_FAKE_CLAUDE_STDERR");
+    // The input, which can carry foreign entry content (the JSON of
+    // `add-json`): d-mcp must drain and drop child stderr.
+    eprintln!("args: {args:?}");
     let directives = Directives::load(&root);
     if args.first().map(String::as_str) == Some("--version") {
-        println!("2.1.310 (Claude Code)");
-        return ExitCode::SUCCESS;
+        return match directives.version().as_deref() {
+            Some("fail") => ExitCode::from(1),
+            Some(text) => {
+                println!("{text}");
+                ExitCode::SUCCESS
+            }
+            None => {
+                println!("2.1.310 (Claude Code)");
+                ExitCode::SUCCESS
+            }
+        };
     }
     if args.first().map(String::as_str) != Some("mcp") || args.len() < 2 {
         return ExitCode::from(2);
@@ -410,6 +435,15 @@ fn main() -> ExitCode {
                 entry.insert("edited".to_owned(), json!(true));
             }
             save(&file, &config);
+        }
+        if let Some(words) = directives.find("clobber-after", subcommand, &name)
+            && let Some(path) = words.get(3).map(Path::new)
+            && path.is_relative()
+            && path
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            fs::write(root.join(path), "not = [toml\n").expect("clobber the file");
         }
         if directives.has("sleep-after", subcommand, &name) {
             sleep();

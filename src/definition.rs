@@ -7,6 +7,7 @@
 //! they never echo a value. This module does no I/O.
 
 mod hash;
+mod serialize;
 mod walk;
 
 use std::collections::BTreeMap;
@@ -15,6 +16,7 @@ use std::fmt;
 use crate::rule::Rule;
 
 pub use hash::{CORE_DOMAIN_TAG, DEFINITION_DOMAIN_TAG, canonical_json};
+pub use serialize::to_toml;
 
 /// Maximum length of a neutral name.
 ///

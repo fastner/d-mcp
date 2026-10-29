@@ -1,9 +1,9 @@
 //! Test isolation for command-level tests.
 //!
-//! Every command runs with `HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and the
-//! `XDG_*` directories pointing into a fresh temporary directory, with
-//! `D_MCP_STORE` removed and the current directory inside the temporary
-//! directory. No test touches the real `~/.d-mcp` or real harness
+//! Every command runs with an otherwise empty environment: `HOME`,
+//! `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and the `XDG_*` directories point into
+//! a fresh temporary directory, `D_MCP_STORE` is unset and the current
+//! directory is inside the temporary directory. No test touches the real `~/.d-mcp` or real harness
 //! configuration.
 //!
 //! `PATH` is always controlled: by default it holds only an empty directory,
@@ -210,8 +210,25 @@ impl TestEnv {
     }
 
     /// A `d-mcp` command with the isolated environment and no `D_MCP_STORE`.
+    ///
+    /// The environment starts empty, so no variable of the developer's shell
+    /// (such as a `GITHUB_TOKEN` a test expects to be unset) reaches d-mcp.
+    /// Only the system temp directory (`TMPDIR`, which the fakes use to find
+    /// the test root) and the coverage variables of `cargo llvm-cov`
+    /// (`LLVM_PROFILE_FILE`, `CARGO_LLVM_COV*`) are passed on.
     pub fn cmd(&self) -> Command {
         let mut cmd = cargo_bin_cmd!("d-mcp");
+        cmd.env_clear();
+        for (name, value) in std::env::vars_os() {
+            let keep = name.to_str().is_some_and(|name| {
+                name == "TMPDIR"
+                    || name == "LLVM_PROFILE_FILE"
+                    || name.starts_with("CARGO_LLVM_COV")
+            });
+            if keep {
+                cmd.env(name, value);
+            }
+        }
         cmd.env("HOME", self.home())
             .env("PATH", &self.path)
             .env("XDG_CONFIG_HOME", self.root().join("xdg/config"))
@@ -352,6 +369,104 @@ pub fn is_fresh(dep_info: &Path, built: std::time::SystemTime) -> bool {
                 .and_then(|meta| meta.modified())
                 .is_ok_and(|modified| modified <= built)
         })
+}
+
+/// The combined fixture `tests/fixtures/real-setup/`, installed into a
+/// [`TestEnv`] by [`TestEnv::install_real_setup`].
+pub struct RealSetup {
+    /// The repository root (the isolated working directory, with `.git`).
+    pub repo: PathBuf,
+    /// The working directory for commands: `<repo>/sub`, so the broken Codex
+    /// layer in `sub/.codex/` is read too.
+    pub cwd: PathBuf,
+    /// The team source with a canary in a definition's `description`.
+    pub team: PathBuf,
+}
+
+/// Every canary of the fixtures and fakes starts with this.
+pub const CANARY: &str = "CANARY";
+
+fn copy_tree(from: &Path, to: &Path, substitute: &dyn Fn(String) -> String) {
+    fs::create_dir_all(to).expect("create fixture dir");
+    for entry in fs::read_dir(from).expect("read fixture dir") {
+        let entry = entry.expect("fixture entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_tree(&entry.path(), &target, substitute);
+        } else {
+            let text = fs::read_to_string(entry.path()).expect("read fixture");
+            fs::write(&target, substitute(text)).expect("write fixture");
+        }
+    }
+}
+
+impl TestEnv {
+    /// Initializes the default store and installs the `real-setup` fixture:
+    /// the Codex and Claude Code user files, the repository files, the
+    /// local definitions and the team source (not registered).
+    pub fn install_real_setup(&self) -> RealSetup {
+        self.init();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/real-setup");
+        let repo = self.work();
+        let cwd = repo.join("sub");
+        let team = self.root().join("team");
+        let (repo_text, cwd_text) = (repo.display().to_string(), cwd.display().to_string());
+        let substitute = move |text: String| {
+            text.replace("@REPO@", &repo_text)
+                .replace("@CWD@", &cwd_text)
+        };
+        copy_tree(&fixture.join("repo"), &repo, &substitute);
+        fs::create_dir_all(repo.join(".git")).expect("create .git");
+        copy_tree(&fixture.join("codex"), &self.codex_home(), &substitute);
+        copy_tree(
+            &fixture.join("claude"),
+            self.claude_config().parent().expect("claude dir"),
+            &substitute,
+        );
+        copy_tree(
+            &fixture.join("local"),
+            &self.default_store().join("local"),
+            &substitute,
+        );
+        copy_tree(&fixture.join("team"), &team, &substitute);
+        RealSetup { repo, cwd, team }
+    }
+
+    /// A `d-mcp` command like [`TestEnv::cmd`], run from `dir`.
+    pub fn cmd_in(&self, dir: &Path) -> Command {
+        let mut cmd = self.cmd();
+        cmd.current_dir(dir);
+        cmd
+    }
+
+    /// Runs `d-mcp --json <args>` from `dir`; returns exit code, parsed
+    /// stdout and stderr.
+    pub fn json_in(&self, dir: &Path, args: &[&str]) -> (i32, Value, String) {
+        let output = self
+            .cmd_in(dir)
+            .arg("--json")
+            .args(args)
+            .output()
+            .expect("run d-mcp");
+        let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+        let value: Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|error| panic!("stdout is not JSON ({error}): {stdout}"));
+        (
+            output.status.code().expect("exit code"),
+            value,
+            String::from_utf8(output.stderr).expect("utf-8 stderr"),
+        )
+    }
+
+    /// Runs `d-mcp <args>` in text mode from `dir`.
+    pub fn text_in(&self, dir: &Path, args: &[&str]) -> (i32, String, String) {
+        let output = self.cmd_in(dir).args(args).output().expect("run d-mcp");
+        (
+            output.status.code().expect("exit code"),
+            String::from_utf8(output.stdout).expect("utf-8 stdout"),
+            String::from_utf8(output.stderr).expect("utf-8 stderr"),
+        )
+    }
 }
 
 /// A minimal valid stdio definition.

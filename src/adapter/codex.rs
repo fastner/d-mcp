@@ -21,19 +21,22 @@
 //!   (`enabled = true`, `required = false`, `disabled_tools = []`): Codex
 //!   drops them when it re-saves its file, so d-mcp never writes them.
 
+mod discover;
 mod document;
+mod import;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
 use super::{
     ActualEntry, Adapter, AdapterTexts, ApplyContext, ApplyMode, ApplyResult, EntryResult, Gap,
-    GapSeverity, HarnessPlan, HarnessRead, Hooks, Intent, Journal, Location, LoginState,
-    OverrideKey, OverrideType, PrivateRead, Rendered, Scope, WriteKind,
+    GapSeverity, HarnessPlan, HarnessRead, Hooks, ImportGap, Imported, Intent, Journal, Location,
+    LoginState, OverrideKey, OverrideType, PrivateRead, RawEntry, Rendered, Scope, ScopeRead,
+    WriteKind,
 };
 use crate::config::Harness;
 use crate::definition::{Auth, Definition, EnvValue, Transport};
@@ -48,6 +51,9 @@ pub use document::{
 /// The Codex versions this adapter was verified against (Codex verification
 /// gate of WP2).
 pub const VERIFIED_VERSIONS: &[&str] = &["codex-cli 0.165.0"];
+
+/// The program name of the Codex CLI, looked up on `PATH`.
+pub const PROGRAM: &str = "codex";
 
 /// The allowed `harness.codex` override keys, in writing order.
 ///
@@ -271,6 +277,33 @@ fn parse_listing(stdout: &[u8]) -> Option<BTreeMap<String, LoginState>> {
     )
 }
 
+/// Whether Codex loads no project configuration when it runs in `dir`: an
+/// absolute directory without a `.codex/config.toml` in it or in any
+/// ancestor up to its project root (the nearest ancestor with `.git`, or
+/// `dir` itself). Codex 0.165.0 loads every such file from a trusted project
+/// root down to its working directory.
+fn is_neutral(dir: &Path) -> bool {
+    if !dir.is_absolute() || !dir.is_dir() {
+        return false;
+    }
+    let root = super::repository_root(dir);
+    dir.ancestors()
+        .take_while(|ancestor| ancestor.starts_with(&root))
+        .all(|ancestor| fs::symlink_metadata(ancestor.join(".codex").join("config.toml")).is_err())
+}
+
+/// A neutral working directory for `codex`: `preferred` (the store root)
+/// when it is neutral, otherwise a fresh temporary directory, kept alive by
+/// the returned guard. `None` when not even that is neutral.
+fn neutral_dir(preferred: Option<&Path>) -> Option<(PathBuf, Option<tempfile::TempDir>)> {
+    if let Some(dir) = preferred.filter(|dir| is_neutral(dir)) {
+        return Some((dir.to_path_buf(), None));
+    }
+    let temp = tempfile::Builder::new().prefix("d-mcp-").tempdir().ok()?;
+    let path = temp.path().to_path_buf();
+    is_neutral(&path).then_some((path, Some(temp)))
+}
+
 fn note(field: &str, reason: String, unless_present: Option<&'static str>) -> Gap {
     Gap {
         field: field.to_owned(),
@@ -281,6 +314,56 @@ fn note(field: &str, reason: String, unless_present: Option<&'static str>) -> Ga
 }
 
 impl CodexAdapter {
+    /// Reads the user configuration: the [`HarnessRead`] for planning and
+    /// the parsed entries with their values, from one read of the file.
+    fn read_document(
+        location: &Location,
+    ) -> Result<(HarnessRead, BTreeMap<String, document::ParsedEntry>)> {
+        let mut read = HarnessRead {
+            location: location.clone(),
+            entries: BTreeMap::new(),
+            root_supported: true,
+            private: PrivateRead::default(),
+            shadowed: BTreeMap::new(),
+        };
+        if !location.file_exists {
+            return Ok((read, BTreeMap::new()));
+        }
+        let file = &location.file;
+        // A symlinked config is resolved to its target first; the link
+        // itself is kept.
+        let target = fs::canonicalize(file).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                invalid(file, "not a regular file", None)
+            } else {
+                Error::io("resolve", file, &error)
+            }
+        })?;
+        let (text, meta, parsed) = read_target(file, &target)?;
+        read.root_supported = parsed.root_supported;
+        read.entries = parsed
+            .entries
+            .iter()
+            .map(|(name, entry)| {
+                (
+                    name.clone(),
+                    ActualEntry {
+                        hash: entry.hash.clone(),
+                        supported_style: entry.region.is_some(),
+                        preserved: entry.preserved.clone(),
+                    },
+                )
+            })
+            .collect();
+        read.private = PrivateRead {
+            target: Some(target),
+            bytes: text.into_bytes(),
+            mode: meta.mode,
+            owner: meta.owner,
+        };
+        Ok((read, parsed.entries))
+    }
+
     fn render_entry(definition: &Definition) -> (Vec<(String, Value)>, Vec<Gap>) {
         let mut entry: Vec<(String, Value)> = Vec::new();
         let mut tables: Vec<(String, Value)> = Vec::new();
@@ -426,6 +509,10 @@ impl Adapter for CodexAdapter {
         VERIFIED_VERSIONS
     }
 
+    fn program(&self) -> &'static str {
+        PROGRAM
+    }
+
     fn texts(&self) -> &'static AdapterTexts {
         &TEXTS
     }
@@ -441,55 +528,25 @@ impl Adapter for CodexAdapter {
         Ok(Location {
             scope,
             file_exists: fs::symlink_metadata(&file).is_ok(),
-            binary_found: find_program(env.path.as_deref(), "codex".as_ref()).is_some(),
+            binary_found: find_program(env.path.as_deref(), PROGRAM.as_ref()).is_some(),
             file,
         })
     }
 
     fn read(&self, location: &Location) -> Result<HarnessRead> {
-        let mut read = HarnessRead {
-            location: location.clone(),
-            entries: BTreeMap::new(),
-            root_supported: true,
-            private: PrivateRead::default(),
-            shadowed: BTreeMap::new(),
-        };
-        if !location.file_exists {
-            return Ok(read);
-        }
-        let file = &location.file;
-        // A symlinked config is resolved to its target first; the link
-        // itself is kept.
-        let target = fs::canonicalize(file).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                invalid(file, "not a regular file", None)
-            } else {
-                Error::io("resolve", file, &error)
-            }
-        })?;
-        let (text, meta, parsed) = read_target(file, &target)?;
-        read.root_supported = parsed.root_supported;
-        read.entries = parsed
-            .entries
-            .into_iter()
-            .map(|(name, entry)| {
-                (
-                    name,
-                    ActualEntry {
-                        hash: entry.hash,
-                        supported_style: entry.region.is_some(),
-                        preserved: entry.preserved,
-                    },
-                )
-            })
-            .collect();
-        read.private = PrivateRead {
-            target: Some(target),
-            bytes: text.into_bytes(),
-            mode: meta.mode,
-            owner: meta.owner,
-        };
-        Ok(read)
+        Self::read_document(location).map(|(read, _)| read)
+    }
+
+    fn discover(&self, env: &Environment, repo_root: &Path) -> Vec<ScopeRead> {
+        discover::discover(self, env, repo_root)
+    }
+
+    fn import(
+        &self,
+        read: &ScopeRead,
+        name: &str,
+    ) -> std::result::Result<Imported, Vec<ImportGap>> {
+        import::import(read, name)
     }
 
     fn dropped_preserved(
@@ -502,6 +559,18 @@ impl Adapter for CodexAdapter {
             .copied()
             .filter(|key| !document::preserved_key_fits(key, &rendered.entry))
             .collect()
+    }
+
+    fn canonical_entry(&self, value: &Value) -> Value {
+        canonical_entry(value)
+    }
+
+    fn entry_hash(&self, value: &Value) -> String {
+        entry_hash(value)
+    }
+
+    fn normalized_entry(&self, raw: &RawEntry, imported: &Imported) -> Value {
+        import::normalized(raw.value(), imported)
     }
 
     fn render(&self, definition: &Definition) -> Rendered {
@@ -666,14 +735,21 @@ impl Adapter for CodexAdapter {
                 .map(|name| (name.clone(), LoginState::Unknown))
                 .collect()
         };
-        let Some(program) = find_program(env.path.as_deref(), "codex".as_ref()) else {
+        let Some(program) = find_program(env.path.as_deref(), PROGRAM.as_ref()) else {
             return unknown();
         };
         let Ok(codex_home) = env.codex_home() else {
             return unknown();
         };
+        // From a neutral directory, so no project configuration of d-mcp's
+        // own working directory is listed or trusted.
+        let store = env.store_root(None).ok();
+        let Some((cwd, _temp)) = neutral_dir(store.as_deref()) else {
+            return unknown();
+        };
         let invocation = Invocation::new(program)
             .args(["mcp", "list", "--json"])
+            .current_dir(cwd)
             .env("CODEX_HOME", codex_home);
         let listing = match runner.run(&invocation, env.path.as_deref()) {
             Ok(output) if output.success() && !output.truncated => parse_listing(&output.stdout),
@@ -806,6 +882,29 @@ mod tests {
             .map(|(key, _)| key)
             .collect();
         assert_eq!(keys, ["command", "enabled", "required", "disabled_tools"]);
+    }
+
+    #[test]
+    fn neutral_directories_have_no_project_layer() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let store = root.join("home/.d-mcp");
+        fs::create_dir_all(&store).unwrap();
+        assert!(is_neutral(&store));
+        assert!(!is_neutral(Path::new("relative")));
+        assert!(!is_neutral(&root.join("missing")));
+        // Without a `.git`, only the directory itself is the project.
+        fs::create_dir_all(root.join("home/.codex")).unwrap();
+        fs::write(root.join("home/.codex/config.toml"), "").unwrap();
+        assert!(is_neutral(&store));
+        // A home directory under version control makes it a project layer.
+        fs::create_dir(root.join("home/.git")).unwrap();
+        assert!(!is_neutral(&store));
+        let (dir, guard) = neutral_dir(Some(&store)).unwrap();
+        assert_ne!(dir, store);
+        assert!(guard.is_some());
+        fs::remove_dir(root.join("home/.git")).unwrap();
+        assert_eq!(neutral_dir(Some(&store)).unwrap().0, store);
     }
 
     #[test]

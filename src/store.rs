@@ -36,13 +36,15 @@ pub const LOCK_RETRY_DELAYS: [Duration; 7] = [
 ];
 
 /// Store entries that may exist in a (possibly partial) store directory.
-/// `state.toml` is written by `sync`; `lock.toml` and `approvals.toml` are
-/// written by later work packages.
-const KNOWN_ENTRIES: [&str; 6] = [
+/// `state.toml` is written by `sync`; `.hash-key` by `init` and by any
+/// mutating command that finds it missing (see [`crate::hashkey`]);
+/// `lock.toml` and `approvals.toml` are written by later work packages.
+pub const KNOWN_ENTRIES: [&str; 7] = [
     "config.toml",
     "local",
     ".lock",
     "state.toml",
+    ".hash-key",
     "lock.toml",
     "approvals.toml",
 ];
@@ -293,6 +295,8 @@ pub struct StorePaths {
     pub lock: PathBuf,
     /// `state.toml`, the write state of `sync`.
     pub state: PathBuf,
+    /// `.hash-key`, the key of the display hashes (see [`crate::hashkey`]).
+    pub hash_key: PathBuf,
 }
 
 impl StorePaths {
@@ -305,6 +309,7 @@ impl StorePaths {
             local_servers: root.join("local").join("servers"),
             lock: root.join(".lock"),
             state: root.join("state.toml"),
+            hash_key: root.join(".hash-key"),
             root,
         }
     }
@@ -523,6 +528,62 @@ pub(crate) fn no_follow(options: &mut OpenOptions, nonblocking: bool) {
 #[cfg(not(unix))]
 pub(crate) fn no_follow(_options: &mut OpenOptions, _nonblocking: bool) {}
 
+/// Why [`read_regular_capped`] refused or failed to read a file.
+#[derive(Debug)]
+pub(crate) enum CappedReadError {
+    /// The path is a symlink, a directory, a FIFO or another non-regular
+    /// file.
+    NotRegular,
+    /// The file is larger than the cap.
+    TooLarge,
+    /// Any other I/O error (the file is missing, unreadable, ...).
+    Io(io::Error),
+}
+
+/// Reads a regular file of at most `max` bytes, without following a final
+/// symlink (`O_NOFOLLOW`) and without blocking on a FIFO (`O_NONBLOCK`).
+/// The type and size are re-checked through the opened handle and the read
+/// is capped, so a file swapped or grown after a first check is still
+/// caught. The same open is used for definition files and for repository
+/// files of the harnesses (`.mcp.json`, `.codex/config.toml`).
+///
+/// # Errors
+///
+/// See [`CappedReadError`].
+pub(crate) fn read_regular_capped(
+    path: &Path,
+    max: u64,
+) -> std::result::Result<Vec<u8>, CappedReadError> {
+    use std::io::Read;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    no_follow(&mut options, true);
+    let file = options.open(path).map_err(|error| {
+        // A refused symlink or another non-regular entry is reported as
+        // such; anything else (missing, unreadable) is an I/O error.
+        if fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.is_file()) {
+            CappedReadError::NotRegular
+        } else {
+            CappedReadError::Io(error)
+        }
+    })?;
+    let metadata = file.metadata().map_err(CappedReadError::Io)?;
+    if !metadata.is_file() {
+        return Err(CappedReadError::NotRegular);
+    }
+    if metadata.len() > max {
+        return Err(CappedReadError::TooLarge);
+    }
+    let mut bytes = Vec::new();
+    file.take(max.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(CappedReadError::Io)?;
+    if bytes.len() as u64 > max {
+        return Err(CappedReadError::TooLarge);
+    }
+    Ok(bytes)
+}
+
 /// Creates one directory with mode `0700`.
 pub(crate) fn create_dir(path: &Path) -> Result<()> {
     let mut builder = fs::DirBuilder::new();
@@ -674,7 +735,7 @@ pub fn init(paths: &StorePaths, dry_run: bool) -> Result<InitReport> {
 
     if dry_run {
         // The same order as a real run: root, `.lock`, `config.toml`,
-        // `local`, `local/servers`.
+        // `local`, `local/servers`, `.hash-key`.
         if !root_exists {
             created.push(paths.root.clone());
         }
@@ -683,6 +744,7 @@ pub fn init(paths: &StorePaths, dry_run: bool) -> Result<InitReport> {
             &paths.config,
             &paths.local_root,
             &paths.local_servers,
+            &paths.hash_key,
         ] {
             if fs::symlink_metadata(path).is_err() {
                 created.push(path.clone());
@@ -724,6 +786,12 @@ pub fn init(paths: &StorePaths, dry_run: bool) -> Result<InitReport> {
                 created.push(directory.clone());
             }
         }
+    }
+    // The display-hash key; an existing one is kept, a corrupt one fails.
+    let (_, key_created, warning) = crate::hashkey::ensure(paths, &lock)?;
+    warnings.extend(warning);
+    if key_created {
+        created.push(paths.hash_key.clone());
     }
     drop(lock);
     Ok(InitReport {
@@ -955,7 +1023,8 @@ mod tests {
                 paths.lock.clone(),
                 paths.config.clone(),
                 paths.local_root.clone(),
-                paths.local_servers.clone()
+                paths.local_servers.clone(),
+                paths.hash_key.clone()
             ]
         );
         assert_eq!(
@@ -972,6 +1041,7 @@ mod tests {
             assert_eq!(mode(&paths.local_servers), DIR_MODE);
             assert_eq!(mode(&paths.config), FILE_MODE);
             assert_eq!(mode(&paths.lock), FILE_MODE);
+            assert_eq!(mode(&paths.hash_key), FILE_MODE);
         }
         let again = init(&paths, false).unwrap();
         assert!(again.created.is_empty());
@@ -989,7 +1059,8 @@ mod tests {
             [
                 paths.lock.clone(),
                 paths.config.clone(),
-                paths.local_servers.clone()
+                paths.local_servers.clone(),
+                paths.hash_key.clone()
             ]
         );
         assert!(!paths.config.exists());
@@ -1154,7 +1225,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let paths = StorePaths::new(link.clone());
         let dry = init(&paths, true).unwrap();
-        assert_eq!(dry.created.len(), 4);
+        assert_eq!(dry.created.len(), 5);
         assert_eq!(
             dry.warnings,
             [StoreWarning::LoosePermissions {

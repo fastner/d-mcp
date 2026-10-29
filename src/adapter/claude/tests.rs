@@ -43,19 +43,15 @@ fn declarations() {
         ]
     );
     assert_eq!(adapter.texts().location_variable, "CLAUDE_CONFIG_DIR");
-    let read = HarnessRead {
-        location: Location {
-            scope: Scope::User,
-            file: "/c/.claude.json".into(),
-            file_exists: false,
-            binary_found: false,
-        },
-        entries: BTreeMap::new(),
-        root_supported: true,
-        private: PrivateRead::default(),
-        shadowed: BTreeMap::new(),
-    };
-    assert!(adapter.import(&read, "x").is_none());
+    let read = ScopeRead::new(
+        Harness::Claude,
+        crate::adapter::DiscoveredScope::User,
+        "/c/.claude.json".into(),
+    );
+    assert_eq!(
+        adapter.import(&read, "x").unwrap_err()[0].reason,
+        crate::adapter::ImportGapReason::NotFound
+    );
 }
 
 #[test]
@@ -229,6 +225,9 @@ fn the_adapter_never_writes_its_configuration_file() {
         include_str!("../claude.rs"),
         include_str!("file.rs"),
         include_str!("cli.rs"),
+        include_str!("discover.rs"),
+        include_str!("import.rs"),
+        include_str!("settings.rs"),
     ];
     // Built at run time, so this test's own source does not match.
     let forbidden = [

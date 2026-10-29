@@ -1,9 +1,12 @@
 //! Command-line definitions, dispatch and rendering.
 //!
 //! Mutating commands (`init`, `source add`, `source remove`, `select`,
-//! `unselect`, `sync`, `unmanage`) take the store lock, then read
-//! `config.toml`, then write. Read-only commands (`resolve`, `source list`)
-//! and every `--dry-run` take no lock and write nothing.
+//! `unselect`, `sync`, `unmanage`, `adopt --apply`, `uninstall --apply`)
+//! take the store lock, then read `config.toml`, then write; each creates a
+//! missing display-hash key (`.hash-key`) under the lock. Read-only
+//! commands (`resolve`, `source list`, `inventory`, `status`, `doctor`,
+//! `adopt` and `uninstall` without `--apply`) and every `--dry-run` take no
+//! lock and write nothing.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -14,16 +17,22 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 
 use crate::adapter::registry;
+use crate::adopt::{AdoptOptions, EntryRef, Expect, Place, VarChoice, adopt};
 use crate::config::{
     Config, Harness, HarnessSet, LOCAL_SOURCE_ID, Selection, SourceEntry, SourceKind,
 };
 use crate::definition::is_valid_name;
+use crate::doctor::{DoctorOptions, doctor};
 use crate::error::{Error, Result};
+use crate::hashkey;
+use crate::inventory::{InventoryOptions, inventory};
 use crate::output::{Report, Ui};
 use crate::resolver::{ServerResolution, resolve};
 use crate::source::{SourceSpec, is_available, offered_names, scan, source_specs};
+use crate::status::{StatusOptions, status};
 use crate::store::{self, Environment, StoreLock, StorePaths};
 use crate::sync::{SyncOptions, sync, unmanage};
+use crate::uninstall::{UninstallOptions, uninstall};
 use crate::validate::validate;
 
 /// Manage MCP server definitions once and sync them into every coding-agent
@@ -37,7 +46,9 @@ use crate::validate::validate;
     arg_required_else_help = true,
     after_help = "Examples:\n  d-mcp init\n  d-mcp source add ~/team-mcp --id team --priority 10\n  \
                   d-mcp select github --harness claude\n  d-mcp resolve --json\n  \
-                  d-mcp sync --dry-run\n  d-mcp unmanage github --harness codex"
+                  d-mcp inventory\n  d-mcp adopt claude:user:github codex:user:github\n  \
+                  d-mcp sync --dry-run\n  d-mcp status --auth\n  d-mcp doctor\n  \
+                  d-mcp unmanage github --harness codex\n  d-mcp uninstall"
 )]
 pub struct Cli {
     /// Store directory. Overrides `D_MCP_STORE` and the default `~/.d-mcp`.
@@ -82,6 +93,71 @@ pub enum Command {
     },
     /// Resolve every selection against the sources (read-only).
     Resolve,
+    /// List every MCP server entry of every harness scope d-mcp can read,
+    /// classified against the write state, with duplicates and conflicts
+    /// (read-only; entry content is redacted).
+    Inventory {
+        /// List only this harness; repeat for several. Without it, every
+        /// harness with an adapter.
+        #[arg(long = "harness", value_enum, value_name = "HARNESS")]
+        harnesses: Vec<AdapterArg>,
+    },
+    /// Adopt existing harness entries as one d-mcp definition per name, in
+    /// the `local` source: every env and header literal becomes a variable
+    /// reference. Without `--apply` this is a read-only preview.
+    Adopt {
+        /// The entries, as `<harness>:<scope>:<name>` with the scope `user`
+        /// or `project`; entries with the same name become one definition,
+        /// selected for exactly their harnesses.
+        #[arg(required = true, value_name = "HARNESS:SCOPE:NAME")]
+        entries: Vec<EntryRef>,
+        /// Write the definition and the selection and take the entries over.
+        /// Needs an `--expect` per entry; with `--dry-run` it previews.
+        #[arg(long)]
+        apply: bool,
+        /// The display hash of an entry from the preview; required for every
+        /// entry with `--apply`.
+        #[arg(long = "expect", value_name = "HARNESS:SCOPE:NAME=DISPLAY_HASH")]
+        expect: Vec<Expect>,
+        /// Keep this env literal as a value instead of a variable reference
+        /// (env only, and only when it does not look like a secret).
+        #[arg(long = "keep-literal", value_name = "NAME")]
+        keep_literal: Vec<String>,
+        /// The variable of a replaced header literal, by native field, such
+        /// as `headers.Authorization=GITHUB_TOKEN`.
+        #[arg(long = "var", value_name = "FIELD=NAME")]
+        vars: Vec<VarChoice>,
+        /// Adopt a project-scope entry into the user scope; the project entry
+        /// is left as it is.
+        #[arg(long)]
+        to_user_scope: bool,
+        /// The origin whose content wins when the harnesses' entries
+        /// conflict, as `<harness>:<scope>`.
+        #[arg(long, value_name = "HARNESS:SCOPE")]
+        from: Option<Place>,
+        /// Use OAuth instead of the static header.
+        #[arg(long, conflicts_with = "oauth_supported")]
+        prefer_oauth: bool,
+        /// Keep the bearer token and declare that the server supports OAuth.
+        #[arg(long)]
+        oauth_supported: bool,
+        /// Accept that rewriting an OAuth-capable Claude Code entry clears its
+        /// stored tokens and client secret.
+        #[arg(long)]
+        accept_relogin: bool,
+        /// The variable that holds the OAuth client secret (required when a
+        /// rewritten Claude Code entry has `oauth.clientId`).
+        #[arg(long, value_name = "NAME")]
+        client_secret_env: Option<String>,
+        /// Accept a variable whose value differs from the literal it
+        /// replaces; the literal is unrecoverable after apply.
+        #[arg(long)]
+        allow_env_mismatch: bool,
+        /// Accept a variable that is unset or empty; the literal is
+        /// unrecoverable after apply.
+        #[arg(long)]
+        allow_missing_env: bool,
+    },
     /// Write the selected servers into the harnesses (Codex and Claude
     /// Code), at user scope.
     Sync {
@@ -98,6 +174,47 @@ pub enum Command {
         /// old file is not edited.
         #[arg(long)]
         relocate: bool,
+    },
+    /// Show per harness and server the desired, recorded and actual state,
+    /// the operation the next sync would run and the missing variables
+    /// (read-only).
+    Status {
+        /// Also query the login state; for Claude Code this runs `claude mcp
+        /// get`, which connects to each OAuth server.
+        #[arg(long)]
+        auth: bool,
+        /// Only this harness; repeat for several. Without it, every harness
+        /// with an adapter.
+        #[arg(long = "harness", value_enum, value_name = "HARNESS")]
+        harnesses: Vec<AdapterArg>,
+        /// Only these servers. Without them, every selected or managed one.
+        #[arg(value_name = "SERVER")]
+        names: Vec<String>,
+    },
+    /// Check the store, the harnesses and the managed entries; exits 1 when
+    /// a check is at `error` (read-only).
+    Doctor {
+        /// Also query the login state of managed entries; like `status
+        /// --auth`, for Claude Code this connects to each OAuth server.
+        #[arg(long)]
+        auth: bool,
+    },
+    /// Stop managing every harness entry: remove the entries d-mcp created,
+    /// release adopted ones, and leave drifted ones. Without `--apply` this
+    /// is a read-only preview.
+    Uninstall {
+        /// Act: edit the harness configs and the state; with `--dry-run` it
+        /// previews.
+        #[arg(long)]
+        apply: bool,
+        /// Afterwards delete the known store files (config, state, `local/`,
+        /// `.hash-key`, ...) inside the store root; this cannot be undone.
+        #[arg(long)]
+        purge: bool,
+        /// With `--purge` on a store root that is a symlink: delete the
+        /// store files inside its target.
+        #[arg(long, requires = "purge")]
+        follow_store_link: bool,
     },
     /// Stop managing a server's harness entries and drop those harnesses
     /// from its selection. The entries are left as they are.
@@ -185,6 +302,9 @@ fn dispatch(cli: &Cli, env: &Environment, ui: &mut Ui<'_>) -> Result<(Report, Op
     let read_only = matches!(
         command,
         Command::Resolve
+            | Command::Inventory { .. }
+            | Command::Status { .. }
+            | Command::Doctor { .. }
             | Command::Source {
                 command: SourceCommand::List
             }
@@ -214,10 +334,104 @@ fn dispatch(cli: &Cli, env: &Environment, ui: &mut Ui<'_>) -> Result<(Report, Op
             }
             return result;
         }
+        Command::Adopt {
+            entries,
+            apply,
+            expect,
+            keep_literal,
+            vars,
+            to_user_scope,
+            from,
+            prefer_oauth,
+            oauth_supported,
+            accept_relogin,
+            client_secret_env,
+            allow_env_mismatch,
+            allow_missing_env,
+        } => {
+            let options = AdoptOptions {
+                entries: entries.clone(),
+                apply: *apply,
+                dry_run,
+                keep_literal: keep_literal.iter().cloned().collect(),
+                vars: vars.clone(),
+                to_user_scope: *to_user_scope,
+                from: *from,
+                prefer_oauth: *prefer_oauth,
+                oauth_supported: *oauth_supported,
+                accept_relogin: *accept_relogin,
+                client_secret_env: client_secret_env.clone(),
+                expect: expect.clone(),
+                allow_env_mismatch: *allow_env_mismatch,
+                allow_missing_env: *allow_missing_env,
+                var: None,
+            };
+            let mut warnings = Vec::new();
+            let result = adopt(&paths, env, &options, &mut warnings);
+            for warning in &warnings {
+                ui.warn(warning);
+            }
+            return result;
+        }
+        Command::Status {
+            auth,
+            harnesses,
+            names,
+        } => {
+            let options = StatusOptions {
+                harnesses: harnesses.iter().copied().map(Harness::from).collect(),
+                names: names.iter().cloned().collect(),
+                auth: *auth,
+                var: None,
+            };
+            let mut warnings = Vec::new();
+            let result = status(&paths, env, &options, &mut warnings);
+            for warning in &warnings {
+                ui.warn(warning);
+            }
+            result
+        }
+        Command::Doctor { auth } => {
+            let mut warnings = Vec::new();
+            let result = doctor(&paths, env, &DoctorOptions { auth: *auth }, &mut warnings);
+            for warning in &warnings {
+                ui.warn(warning);
+            }
+            return result;
+        }
+        Command::Uninstall {
+            apply,
+            purge,
+            follow_store_link,
+        } => {
+            let options = UninstallOptions {
+                apply: *apply,
+                dry_run,
+                purge: *purge,
+                follow_store_link: *follow_store_link,
+            };
+            let mut warnings = Vec::new();
+            let result = uninstall(&paths, env, &options, &mut warnings);
+            for warning in &warnings {
+                ui.warn(warning);
+            }
+            return result;
+        }
         Command::Unmanage { server, harnesses } => {
             let harnesses = harnesses.iter().copied().map(Harness::from).collect();
             let mut warnings = Vec::new();
             let result = unmanage(&paths, server, &harnesses, dry_run, &mut warnings);
+            for warning in &warnings {
+                ui.warn(warning);
+            }
+            result
+        }
+        Command::Inventory { harnesses } => {
+            let options = InventoryOptions {
+                harnesses: harnesses.iter().copied().map(Harness::from).collect(),
+            };
+            let mut warnings = Vec::new();
+            let result = inventory(&paths, env, &options, &mut warnings);
             for warning in &warnings {
                 ui.warn(warning);
             }
@@ -255,6 +469,12 @@ fn mutate<T>(
         Some(StoreLock::acquire(paths)?)
     };
     let mut config = paths.load_config()?;
+    // Every mutating command creates a missing display-hash key.
+    if let Some(lock) = &lock
+        && let Some(warning) = hashkey::ensure_under_lock(paths, lock)?
+    {
+        ui.warn(&warning.to_string());
+    }
     let result = change(&mut config)?;
     if let Some(lock) = &lock
         && let Some(warning) = paths.save_config(lock, &config)?
@@ -754,7 +974,7 @@ mod tests {
         let f = Fixture::new();
         let (code, value) = f.json(&["--dry-run", "init"]);
         assert_eq!(code, 0);
-        assert_eq!(value["data"]["created"].as_array().unwrap().len(), 5);
+        assert_eq!(value["data"]["created"].as_array().unwrap().len(), 6);
         assert!(!f.temp.path().join("store").exists());
         let (code, out, _) = f.run(&["--dry-run", "init"]);
         assert_eq!(code, 0);

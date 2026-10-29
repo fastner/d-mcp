@@ -158,10 +158,17 @@ fn init_is_idempotent_and_sets_permissions() {
         .iter()
         .map(|path| path.as_str().unwrap())
         .collect();
-    let expected: Vec<String> = ["", "/.lock", "/config.toml", "/local", "/local/servers"]
-        .iter()
-        .map(|suffix| format!("{}{suffix}", store.display()))
-        .collect();
+    let expected: Vec<String> = [
+        "",
+        "/.lock",
+        "/config.toml",
+        "/local",
+        "/local/servers",
+        "/.hash-key",
+    ]
+    .iter()
+    .map(|suffix| format!("{}{suffix}", store.display()))
+    .collect();
     assert_eq!(created, expected);
     assert_eq!(
         fs::read_to_string(store.join("config.toml")).unwrap(),
@@ -178,7 +185,11 @@ fn init_is_idempotent_and_sets_permissions() {
         ] {
             assert_eq!(mode(&dir), 0o700, "{}", dir.display());
         }
-        for file in [store.join("config.toml"), store.join(".lock")] {
+        for file in [
+            store.join("config.toml"),
+            store.join(".lock"),
+            store.join(".hash-key"),
+        ] {
             assert_eq!(mode(&file), 0o600, "{}", file.display());
         }
     }
@@ -202,7 +213,7 @@ fn init_completes_a_partial_store() {
     let (code, value, _) = env.json(&["init"]);
     assert_eq!(code, 0);
     let created = value["data"]["created"].as_array().unwrap();
-    assert_eq!(created.len(), 3, "{value}");
+    assert_eq!(created.len(), 4, "{value}");
     assert!(store.join("local/servers").is_dir());
     assert!(store.join("config.toml").is_file());
 }
@@ -219,7 +230,7 @@ fn init_follows_a_symlinked_store_and_warns_about_loose_permissions() {
     std::os::unix::fs::symlink(&real, env.default_store()).unwrap();
     let (code, value, stderr) = env.json(&["init"]);
     assert_eq!(code, 0, "{value}");
-    assert_eq!(value["data"]["created"].as_array().unwrap().len(), 4);
+    assert_eq!(value["data"]["created"].as_array().unwrap().len(), 5);
     assert!(
         stderr.contains("warning: the store directory") && stderr.contains("mode 0750"),
         "{stderr}"
@@ -751,7 +762,7 @@ fn dry_run_creates_nothing_on_a_missing_store() {
     let store = env.default_store();
     let (code, value, _) = env.json(&["--dry-run", "init"]);
     assert_eq!(code, 0);
-    assert_eq!(value["data"]["created"].as_array().unwrap().len(), 5);
+    assert_eq!(value["data"]["created"].as_array().unwrap().len(), 6);
     assert!(fs::symlink_metadata(&store).is_err());
     for args in [
         vec!["--dry-run", "select", "github"],
@@ -1028,7 +1039,7 @@ fn rewritten_config_keeps_mode_0600_and_leaves_no_temp_files() {
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
         .collect();
     names.sort();
-    assert_eq!(names, [".lock", "config.toml", "local"]);
+    assert_eq!(names, [".hash-key", ".lock", "config.toml", "local"]);
 }
 
 #[test]
@@ -1063,4 +1074,49 @@ fn store_path_flag_beats_env_for_every_command() {
         );
     }
     assert!(!bogus.exists());
+}
+
+#[test]
+fn only_mutating_commands_create_a_missing_hash_key() {
+    let env = TestEnv::new();
+    env.init();
+    let key = env.default_store().join(".hash-key");
+    let paths = d_mcp::store::StorePaths::new(env.default_store());
+    let load = || d_mcp::hashkey::load(&paths).unwrap().expect("a .hash-key");
+    let original = load();
+    fs::remove_file(&key).unwrap();
+    for args in [
+        &["resolve"][..],
+        &["source", "list"],
+        &["inventory"],
+        &["--dry-run", "select", "github"],
+        &["--dry-run", "sync"],
+    ] {
+        let (code, _, stderr) = env.text(args);
+        assert_eq!(code, 0, "{args:?}: {stderr}");
+        assert!(!key.exists(), "{args:?} created the key");
+    }
+    let (code, _, _) = env.text(&["select", "github"]);
+    assert_eq!(code, 0);
+    // The key is parsed as d-mcp parses it, not by its file layout.
+    let created = load();
+    assert!(created != original, "a new key was generated");
+    // An existing key is kept by every later command, `init` included.
+    env.text(&["unselect", "github"]);
+    env.init();
+    assert!(load() == created);
+    for args in [&["sync"][..], &["init"]] {
+        fs::remove_file(&key).unwrap();
+        env.text(args);
+        assert!(key.is_file(), "{args:?}");
+    }
+    // A corrupt key is never replaced and blocks mutating commands only.
+    fs::write(&key, "corrupt").unwrap();
+    let (code, value, _) = env.json(&["select", "github"]);
+    assert_eq!(code, 3);
+    assert_eq!(value["error"]["code"], "hash-key-corrupt");
+    assert_eq!(fs::read(&key).unwrap(), b"corrupt");
+    let (code, _, stderr) = env.text(&["inventory"]);
+    assert_eq!(code, 0);
+    assert!(stderr.contains("warning: no display hashes"), "{stderr}");
 }

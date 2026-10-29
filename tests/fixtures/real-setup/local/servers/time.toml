@@ -1,0 +1,6 @@
+name = "time"
+
+[transport]
+type = "stdio"
+command = "uvx"
+args = ["mcp-server-time"]

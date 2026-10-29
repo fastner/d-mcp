@@ -27,6 +27,7 @@ use std::ops::Range;
 use serde_json::{Map, Number, Value};
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table};
 
+use crate::adapter::RawEntry;
 use crate::canonical::tagged_hash;
 use crate::spanned::{self, Node, NodeKind};
 
@@ -90,6 +91,8 @@ pub struct ParsedEntry {
     pub region: Option<Range<usize>>,
     /// Preserved keys present in the entry.
     pub preserved: BTreeSet<&'static str>,
+    /// The entry as JSON, without the preserved keys (see [`entry_json`]).
+    pub value: RawEntry,
 }
 
 /// A parsed Codex config.
@@ -181,6 +184,7 @@ pub fn parse(text: &str) -> Result<Parsed, (usize, usize)> {
                 hash: entry_hash(&value),
                 region,
                 preserved,
+                value: RawEntry::new(value),
             },
         );
     }
@@ -375,6 +379,22 @@ pub fn entry_hash(value: &Value) -> String {
     tagged_hash(ENTRY_HASH_TAG, &canonical_entry(value))
 }
 
+/// The `trust_level` of a project in the user configuration:
+/// `[projects."<root>"] trust_level = "..."` (verified against Codex
+/// 0.165.0, which loads a project's `.codex/config.toml` files only when its
+/// root is `trusted`). `None` when the project, the key or a string value is
+/// absent, or the text does not parse.
+#[must_use]
+pub fn trust_level(text: &str, root: &str) -> Option<String> {
+    let document = text.parse::<DocumentMut>().ok()?;
+    document
+        .get("projects")?
+        .get(root)?
+        .get("trust_level")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 /// Converts a JSON value into a TOML value. Objects become inline tables.
 fn toml_value(value: &Value) -> toml_edit::Value {
     match value {
@@ -535,6 +555,38 @@ mod tests {
     const SAMPLE: &str = "model = \"o3\"\n\n# above a\n[mcp_servers.a]\ncommand = \"npx\"\n\n\
                           # above env\n[mcp_servers.a.env]\nX = \"1\"\n\n# above b\n\
                           [mcp_servers.b]\nurl = \"https://x.test/mcp\"\n\n[profiles.p]\nm = 1\n";
+
+    #[test]
+    fn trust_levels_are_read_by_project_root() {
+        let text = "[projects.\"/r\"]\ntrust_level = \"trusted\"\n\
+                    [projects.\"/u\"]\ntrust_level = \"untrusted\"\n\
+                    [projects.\"/n\"]\ntrust_level = 1\n";
+        assert_eq!(trust_level(text, "/r").as_deref(), Some("trusted"));
+        assert_eq!(trust_level(text, "/u").as_deref(), Some("untrusted"));
+        assert_eq!(trust_level(text, "/n"), None);
+        assert_eq!(trust_level(text, "/missing"), None);
+        assert_eq!(trust_level("projects = [", "/r"), None);
+        assert_eq!(
+            trust_level(
+                "projects = { \"/r\" = { trust_level = \"trusted\" } }",
+                "/r"
+            )
+            .as_deref(),
+            Some("trusted")
+        );
+    }
+
+    #[test]
+    fn entries_keep_their_value_without_preserved_keys() {
+        let parsed = parse(
+            "[mcp_servers.x]\nurl = \"u\"\n[mcp_servers.x.oauth]\nclient_id = \"c\"\n\
+             client_secret = \"CANARY_SECRET\"\n",
+        )
+        .unwrap();
+        let value = parsed.entries["x"].value.value();
+        assert_eq!(value, &json!({"url": "u", "oauth": {"client_id": "c"}}));
+        assert!(!format!("{:?}", parsed.entries["x"]).contains("CANARY"));
+    }
 
     #[test]
     fn regions_start_at_the_header_and_end_before_the_next_prefix() {

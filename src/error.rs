@@ -305,6 +305,71 @@ pub enum Error {
         /// The name.
         name: String,
     },
+    /// `adopt` refused: an entry cannot be adopted losslessly and
+    /// literal-free, or an adoption precondition does not hold. The `data`
+    /// of the `adopt` document names each refusal by entry and field, never
+    /// by value.
+    #[error(
+        "{count} {} the adoption; see the report (nothing was written)",
+        if *count == 1 { "refusal blocks" } else { "refusals block" }
+    )]
+    AdoptRefused {
+        /// The number of refusals.
+        count: usize,
+    },
+    /// An entry to adopt changed after the preview it was bound to with
+    /// `--expect`. Nothing was written for it.
+    #[error(
+        "the entry `{entry}` changed since the preview (or its `--expect` hash does not match); run `d-mcp adopt` without `--apply` again"
+    )]
+    AdoptEntryChanged {
+        /// `<harness>:<scope>:<name>`.
+        entry: String,
+    },
+    /// `doctor` found at least one check at severity `error`. The `doctor`
+    /// document lists every check.
+    #[error(
+        "{count} doctor {} at `error`; see the report",
+        if *count == 1 { "check is" } else { "checks are" }
+    )]
+    DoctorFailed {
+        /// The number of checks at `error`.
+        count: usize,
+    },
+    /// `uninstall` left entries in the harnesses: drifted, location-changed
+    /// or unsupported ones, whose records are kept unless `--purge`. The
+    /// `uninstall` document names each entry.
+    #[error(
+        "{count} {} left in the harnesses (drifted, location changed or unsupported); see the report",
+        if *count == 1 { "entry is" } else { "entries are" }
+    )]
+    UninstallIncomplete {
+        /// The number of entries left.
+        count: usize,
+    },
+    /// `uninstall --purge` was blocked (a location-changed record, a
+    /// missing harness CLI, a failed harness, or a symlinked store root
+    /// without `--follow-store-link`); nothing was purged.
+    #[error(
+        "{count} {} `--purge`; nothing was purged; see the report",
+        if *count == 1 { "condition blocks" } else { "conditions block" }
+    )]
+    PurgeBlocked {
+        /// The number of blocking conditions.
+        count: usize,
+    },
+    /// `<store>/.hash-key` is not a regular file or does not hold a key.
+    #[error(
+        "the display-hash key {} is corrupt; remove it and run `d-mcp init` to create a new one",
+        path.display()
+    )]
+    HashKeyCorrupt {
+        /// The key file.
+        path: PathBuf,
+    },
+    /// The operating system has no random source for a new display-hash key.
+    #[error("cannot create the display-hash key: the system random source is unavailable")]
+    HashKeyUnavailable,
     /// A file-system operation failed.
     #[error("cannot {operation} {}: {}", path.display(), io::Error::from(*kind))]
     Io {
@@ -363,8 +428,15 @@ impl Error {
             Error::SyncBlocked { .. } => "sync-blocked",
             Error::NotManaged { .. } => "not-managed",
             Error::UnknownTakeOver { .. } => "unknown-take-over",
+            Error::AdoptRefused { .. } => "adopt-refused",
+            Error::AdoptEntryChanged { .. } => "adopt-entry-changed",
+            Error::DoctorFailed { .. } => "doctor-failed",
+            Error::UninstallIncomplete { .. } => "uninstall-incomplete",
+            Error::PurgeBlocked { .. } => "purge-blocked",
             Error::HomeUnset => "home-unset",
             Error::CurrentDirUnavailable => "cwd-unavailable",
+            Error::HashKeyCorrupt { .. } => "hash-key-corrupt",
+            Error::HashKeyUnavailable => "hash-key-unavailable",
             Error::Io { .. } => "io-error",
         }
     }
@@ -391,6 +463,10 @@ impl Error {
             | Error::SyncBlocked { .. }
             | Error::NotManaged { .. }
             | Error::UnknownTakeOver { .. }
+            | Error::AdoptRefused { .. }
+            | Error::DoctorFailed { .. }
+            | Error::UninstallIncomplete { .. }
+            | Error::PurgeBlocked { .. }
             | Error::HarnessCliFailed { .. }
             | Error::HarnessNoNeutralDir { .. } => EXIT_FAILURE,
             Error::ConfigCorrupt { .. }
@@ -400,12 +476,15 @@ impl Error {
             | Error::HarnessConfigInvalid { .. }
             | Error::HarnessVerifyFailed { .. }
             | Error::HarnessEditFailed { .. }
-            | Error::StateCorrupt { .. } => EXIT_UNSAFE,
+            | Error::StateCorrupt { .. }
+            | Error::AdoptEntryChanged { .. }
+            | Error::HashKeyCorrupt { .. } => EXIT_UNSAFE,
             Error::HomeUnset
             | Error::CurrentDirUnavailable
             | Error::HarnessPathNotUtf8 { .. }
             | Error::HarnessCliNotFound { .. }
             | Error::HarnessCliTimeout { .. }
+            | Error::HashKeyUnavailable
             | Error::Io { .. } => EXIT_ENVIRONMENT,
         }
     }
@@ -500,8 +579,17 @@ impl Error {
             Error::UnknownTakeOver {
                 name: "github".into(),
             },
+            Error::AdoptRefused { count: 2 },
+            Error::AdoptEntryChanged {
+                entry: "claude:user:github".into(),
+            },
+            Error::DoctorFailed { count: 1 },
+            Error::UninstallIncomplete { count: 2 },
+            Error::PurgeBlocked { count: 1 },
             Error::HomeUnset,
             Error::CurrentDirUnavailable,
+            Error::HashKeyCorrupt { path: path.clone() },
+            Error::HashKeyUnavailable,
             Error::Io {
                 operation: "read",
                 path,
@@ -543,8 +631,15 @@ impl Error {
                 | Error::SyncBlocked { .. }
                 | Error::NotManaged { .. }
                 | Error::UnknownTakeOver { .. }
+                | Error::AdoptRefused { .. }
+                | Error::AdoptEntryChanged { .. }
+                | Error::DoctorFailed { .. }
+                | Error::UninstallIncomplete { .. }
+                | Error::PurgeBlocked { .. }
                 | Error::HomeUnset
                 | Error::CurrentDirUnavailable
+                | Error::HashKeyCorrupt { .. }
+                | Error::HashKeyUnavailable
                 | Error::Io { .. } => {}
             }
         }

@@ -1,0 +1,50 @@
+{
+  "numStartups": 42,
+  "oauthAccount": {"emailAddress": "CANARY_ACCOUNT@example.test", "accessToken": "CANARY_TOKEN"},
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github", "--token-file", "/srv/CANARY_ARGS/token"],
+      "env": {
+        "GITHUB_TOKEN": "${GITHUB_TOKEN}",
+        "GITHUB_API_URL": "https://user:CANARY_USERINFO@api.github.test/CANARY_PATH?key=CANARY_QUERY#CANARY_FRAGMENT"
+      }
+    },
+    "linear": {
+      "type": "http",
+      "url": "https://mcp.linear.test/mcp",
+      "oauth": {"clientId": "CANARY_CLIENT_ID", "scopes": "read"}
+    },
+    "docs": {"type": "sse", "url": "https://docs.example.test/sse?key=CANARY_QUERY"},
+    "multi": {
+      "type": "http",
+      "url": "https://multi.example.test/mcp",
+      "headers": {"Authorization": "Bearer CANARY_HEADER", "X-Team": "CANARY_HEADER"}
+    },
+    "tasks": {
+      "command": "tasks-mcp",
+      "args": ["--stdio"],
+      "env": {"TASKS_HOME": "${TASKS_HOME}", "TASKS_TOKEN": "CANARY_ENV"}
+    },
+    "api": {
+      "type": "http",
+      "url": "https://api.example.test/mcp",
+      "headers": {"Authorization": "Bearer CANARY_HEADER"}
+    },
+    "notes": {
+      "command": "/usr/local/CANARY_COMMAND/notes-mcp",
+      "args": ["--db", "postgres://notes:CANARY_USERINFO@db.example.test/notes"],
+      "env": {"NOTES_TOKEN": "CANARY_ENV"}
+    }
+  },
+  "projects": {
+    "@CWD@": {
+      "hasTrustDialogAccepted": true,
+      "history": [{"display": "CANARY_HISTORY"}],
+      "mcpServers": {"notes": {"command": "/opt/notes", "env": {"NOTES_TOKEN": "CANARY_ENV"}}}
+    },
+    "/nonexistent-d-mcp-fixture/project": {
+      "mcpServers": {"scratch": {"command": "CANARY_COMMAND", "args": ["CANARY_ARGS"]}}
+    }
+  }
+}
