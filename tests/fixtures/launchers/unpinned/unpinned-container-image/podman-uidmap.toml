@@ -1,0 +1,6 @@
+name = "podman-uidmap"
+
+[transport]
+type = "stdio"
+command = "podman"
+args = ["run", "--uidmap", "0:1:1", "evil"]

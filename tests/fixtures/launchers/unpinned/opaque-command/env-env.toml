@@ -1,0 +1,6 @@
+name = "env-env"
+
+[transport]
+type = "stdio"
+command = "env"
+args = ["FOO=1", "env", "npx", "mcp-server@1.2.3"]

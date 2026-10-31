@@ -1,0 +1,6 @@
+name = "npx-tag"
+
+[transport]
+type = "stdio"
+command = "npx"
+args = ["--tag", "x@1.0.0", "evil"]

@@ -6,7 +6,10 @@
 //!   `managed`, `drifted`, `unmanaged`, `vanished`, `pending` (a write in
 //!   flight) and `location-changed`. Project-scope entries are `unmanaged`
 //!   (d-mcp writes user scope only); Claude Code's local-scope entries are
-//!   `local`, by name only, and never hashed, compared or adopted.
+//!   `local`, by name only, and never hashed, compared or adopted. The
+//!   class is about ownership and content: the owned, unchanged entry of a
+//!   held (`pending-approval`, `risk-not-accepted`, ...) or revoked server
+//!   stays `managed`; `status` shows why and what the next sync does.
 //! - **`shadowed_in`** lists the narrower scopes that hold the same name and
 //!   win in their project: Claude Code's local scope, an approved or pending
 //!   `.mcp.json` entry, and a Codex project layer unless the project is
@@ -38,12 +41,10 @@ use crate::error::{Error, Result};
 use crate::hashkey::{self, HashKey};
 use crate::output::Report;
 use crate::redact::{EntryView, entry_view};
-use crate::resolver::resolve;
-use crate::source::{scan, source_specs};
+use crate::source::{ReadInputs, load_resolution};
 use crate::state::{self, Record, RecordState, State};
 use crate::store::{Environment, StorePaths};
 use crate::sync::{Desired, Operation, PlanInput, PlanStatus, desired_for, plan_harness};
-use crate::validate::validate;
 
 /// The class of an inventory entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -293,6 +294,8 @@ pub(crate) struct StoreView {
     pub(crate) state: State,
     /// The display-hash key, if the store has one.
     pub(crate) key: Option<HashKey>,
+    /// `lock.toml` and `approvals.toml`, for the shared resolution.
+    pub(crate) inputs: ReadInputs,
 }
 
 impl StoreView {
@@ -305,10 +308,12 @@ impl StoreView {
                 config: Config::default(),
                 state: State::default(),
                 key: None,
+                inputs: ReadInputs::default(),
             });
         }
         let config = paths.load_config()?;
         let state = state::load(paths)?;
+        let inputs = ReadInputs::load(paths)?;
         let key = match hashkey::load(paths) {
             Ok(key) => key,
             Err(error) => {
@@ -321,6 +326,7 @@ impl StoreView {
             config,
             state,
             key,
+            inputs,
         })
     }
 
@@ -577,12 +583,7 @@ pub fn build(
     let cwd = env.cwd.clone().ok_or(Error::CurrentDirUnavailable)?;
     let repository = repository_root(&cwd);
     let store = StoreView::load(paths, warnings)?;
-    let mut snapshots: Vec<_> = source_specs(paths, &store.config)
-        .iter()
-        .map(scan)
-        .collect();
-    validate(&mut snapshots, adapter::registry());
-    let resolution = resolve(&snapshots, &store.config.selections);
+    let resolution = load_resolution(paths, &store.config, &store.inputs);
     let mut notices = Vec::new();
     if !store.initialized {
         notices.push(format!(

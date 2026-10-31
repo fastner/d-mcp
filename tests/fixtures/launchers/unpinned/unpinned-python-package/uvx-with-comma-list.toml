@@ -1,0 +1,6 @@
+name = "uvx-with-comma-list"
+
+[transport]
+type = "stdio"
+command = "uvx"
+args = ["--with", "evil,dep==1.0", "tool==1.0"]

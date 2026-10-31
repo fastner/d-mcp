@@ -1,0 +1,6 @@
+name = "npx"
+
+[transport]
+type = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github@2025.4.8"]

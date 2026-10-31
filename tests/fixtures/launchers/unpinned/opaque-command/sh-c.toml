@@ -1,0 +1,6 @@
+name = "sh-c"
+
+[transport]
+type = "stdio"
+command = "sh"
+args = ["-c", "npx -y mcp-server@1.2.3"]

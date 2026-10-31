@@ -1,0 +1,6 @@
+name = "docker-dp"
+
+[transport]
+type = "stdio"
+command = "docker"
+args = ["run", "-dp", "127.0.0.1:3000:3000", "evil"]

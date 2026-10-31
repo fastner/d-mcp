@@ -1,0 +1,6 @@
+name = "local-script"
+
+[transport]
+type = "stdio"
+command = "node"
+args = ["./server.js"]

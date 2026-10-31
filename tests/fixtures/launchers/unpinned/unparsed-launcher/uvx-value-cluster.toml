@@ -1,0 +1,6 @@
+name = "uvx-value-cluster"
+
+[transport]
+type = "stdio"
+command = "uvx"
+args = ["-qp", "3.12", "evil"]

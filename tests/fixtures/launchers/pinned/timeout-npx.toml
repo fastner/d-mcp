@@ -1,0 +1,6 @@
+name = "timeout-npx"
+
+[transport]
+type = "stdio"
+command = "timeout"
+args = ["--signal=KILL", "30", "npx", "-y", "pkg@1.2.3"]

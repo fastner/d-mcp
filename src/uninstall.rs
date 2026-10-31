@@ -27,7 +27,10 @@
 //! inside the store, and registered sources live outside the store. A store
 //! root that is a symlink is purged only with `--follow-store-link`, after
 //! a warning naming the link target; the link and its target directory are
-//! left. The error precedence is 3, 4, 1, 0, as for `sync`.
+//! left. `sources/` (the Git clones and snapshots) is deleted with the
+//! store; a `local/` that is a Git repository blocks the purge
+//! (`local-is-git`) unless `--include-local-repo` is given. The error
+//! precedence is 3, 4, 1, 0, as for `sync`.
 
 mod purge;
 mod render;
@@ -42,6 +45,7 @@ use crate::config::Harness;
 use crate::error::{Error, Result};
 use crate::hashkey;
 use crate::output::Report;
+use crate::source::ReadInputs;
 use crate::state::{self, Record, RecordKey, ReplacedField, State};
 use crate::store::{Environment, StoreLock, StorePaths};
 use crate::sync::{
@@ -196,6 +200,8 @@ pub enum BlockReason {
     HarnessFailed,
     /// The store root is a symlink and `--follow-store-link` is missing.
     StoreRootSymlink,
+    /// `local/` is a Git repository and `--include-local-repo` is missing.
+    LocalIsGit,
 }
 
 impl BlockReason {
@@ -207,6 +213,7 @@ impl BlockReason {
             BlockReason::HarnessCliNotFound => "harness-cli-not-found",
             BlockReason::HarnessFailed => "harness-failed",
             BlockReason::StoreRootSymlink => "store-root-symlink",
+            BlockReason::LocalIsGit => "local-is-git",
         }
     }
 }
@@ -242,6 +249,8 @@ pub struct UninstallOptions {
     pub purge: bool,
     /// Purge the target of a symlinked store root.
     pub follow_store_link: bool,
+    /// Purge a `local/` that is a Git repository.
+    pub include_local_repo: bool,
 }
 
 fn entry(name: &str, action: Action, record: &Record, harness: Harness) -> EntryUninstall {
@@ -652,7 +661,10 @@ fn apply(
 /// # Errors
 ///
 /// Global errors (an uninitialized store, the lock, a corrupt
-/// `config.toml` or `state.toml`) abort without `data`. Everything else is
+/// `config.toml`, `state.toml`, `lock.toml` or `approvals.toml`) abort
+/// without `data`, in the preview and before anything is written in the
+/// apply: the scoped removals resolve through `lock.toml` and
+/// `approvals.toml`, so they are checked up front. Everything else is
 /// the aggregate error next to the report: harness errors, `sync` errors
 /// of the scoped removals, an error that stopped the apply after planning
 /// (such as a store write that failed), `uninstall-incomplete` and
@@ -672,6 +684,9 @@ pub fn uninstall(
     };
     let loaded = state::load(paths)?;
     paths.load_config()?;
+    // The scoped `sync` of the removals reads these; a corrupt one must
+    // stop the command before the releases are written.
+    ReadInputs::load(paths)?;
     if let Some(lock) = &lock {
         warnings.extend(hashkey::ensure_under_lock(paths, lock)?.map(|w| w.to_string()));
     }
@@ -682,11 +697,19 @@ pub fn uninstall(
             harnesses.push(plan_harness(*adapter, env, *scope, &mut state, preview));
         }
     }
-    let mut purge = PurgePlan::new(paths, options.purge, options.follow_store_link)?;
+    let mut purge = PurgePlan::new(
+        paths,
+        options.purge,
+        options.follow_store_link,
+        options.include_local_repo,
+    )?;
     for (reason, harness) in blocked_by(&harnesses) {
         purge.block(reason, harness);
     }
     if let Some(warning) = purge.symlink_warning(preview) {
+        warnings.push(warning);
+    }
+    if let Some(warning) = purge.local_repo_warning(preview) {
         warnings.push(warning);
     }
     let mut uninstall = Uninstall {

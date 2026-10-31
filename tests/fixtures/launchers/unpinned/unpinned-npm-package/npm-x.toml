@@ -1,0 +1,6 @@
+name = "npm-x"
+
+[transport]
+type = "stdio"
+command = "npm"
+args = ["x", "mcp-server@~1.2"]

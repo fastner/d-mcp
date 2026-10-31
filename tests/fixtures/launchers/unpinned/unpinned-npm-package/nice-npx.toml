@@ -1,0 +1,6 @@
+name = "nice-npx"
+
+[transport]
+type = "stdio"
+command = "nice"
+args = ["-n", "5", "npx", "evil"]

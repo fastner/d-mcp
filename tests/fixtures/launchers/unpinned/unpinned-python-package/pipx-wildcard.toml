@@ -1,0 +1,6 @@
+name = "pipx-wildcard"
+
+[transport]
+type = "stdio"
+command = "pipx"
+args = ["run", "--spec", "mcp-proxy==0.8.*", "mcp-proxy"]

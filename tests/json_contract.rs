@@ -905,3 +905,225 @@ fn uninstall_matches_the_reference() {
     check_all(&value);
     assert!(value["data"]["sync"].is_object());
 }
+
+#[test]
+fn git_source_documents_match_the_reference() {
+    let env = TestEnv::new().with_git();
+    env.init();
+    let remote = env.remote("personal");
+    remote.write("servers/github.toml", stdio("github", "npx"));
+    remote.commit("first");
+    let url = remote.url();
+    for args in [
+        vec!["--dry-run", "source", "add-git", url.as_str(), "--trusted"],
+        vec!["source", "add-git", url.as_str(), "--trusted"],
+    ] {
+        let (code, value, _) = env.json(&args);
+        assert_eq!(code, 0, "{value}");
+        check_success(&value, "### `source add-git`");
+        assert_shape(
+            &documented("### Source object"),
+            &value["data"]["source"],
+            "source",
+        );
+    }
+    let (code, value, _) = env.json(&["source", "list"]);
+    assert_eq!(code, 0);
+    check_success(&value, "### `source list`");
+    assert_eq!(value["data"]["sources"][0]["kind"], "git");
+    let (code, value, _) = env.json(&["source", "remove", "personal"]);
+    assert_eq!(code, 0);
+    check_success(&value, "### `source remove`");
+    let (code, value, _) = env.json(&["source", "add-git", "https://u:p@github.com/x.git"]);
+    assert_eq!(code, 1);
+    assert_shape(&documented("### Envelope"), &value, "envelope");
+    assert_eq!(value["error"]["code"], "source-url-invalid");
+}
+
+/// Checks the envelope of a run that failed with `code` but carries `data`
+/// (a blocked approval), and the `data` shape.
+fn check_with_error(value: &Value, heading: &str, code: &str) {
+    assert_shape(&documented("### Envelope"), value, "envelope");
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["code"], code);
+    assert_shape(&documented(heading), &value["data"], heading);
+}
+
+#[test]
+fn approval_documents_match_the_reference() {
+    let env = TestEnv::new().with_git();
+    env.init();
+    let remote = env.remote("personal");
+    remote.write(
+        "servers/github.toml",
+        "name = \"github\"\n[transport]\ntype = \"stdio\"\ncommand = \"npx\"\nargs = [\"-y\", \"gh-mcp@1.0.0\"]\n",
+    );
+    remote.write("servers/fetch.toml", stdio("fetch", "uvx"));
+    remote.write("servers/broken.toml", "name = ");
+    remote.commit("first");
+    let url = remote.url();
+    let (code, _, _) = env.json(&["source", "add-git", url.as_str(), "--id", "personal"]);
+    assert_eq!(code, 0);
+    let (code, value, _) = env.json(&["select", "github"]);
+    assert_eq!(code, 0);
+    check_success(&value, "### `select`");
+    let (code, value, _) = env.json(&["resolve"]);
+    assert_eq!(code, 0);
+    check_success(&value, "### `resolve`");
+    assert_eq!(value["data"]["servers"][0]["reason"], "pending-approval");
+
+    let (code, value, _) = env.json(&["--dry-run", "approve", "github"]);
+    assert_eq!(code, 0);
+    check_success(&value, "### `approve`");
+    let hash = value["data"]["definition_hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (code, value, _) = env.json(&["approve", "github", "--expect", &hash]);
+    assert_eq!(code, 0);
+    check_success(&value, "### `approve`");
+    let (code, value, _) = env.json(&["--dry-run", "approve", "broken"]);
+    assert_eq!(code, 1);
+    check_with_error(&value, "### `approve`", "approval-blocked");
+    assert!(value["data"]["problem"].is_object());
+    let (code, value, _) = env.json(&["--dry-run", "approve", "fetch"]);
+    assert_eq!(code, 1);
+    check_with_error(&value, "### `approve`", "approval-blocked");
+    let fetch = value["data"]["definition_hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    for args in [
+        vec!["--dry-run", "accept-risk", "fetch", "--reason", "ours"],
+        vec![
+            "accept-risk",
+            "fetch",
+            "--reason",
+            "ours",
+            "--expect",
+            &fetch,
+        ],
+    ] {
+        let (code, value, _) = env.json(&args);
+        assert_eq!(code, 0, "{value}");
+        check_success(&value, "### `accept-risk`");
+    }
+    for args in [
+        vec!["--dry-run", "source", "trust", "personal", "--on"],
+        vec!["source", "trust", "personal", "--on"],
+    ] {
+        let (code, value, _) = env.json(&args);
+        assert_eq!(code, 0);
+        check_success(&value, "### `source trust`");
+    }
+    let (code, value, _) = env.json(&["--dry-run", "approve", "--all-from", "personal"]);
+    assert_eq!(code, 1);
+    check_with_error(&value, "### `approve --all-from`", "approval-blocked");
+    let pin = remote.head();
+    let (code, value, _) = env.json(&["approve", "--all-from", "personal", "--expect", &pin]);
+    assert_eq!(code, 1);
+    check_with_error(&value, "### `approve --all-from`", "approval-blocked");
+    for args in [
+        vec!["--dry-run", "select", "--all-from", "personal"],
+        vec!["select", "--all-from", "personal"],
+    ] {
+        let (code, value, _) = env.json(&args);
+        assert_eq!(code, 0);
+        check_success(&value, "### `select --all-from`");
+    }
+    remote.write("servers/github.toml", stdio("github", "npx"));
+    remote.write("servers/linear.toml", stdio("linear", "npx"));
+    remote.remove("servers/broken.toml");
+    remote.commit("second");
+    for args in [
+        vec!["--dry-run", "source", "refresh", "personal"],
+        vec!["source", "refresh", "personal"],
+    ] {
+        let (code, value, _) = env.json(&args);
+        assert_eq!(code, 0, "{value}");
+        check_success(&value, "### `source refresh`");
+        assert_shape(
+            &documented("### Source object"),
+            &value["data"]["source"],
+            "source",
+        );
+        assert_eq!(value["data"]["changes"].as_array().unwrap().len(), 3);
+    }
+    let (code, value, _) = env.json(&["resolve"]);
+    assert_eq!(code, 0);
+    check_success(&value, "### `resolve`");
+    for args in [
+        vec!["--dry-run", "revoke", "fetch"],
+        vec!["revoke", "fetch"],
+    ] {
+        let (code, value, _) = env.json(&args);
+        assert_eq!(code, 0);
+        check_success(&value, "### `revoke`");
+    }
+    let (code, value, _) = env.json(&["resolve"]);
+    assert_eq!(code, 0);
+    check_success(&value, "### `resolve`");
+    for (args, code) in [
+        (vec!["approve", "github"], "expect-required"),
+        (
+            vec![
+                "accept-risk",
+                "fetch",
+                "--reason",
+                "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            ],
+            "reason-invalid",
+        ),
+        (
+            vec!["approve", "nobody", "--expect", "x"],
+            "approval-not-needed",
+        ),
+    ] {
+        let (_, value, _) = env.json(&args);
+        assert_shape(&documented("### Envelope"), &value, "envelope");
+        assert_eq!(value["error"]["code"], code);
+    }
+    // A removed Git source leaves orphaned approvals: a documented problem
+    // in `resolve` and an `approvals` warning in `doctor`.
+    let (code, value, _) = env.json(&["source", "remove", "personal"]);
+    assert_eq!(code, 0);
+    check_success(&value, "### `source remove`");
+    let (code, value, _) = env.json(&["resolve"]);
+    assert_eq!(code, 0);
+    check_success(&value, "### `resolve`");
+    let orphaned: Vec<&Value> = value["problems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|problem| problem["code"] == "orphaned-approval")
+        .collect();
+    // `revoke fetch` dropped its approval and risk, but its revoked marker
+    // is orphaned too (and still blocks); `github`'s approval stays.
+    assert_eq!(orphaned.len(), 2, "{value:#}");
+    assert_eq!(orphaned[0]["server"], "fetch");
+    assert!(
+        orphaned[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("revoked marker")
+    );
+    assert_eq!(orphaned[1]["server"], "github");
+    assert!(REFERENCE.contains("| `orphaned-approval` | `server`, `source` |"));
+    let (code, value, _) = env.json(&["doctor"]);
+    assert_eq!(code, 0, "{value:#}");
+    check_success(&value, "### `doctor`");
+    let approvals: Vec<&Value> = value["data"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|check| check["check"] == "approvals")
+        .collect();
+    assert!(
+        approvals
+            .iter()
+            .all(|check| check["code"] == "orphaned-approval"),
+        "{approvals:?}"
+    );
+    assert_eq!(approvals.len(), 2, "{approvals:?}");
+}

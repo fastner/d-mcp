@@ -1,0 +1,6 @@
+name = "pipx-run"
+
+[transport]
+type = "stdio"
+command = "pipx"
+args = ["run", "mcp-proxy"]

@@ -1,0 +1,6 @@
+name = "env-after-double-dash"
+
+[transport]
+type = "stdio"
+command = "env"
+args = ["--", "LD_PRELOAD=/tmp/hook.so", "npx", "-y", "pkg@1.2.3"]

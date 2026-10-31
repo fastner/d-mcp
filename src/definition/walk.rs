@@ -69,7 +69,7 @@ fn find<'e>(entries: &'e [Entry], key: &str) -> Option<&'e Entry> {
     entries.iter().find(|entry| entry.key == key)
 }
 
-fn secret_rule(finding: SecretFinding) -> Rule {
+pub(crate) fn secret_rule(finding: SecretFinding) -> Rule {
     match finding {
         SecretFinding::Prefix => Rule::SecretPrefix,
         SecretFinding::Jwt => Rule::SecretJwt,

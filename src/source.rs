@@ -1,6 +1,13 @@
 //! Source scanning: reads `servers/*.toml` of a source root into a
 //! [`SourceSnapshot`] for the resolver.
 //!
+//! A directory source is scanned at its root. A Git source is scanned at its
+//! snapshot, `<store>/sources/<id>/snapshot` (see [`snapshot`]), and only
+//! when the snapshot's stamp equals the pin in `lock.toml`; a missing
+//! snapshot, a missing pin or a stamp that differs makes it unavailable. No
+//! `git` runs here. [`load_resolution`] is the one pipeline every command
+//! resolves through.
+//!
 //! Only regular files are accepted; symlinks are not followed. Files over
 //! 64 KiB are rejected. Hidden files, non-`.toml` files and subdirectories are
 //! ignored and reported as notices. The conflict key is the file stem when it
@@ -8,14 +15,26 @@
 //! `foo`; a stem that breaks the name rule is a per-file problem and shadows
 //! nothing.
 
+pub mod git_source;
+mod load;
+pub mod refresh;
+pub mod snapshot;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, LOCAL_SOURCE_ID, SourceKind};
+use crate::config::{Config, LOCAL_SOURCE_ID, SourceKind, SourceOrigin};
 use crate::definition::{OverrideSites, is_valid_name, parse_definition_with_sites};
+use crate::git::CommitId;
+use crate::lockfile::LockFile;
 use crate::resolver::{FileEntry, FileProblem, Notice, SourceSnapshot};
 use crate::rule::Rule;
 use crate::store::{CappedReadError, StorePaths, read_regular_capped};
+
+pub use load::{
+    ReadInputs, load_resolution, load_snapshots, orphaned_approvals, prepare_snapshots,
+    resolve_snapshots,
+};
 
 /// Maximum size of a definition file.
 pub const MAX_DEFINITION_BYTES: u64 = 64 * 1024;
@@ -27,12 +46,28 @@ pub struct SourceSpec {
     pub id: String,
     /// The kind.
     pub kind: SourceKind,
-    /// The source root; definitions live in `<root>/servers/`.
+    /// The scanned root; definitions live in `<root>/servers/`. For a Git
+    /// source this is its snapshot, `<store>/sources/<id>/snapshot`.
     pub root: PathBuf,
     /// The priority.
     pub priority: u32,
     /// Whether this is the implicit built-in `local` source.
     pub builtin: bool,
+    /// The Git fields and the pin of a Git source.
+    pub git: Option<GitSpec>,
+}
+
+/// The Git side of a [`SourceSpec`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitSpec {
+    /// The remote URL.
+    pub url: String,
+    /// The followed ref.
+    pub reference: String,
+    /// Whether the source is trusted.
+    pub trusted: bool,
+    /// The pinned commit from `lock.toml`; `None` when none is recorded.
+    pub pin: Option<CommitId>,
 }
 
 impl SourceSpec {
@@ -41,35 +76,75 @@ impl SourceSpec {
     pub fn servers(&self) -> PathBuf {
         self.root.join("servers")
     }
+
+    /// The location shown to the user: the root of a directory source, or
+    /// `<store>/sources/<id>` of a Git source.
+    #[must_use]
+    pub fn location(&self) -> &Path {
+        match &self.git {
+            Some(_) => self.root.parent().unwrap_or(&self.root),
+            None => &self.root,
+        }
+    }
+
+    /// Whether a Git source's snapshot is stamped with its pin; always true
+    /// for a directory source.
+    fn snapshot_current(&self) -> bool {
+        match &self.git {
+            None => true,
+            Some(git) => git
+                .pin
+                .as_ref()
+                .is_some_and(|pin| snapshot::stamp_matches(&self.root, pin)),
+        }
+    }
 }
 
 /// All sources of a store: the built-in `local` source (priority 0, root
-/// `<store>/local`) followed by the user sources from `config.toml`.
+/// `<store>/local`) followed by the user sources from `config.toml`, Git
+/// sources with their pin from `lock`.
 #[must_use]
-pub fn source_specs(paths: &StorePaths, config: &Config) -> Vec<SourceSpec> {
+pub fn source_specs(paths: &StorePaths, config: &Config, lock: &LockFile) -> Vec<SourceSpec> {
     let mut specs = vec![SourceSpec {
         id: LOCAL_SOURCE_ID.to_owned(),
         kind: SourceKind::Directory,
         root: paths.local_root.clone(),
         priority: 0,
         builtin: true,
+        git: None,
     }];
-    specs.extend(config.sources.iter().map(|source| SourceSpec {
-        id: source.id.clone(),
-        kind: source.kind,
-        root: source.path.clone(),
-        priority: source.priority,
-        builtin: false,
+    specs.extend(config.sources.iter().map(|source| {
+        let (root, git) = match &source.origin {
+            SourceOrigin::Directory { path } => (path.clone(), None),
+            SourceOrigin::Git(git) => (
+                paths.git_source(&source.id).join(git_source::SNAPSHOT_DIR),
+                Some(GitSpec {
+                    url: git.url.clone(),
+                    reference: git.reference.clone(),
+                    trusted: git.trusted,
+                    pin: lock.pin(&source.id).cloned(),
+                }),
+            ),
+        };
+        SourceSpec {
+            id: source.id.clone(),
+            kind: source.kind(),
+            root,
+            priority: source.priority,
+            builtin: false,
+            git,
+        }
     }));
     specs
 }
 
 /// Whether the source root and its `servers/` directory are readable
-/// directories.
+/// directories and, for a Git source, the snapshot matches the pin.
 #[must_use]
 pub fn is_available(spec: &SourceSpec) -> bool {
     fs::metadata(&spec.root).is_ok_and(|metadata| metadata.is_dir())
         && fs::read_dir(spec.servers()).is_ok()
+        && spec.snapshot_current()
 }
 
 /// Scans a source. An unavailable source yields an empty snapshot with
@@ -82,8 +157,10 @@ pub fn scan(spec: &SourceSpec) -> SourceSnapshot {
         available: false,
         files: Vec::new(),
         notices: Vec::new(),
+        revoked: std::collections::BTreeSet::new(),
     };
-    if !fs::metadata(&spec.root).is_ok_and(|metadata| metadata.is_dir()) {
+    if !fs::metadata(&spec.root).is_ok_and(|metadata| metadata.is_dir()) || !spec.snapshot_current()
+    {
         return snapshot;
     }
     let servers = spec.servers();
@@ -108,6 +185,8 @@ pub fn scan(spec: &SourceSpec) -> SourceSnapshot {
                 key: None,
                 outcome: Err(FileProblem::file(Rule::Unreadable)),
                 override_sites: OverrideSites::default(),
+                findings: Vec::new(),
+                gate: None,
             });
             continue;
         };
@@ -148,6 +227,8 @@ pub fn scan(spec: &SourceSpec) -> SourceSnapshot {
             key,
             outcome,
             override_sites,
+            findings: Vec::new(),
+            gate: None,
         });
     }
     snapshot
@@ -200,6 +281,7 @@ mod tests {
             root: root.to_path_buf(),
             priority: 1,
             builtin: false,
+            git: None,
         }
     }
 
@@ -355,15 +437,30 @@ mod tests {
     fn specs_start_with_the_builtin_local_source() {
         let paths = StorePaths::new(PathBuf::from("/store"));
         let config = Config {
-            sources: vec![crate::config::SourceEntry {
-                id: "team".to_owned(),
-                kind: SourceKind::Directory,
-                path: PathBuf::from("/srv/team"),
-                priority: 3,
-            }],
+            sources: vec![
+                crate::config::SourceEntry {
+                    id: "team".to_owned(),
+                    priority: 3,
+                    origin: SourceOrigin::Directory {
+                        path: PathBuf::from("/srv/team"),
+                    },
+                },
+                crate::config::SourceEntry {
+                    id: "personal".to_owned(),
+                    priority: 4,
+                    origin: SourceOrigin::Git(crate::config::GitOrigin {
+                        url: "/srv/git/personal.git".to_owned(),
+                        reference: "main".to_owned(),
+                        trusted: false,
+                    }),
+                },
+            ],
             selections: Vec::new(),
         };
-        let specs = source_specs(&paths, &config);
+        let mut lock = LockFile::default();
+        let pin = CommitId::parse(&"c".repeat(40)).unwrap();
+        lock.set_pin("personal", pin.clone(), "refs/heads/main".to_owned());
+        let specs = source_specs(&paths, &config, &lock);
         assert_eq!(specs[0].id, "local");
         assert_eq!(specs[0].priority, 0);
         assert!(specs[0].builtin);
@@ -371,5 +468,49 @@ mod tests {
         assert_eq!(specs[0].servers(), PathBuf::from("/store/local/servers"));
         assert_eq!(specs[1].id, "team");
         assert!(!specs[1].builtin);
+        assert_eq!(specs[1].location(), Path::new("/srv/team"));
+        assert_eq!(specs[2].kind, SourceKind::Git);
+        assert_eq!(
+            specs[2].root,
+            PathBuf::from("/store/sources/personal/snapshot")
+        );
+        assert_eq!(specs[2].location(), Path::new("/store/sources/personal"));
+        assert_eq!(specs[2].git.as_ref().unwrap().pin, Some(pin));
+    }
+
+    #[test]
+    fn git_snapshots_are_read_only_when_stamped_with_the_pin() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("snapshot");
+        fs::create_dir_all(root.join("servers")).unwrap();
+        fs::write(root.join("servers/github.toml"), VALID).unwrap();
+        let pin = CommitId::parse(&"d".repeat(40)).unwrap();
+        let mut spec = SourceSpec {
+            kind: SourceKind::Git,
+            git: Some(GitSpec {
+                url: "/srv/x.git".to_owned(),
+                reference: "main".to_owned(),
+                trusted: false,
+                pin: None,
+            }),
+            ..spec(&root)
+        };
+        // No pin recorded.
+        assert!(!scan(&spec).available);
+        assert!(!is_available(&spec));
+        spec.git.as_mut().unwrap().pin = Some(pin.clone());
+        // No stamp.
+        assert!(!scan(&spec).available);
+        fs::write(
+            root.join(snapshot::STAMP_FILE),
+            format!("{}\n", "e".repeat(40)),
+        )
+        .unwrap();
+        assert!(!scan(&spec).available);
+        fs::write(root.join(snapshot::STAMP_FILE), format!("{pin}\n")).unwrap();
+        let scanned = scan(&spec);
+        assert!(scanned.available);
+        assert!(is_available(&spec));
+        assert_eq!(offered_names(&scanned), ["github"]);
     }
 }

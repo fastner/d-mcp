@@ -1,0 +1,6 @@
+name = "pnpm-dlx"
+
+[transport]
+type = "stdio"
+command = "pnpm"
+args = ["dlx", "mcp-server@1.2.3"]

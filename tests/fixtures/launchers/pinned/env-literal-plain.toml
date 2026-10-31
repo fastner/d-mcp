@@ -1,0 +1,9 @@
+name = "env-literal-plain"
+
+[transport]
+type = "stdio"
+command = "npx"
+args = ["-y", "pkg@1.2.3"]
+
+[env]
+LOG_LEVEL = { value = "debug" }

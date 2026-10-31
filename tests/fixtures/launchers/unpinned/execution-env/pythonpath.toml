@@ -1,0 +1,9 @@
+name = "pythonpath"
+
+[transport]
+type = "stdio"
+command = "uvx"
+args = ["pkg==1.0"]
+
+[env]
+PYTHONPATH = { value = "/opt/hook" }

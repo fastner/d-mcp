@@ -940,7 +940,11 @@ fn dry_runs_leave_every_file_byte_identical() {
     assert_eq!(value["data"]["dry_run"], true);
     assert_eq!(entry(&value, "dmcp-new")["outcome"], "planned");
     let (_, text, _) = env.text(&["--dry-run", "sync", "--take-over", "github"]);
-    assert!(text.ends_with("Dry run: nothing was written.\n"), "{text}");
+    // The unpinned `npx` of the local definitions adds audit warnings below.
+    assert!(
+        text.contains("Dry run: nothing was written.\nproblems:\n  audit-finding: "),
+        "{text}"
+    );
     assert_eq!(snapshot(env.root()), before);
     // With a record in place, `unmanage --dry-run` only reports.
     sync_json(&env, &["--take-over", "github"]);

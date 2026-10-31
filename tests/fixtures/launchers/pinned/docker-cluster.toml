@@ -1,0 +1,6 @@
+name = "docker-cluster"
+
+[transport]
+type = "stdio"
+command = "docker"
+args = ["run", "-it", "--rm", "--publish=127.0.0.1:3000:3000", "mcp/fetch:1.2"]

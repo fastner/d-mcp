@@ -1,0 +1,6 @@
+name = "docker-run"
+
+[transport]
+type = "stdio"
+command = "docker"
+args = ["run", "-i", "--rm", "-e", "GITHUB_TOKEN", "ghcr.io/github/github-mcp-server:0.4.0"]

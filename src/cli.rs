@@ -1,12 +1,18 @@
 //! Command-line definitions, dispatch and rendering.
 //!
-//! Mutating commands (`init`, `source add`, `source remove`, `select`,
-//! `unselect`, `sync`, `unmanage`, `adopt --apply`, `uninstall --apply`)
-//! take the store lock, then read `config.toml`, then write; each creates a
-//! missing display-hash key (`.hash-key`) under the lock. Read-only
+//! Mutating commands (`init`, `source add`, `source add-git`, `source
+//! refresh`, `source trust`, `source remove`, `select`, `unselect`,
+//! `approve`, `accept-risk`, `revoke`, `sync`, `unmanage`, `adopt --apply`,
+//! `uninstall --apply`) take the store lock, then read `config.toml`, then
+//! write; each creates a missing display-hash key (`.hash-key`) under the
+//! lock. `source add-git` clones and `source refresh` fetches before they
+//! take the lock. Read-only
 //! commands (`resolve`, `source list`, `inventory`, `status`, `doctor`,
 //! `adopt` and `uninstall` without `--apply`) and every `--dry-run` take no
-//! lock and write nothing.
+//! lock and write nothing in the store.
+
+mod approval;
+mod source_git;
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -16,24 +22,26 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 
-use crate::adapter::registry;
 use crate::adopt::{AdoptOptions, EntryRef, Expect, Place, VarChoice, adopt};
 use crate::config::{
-    Config, Harness, HarnessSet, LOCAL_SOURCE_ID, Selection, SourceEntry, SourceKind,
+    Config, Harness, HarnessSet, LOCAL_SOURCE_ID, Selection, SourceEntry, SourceOrigin,
 };
 use crate::definition::is_valid_name;
 use crate::doctor::{DoctorOptions, doctor};
 use crate::error::{Error, Result};
 use crate::hashkey;
 use crate::inventory::{InventoryOptions, inventory};
+use crate::lockfile;
 use crate::output::{Report, Ui};
-use crate::resolver::{ServerResolution, resolve};
-use crate::source::{SourceSpec, is_available, offered_names, scan, source_specs};
+use crate::resolver::ServerResolution;
+use crate::source::git_source;
+use crate::source::{
+    ReadInputs, SourceSpec, is_available, load_resolution, offered_names, scan, source_specs,
+};
 use crate::status::{StatusOptions, status};
-use crate::store::{self, Environment, StoreLock, StorePaths};
+use crate::store::{self, Environment, StoreLock, StorePaths, StoreWarning};
 use crate::sync::{SyncOptions, sync, unmanage};
 use crate::uninstall::{UninstallOptions, uninstall};
-use crate::validate::validate;
 
 /// Manage MCP server definitions once and sync them into every coding-agent
 /// harness.
@@ -45,7 +53,11 @@ use crate::validate::validate;
     long_about = None,
     arg_required_else_help = true,
     after_help = "Examples:\n  d-mcp init\n  d-mcp source add ~/team-mcp --id team --priority 10\n  \
-                  d-mcp select github --harness claude\n  d-mcp resolve --json\n  \
+                  d-mcp source add-git git@github.com:me/mcp.git --id personal --trusted\n  \
+                  d-mcp source refresh personal --dry-run\n  \
+                  d-mcp approve github --expect <definition_hash>\n  \
+                  d-mcp select github --harness claude\n  d-mcp select --all-from personal\n  \
+                  d-mcp resolve --json\n  \
                   d-mcp inventory\n  d-mcp adopt claude:user:github codex:user:github\n  \
                   d-mcp sync --dry-run\n  d-mcp status --auth\n  d-mcp doctor\n  \
                   d-mcp unmanage github --harness codex\n  d-mcp uninstall"
@@ -80,11 +92,59 @@ pub enum Command {
     /// Select a server for harnesses (all harnesses by default).
     Select {
         /// The server name.
-        server: String,
+        #[arg(required_unless_present = "all_from")]
+        server: Option<String>,
         /// Target harness; repeat for several. Without it, `all` is stored,
         /// which includes future adapters.
         #[arg(long = "harness", value_enum, value_name = "HARNESS")]
         harnesses: Vec<HarnessArg>,
+        /// Select every server this source offers that is not selected yet,
+        /// for all harnesses; existing selections are kept as they are.
+        #[arg(long, value_name = "SOURCE", conflicts_with_all = ["server", "harnesses"])]
+        all_from: Option<String>,
+    },
+    /// Approve a server's definition from a Git source, bound to its
+    /// `definition_hash`; `--dry-run` shows the approval view and the hash
+    /// to pass.
+    Approve {
+        /// The server name.
+        #[arg(required_unless_present = "all_from")]
+        server: Option<String>,
+        /// The Git source; by default the source of the winning definition.
+        #[arg(long, value_name = "SOURCE", conflicts_with = "all_from")]
+        source: Option<String>,
+        /// Approve every clean server of a trusted Git source; `--expect`
+        /// then takes its pinned commit.
+        #[arg(long, value_name = "SOURCE")]
+        all_from: Option<String>,
+        /// The `definition_hash` from the preview (the pinned commit with
+        /// `--all-from`); required without `--dry-run`.
+        #[arg(long, value_name = "HASH")]
+        expect: Option<String>,
+    },
+    /// Accept the audit findings of a server's definition from a Git
+    /// source, bound to its `definition_hash` and the findings; does not
+    /// approve it.
+    AcceptRisk {
+        /// The server name.
+        server: String,
+        /// Why the risk is acceptable (at most 500 characters, no secrets;
+        /// it is stored, never shown).
+        #[arg(long, value_name = "TEXT")]
+        reason: String,
+        /// The `definition_hash` from the preview; required without
+        /// `--dry-run`.
+        #[arg(long, value_name = "HASH")]
+        expect: Option<String>,
+    },
+    /// Revoke the approvals of a server from a Git source; the next sync
+    /// removes its managed entries, and no lower definition takes its place.
+    Revoke {
+        /// The server name.
+        server: String,
+        /// The Git source; by default the source of the winning definition.
+        #[arg(long, value_name = "SOURCE")]
+        source: Option<String>,
     },
     /// Remove a selection.
     Unselect {
@@ -208,13 +268,18 @@ pub enum Command {
         #[arg(long)]
         apply: bool,
         /// Afterwards delete the known store files (config, state, `local/`,
-        /// `.hash-key`, ...) inside the store root; this cannot be undone.
+        /// `sources/`, `.hash-key`, ...) inside the store root; this cannot
+        /// be undone.
         #[arg(long)]
         purge: bool,
         /// With `--purge` on a store root that is a symlink: delete the
         /// store files inside its target.
         #[arg(long, requires = "purge")]
         follow_store_link: bool,
+        /// With `--purge` when `local/` is a Git repository: delete it too,
+        /// unpushed work included.
+        #[arg(long, requires = "purge")]
+        include_local_repo: bool,
     },
     /// Stop managing a server's harness entries and drop those harnesses
     /// from its selection. The entries are left as they are.
@@ -261,9 +326,58 @@ pub enum SourceCommand {
         #[arg(long)]
         priority: u32,
     },
+    /// Register a Git repository with `servers/<name>.toml` files: clone it
+    /// into the store, pin a commit and snapshot its definitions.
+    AddGit {
+        /// The remote: `https://...`, `ssh://...`, `git@host:org/repo.git`,
+        /// `file:///...` or an absolute path; no password, query or fragment.
+        url: String,
+        /// The source id (neutral name rule); derived from the URL's last
+        /// path segment by default.
+        #[arg(long)]
+        id: Option<String>,
+        /// The branch or tag to follow; the remote's default branch by
+        /// default.
+        #[arg(long = "ref", value_name = "REF")]
+        reference: Option<String>,
+        /// Pin this commit (40 or 64 hex characters) instead of the head of
+        /// the ref; it must be reachable from the ref.
+        #[arg(long, value_name = "SHA")]
+        commit: Option<String>,
+        /// Priority, at least 1 and unique; one above the highest user
+        /// source by default.
+        #[arg(long)]
+        priority: Option<u32>,
+        /// Trust the source, which allows `approve --all-from`.
+        #[arg(long)]
+        trusted: bool,
+    },
+    /// Fetch a Git source's ref, show the change set, and move the pin
+    /// (a moved pin never approves anything).
+    Refresh {
+        /// The source id.
+        id: String,
+        /// Accept a rewritten ref (force-push or moved tag) or a missing pin.
+        #[arg(long)]
+        allow_rewrite: bool,
+    },
+    /// Mark a Git source trusted or untrusted; trust only allows `approve
+    /// --all-from`.
+    #[command(group(clap::ArgGroup::new("state").required(true).args(["on", "off"])))]
+    Trust {
+        /// The source id.
+        id: String,
+        /// Trust the source.
+        #[arg(long)]
+        on: bool,
+        /// Stop trusting the source.
+        #[arg(long)]
+        off: bool,
+    },
     /// List the sources, including the built-in `local` source (read-only).
     List,
-    /// Unregister a source. The built-in `local` source cannot be removed.
+    /// Unregister a source; a Git source's clone, snapshot and pin are
+    /// deleted. The built-in `local` source cannot be removed.
     Remove {
         /// The source id.
         id: String,
@@ -403,12 +517,14 @@ fn dispatch(cli: &Cli, env: &Environment, ui: &mut Ui<'_>) -> Result<(Report, Op
             apply,
             purge,
             follow_store_link,
+            include_local_repo,
         } => {
             let options = UninstallOptions {
                 apply: *apply,
                 dry_run,
                 purge: *purge,
                 follow_store_link: *follow_store_link,
+                include_local_repo: *include_local_repo,
             };
             let mut warnings = Vec::new();
             let result = uninstall(&paths, env, &options, &mut warnings);
@@ -442,10 +558,79 @@ fn dispatch(cli: &Cli, env: &Environment, ui: &mut Ui<'_>) -> Result<(Report, Op
             SourceCommand::Add { path, id, priority } => {
                 source_add(&paths, env, ui, path, id, *priority, dry_run)
             }
+            SourceCommand::AddGit {
+                url,
+                id,
+                reference,
+                commit,
+                priority,
+                trusted,
+            } => source_git::add_git(
+                &paths,
+                env,
+                ui,
+                &git_source::AddGitOptions {
+                    url,
+                    id: id.as_deref(),
+                    reference: reference.as_deref(),
+                    commit: commit.as_deref(),
+                    priority: *priority,
+                    trusted: *trusted,
+                    dry_run,
+                },
+            ),
+            SourceCommand::Refresh { id, allow_rewrite } => source_git::refresh(
+                &paths,
+                env,
+                ui,
+                &crate::source::refresh::RefreshOptions {
+                    id,
+                    allow_rewrite: *allow_rewrite,
+                    dry_run,
+                },
+            ),
+            SourceCommand::Trust { id, on, off: _ } => {
+                approval::trust(&paths, ui, id, *on, dry_run)
+            }
             SourceCommand::List => source_list(&paths),
             SourceCommand::Remove { id } => source_remove(&paths, ui, id, dry_run),
         },
-        Command::Select { server, harnesses } => select(&paths, ui, server, harnesses, dry_run),
+        Command::Select {
+            server,
+            harnesses,
+            all_from,
+        } => match (all_from, server) {
+            (Some(id), _) => approval::select_all_from(&paths, ui, id, dry_run),
+            (None, Some(server)) => select(&paths, ui, server, harnesses, dry_run),
+            (None, None) => unreachable!("clap requires a server or --all-from"),
+        },
+        Command::Approve {
+            server,
+            source,
+            all_from,
+            expect,
+        } => {
+            return match (all_from, server) {
+                (Some(id), _) => approval::approve_all(&paths, ui, id, expect.as_deref(), dry_run),
+                (None, Some(server)) => approval::approve(
+                    &paths,
+                    ui,
+                    server,
+                    source.as_deref(),
+                    expect.as_deref(),
+                    dry_run,
+                ),
+                (None, None) => unreachable!("clap requires a server or --all-from"),
+            };
+        }
+        Command::AcceptRisk {
+            server,
+            reason,
+            expect,
+        } => approval::accept_risk(&paths, ui, server, reason, expect.as_deref(), dry_run),
+        Command::Revoke { server, source } => {
+            approval::revoke(&paths, ui, server, source.as_deref(), dry_run)
+        }
         Command::Unselect { server } => unselect(&paths, ui, server, dry_run),
         Command::Resolve => resolve_command(&paths),
     }?;
@@ -462,6 +647,25 @@ fn mutate<T>(
     dry_run: bool,
     change: impl FnOnce(&mut Config) -> Result<T>,
 ) -> Result<T> {
+    mutate_then(
+        paths,
+        ui,
+        dry_run,
+        |config| change(config).map(|value| (value, ())),
+        |_, ()| Ok(Vec::new()),
+    )
+}
+
+/// [`mutate`] with a second step that runs under the lock after
+/// `config.toml` was written (never in a dry run), with the second value
+/// `change` returned.
+fn mutate_then<T, U>(
+    paths: &StorePaths,
+    ui: &mut Ui<'_>,
+    dry_run: bool,
+    change: impl FnOnce(&mut Config) -> Result<(T, U)>,
+    after: impl FnOnce(&StoreLock, U) -> Result<Vec<StoreWarning>>,
+) -> Result<T> {
     paths.require_initialized()?;
     let lock = if dry_run {
         None
@@ -475,11 +679,14 @@ fn mutate<T>(
     {
         ui.warn(&warning.to_string());
     }
-    let result = change(&mut config)?;
-    if let Some(lock) = &lock
-        && let Some(warning) = paths.save_config(lock, &config)?
-    {
-        ui.warn(&warning.to_string());
+    let (result, rest) = change(&mut config)?;
+    if let Some(lock) = &lock {
+        if let Some(warning) = paths.save_config(lock, &config)? {
+            ui.warn(&warning.to_string());
+        }
+        for warning in after(lock, rest)? {
+            ui.warn(&warning.to_string());
+        }
     }
     Ok(result)
 }
@@ -493,24 +700,37 @@ fn prefix(dry_run: bool) -> &'static str {
 }
 
 fn source_json(spec: &SourceSpec) -> Value {
+    source_json_with(spec, is_available(spec))
+}
+
+/// The source object; `url`, `ref`, `commit` and `trusted` are `null` for a
+/// directory source.
+fn source_json_with(spec: &SourceSpec, available: bool) -> Value {
+    let git = spec.git.as_ref();
     json!({
         "id": spec.id,
         "kind": spec.kind.as_str(),
-        "path": display(&spec.root),
+        "path": display(spec.location()),
         "priority": spec.priority,
         "builtin": spec.builtin,
-        "available": is_available(spec),
+        "available": available,
+        "url": git.map(|git| git.url.as_str()),
+        "ref": git.map(|git| git.reference.as_str()),
+        "commit": git.and_then(|git| git.pin.as_ref().map(|pin| pin.as_str())),
+        "trusted": git.map(|git| git.trusted),
     })
 }
 
-fn user_spec(entry: &SourceEntry) -> SourceSpec {
-    SourceSpec {
-        id: entry.id.clone(),
-        kind: entry.kind,
-        root: entry.path.clone(),
-        priority: entry.priority,
-        builtin: false,
-    }
+/// The spec of a registered user source.
+fn user_spec(paths: &StorePaths, entry: &SourceEntry, pins: &lockfile::LockFile) -> SourceSpec {
+    let config = Config {
+        sources: vec![entry.clone()],
+        selections: Vec::new(),
+    };
+    source_specs(paths, &config, pins)
+        .into_iter()
+        .find(|spec| spec.id == entry.id)
+        .unwrap_or_else(|| unreachable!("source_specs lists every user source"))
 }
 
 fn init(paths: &StorePaths, ui: &mut Ui<'_>, dry_run: bool) -> Result<Report> {
@@ -574,9 +794,8 @@ fn source_add(
     }
     let entry = SourceEntry {
         id: id.to_owned(),
-        kind: SourceKind::Directory,
-        path: canonical,
         priority,
+        origin: SourceOrigin::Directory { path: canonical },
     };
     let added = entry.clone();
     mutate(paths, ui, dry_run, move |config| {
@@ -589,16 +808,19 @@ fn source_add(
                 id: other.id.clone(),
             });
         }
-        if let Some(other) = config.sources.iter().find(|s| s.path == entry.path) {
+        if let (SourceOrigin::Directory { path }, Some(other)) = (
+            &entry.origin,
+            config.sources.iter().find(|s| s.path() == entry.path()),
+        ) {
             return Err(Error::SourcePathRegistered {
-                path: entry.path,
+                path: path.clone(),
                 id: other.id.clone(),
             });
         }
         config.sources.push(entry);
         Ok(())
     })?;
-    let spec = user_spec(&added);
+    let spec = user_spec(paths, &added, &lockfile::LockFile::default());
     if !is_available(&spec) {
         ui.warn(&format!(
             "source `{}` has no readable servers/ directory; it is unavailable until one exists",
@@ -611,7 +833,7 @@ fn source_add(
         if dry_run { "added" } else { "Added" },
         added.id,
         added.priority,
-        display(&added.path)
+        display(spec.location())
     );
     Ok(Report::new(
         json!({ "source": source_json(&spec), "dry_run": dry_run }),
@@ -619,15 +841,11 @@ fn source_add(
     ))
 }
 
-fn sorted_specs(paths: &StorePaths, config: &Config) -> Vec<SourceSpec> {
-    let mut specs = source_specs(paths, config);
-    specs.sort_by_key(|spec| std::cmp::Reverse(spec.priority));
-    specs
-}
-
 fn source_list(paths: &StorePaths) -> Result<Report> {
     let config = paths.load_config()?;
-    let specs = sorted_specs(paths, &config);
+    let pins = lockfile::load(paths)?;
+    let mut specs = source_specs(paths, &config, &pins);
+    specs.sort_by_key(|spec| std::cmp::Reverse(spec.priority));
     let sources: Vec<Value> = specs.iter().map(source_json).collect();
     let mut text = String::from("ID\tPRIORITY\tKIND\tSTATUS\tPATH");
     for source in &sources {
@@ -651,37 +869,53 @@ fn source_remove(paths: &StorePaths, ui: &mut Ui<'_>, id: &str, dry_run: bool) -
     if id == LOCAL_SOURCE_ID {
         return Err(Error::SourceIdReserved);
     }
-    let (removed, lost) = mutate(paths, ui, dry_run, |config| {
-        let Some(position) = config.sources.iter().position(|s| s.id == id) else {
-            return Err(Error::SourceNotFound { id: id.to_owned() });
-        };
-        let removed = config.sources.remove(position);
-        let removed_names: BTreeSet<String> = offered_names(&scan(&user_spec(&removed)))
-            .into_iter()
-            .collect();
-        let remaining: BTreeSet<String> = source_specs(paths, config)
-            .iter()
-            .flat_map(|spec| offered_names(&scan(spec)))
-            .collect();
-        let lost: Vec<String> = config
-            .selections
-            .iter()
-            .map(|selection| selection.server.clone())
-            .filter(|server| removed_names.contains(server) && !remaining.contains(server))
-            .collect();
-        Ok((removed, lost))
-    })?;
+    let (spec, lost) = mutate_then(
+        paths,
+        ui,
+        dry_run,
+        |config| {
+            // Loaded before `config.toml` is written, so a corrupt
+            // `lock.toml` fails the command before anything changes.
+            let pins = lockfile::load(paths)?;
+            let Some(position) = config.sources.iter().position(|s| s.id == id) else {
+                return Err(Error::SourceNotFound { id: id.to_owned() });
+            };
+            let removed = config.sources.remove(position);
+            let spec = user_spec(paths, &removed, &pins);
+            let removed_names: BTreeSet<String> = offered_names(&scan(&spec)).into_iter().collect();
+            let remaining: BTreeSet<String> = source_specs(paths, config, &pins)
+                .iter()
+                .flat_map(|spec| offered_names(&scan(spec)))
+                .collect();
+            let lost: Vec<String> = config
+                .selections
+                .iter()
+                .map(|selection| selection.server.clone())
+                .filter(|server| removed_names.contains(server) && !remaining.contains(server))
+                .collect();
+            let git = removed.git().is_some();
+            Ok(((spec, lost), (git, pins)))
+        },
+        |lock, (git, pins)| {
+            // A Git source's clone, snapshot and pin go; its approvals stay
+            // and are reported as orphaned.
+            if git {
+                git_source::forget(paths, lock, id, pins)
+            } else {
+                Ok(Vec::new())
+            }
+        },
+    )?;
     for server in &lost {
         ui.warn(&format!(
             "selected server `{server}` is no longer offered by any source"
         ));
     }
-    let spec = user_spec(&removed);
     let text = format!(
         "{}{} source `{}`",
         prefix(dry_run),
         if dry_run { "removed" } else { "Removed" },
-        removed.id
+        spec.id
     );
     Ok(Report::new(
         json!({ "source": source_json(&spec), "no_longer_offered": lost, "dry_run": dry_run }),
@@ -712,7 +946,8 @@ fn select(
         harnesses: harnesses.clone(),
     };
     let (replaced, offered) = mutate(paths, ui, dry_run, |config| {
-        let offered = source_specs(paths, config)
+        let pins = lockfile::load(paths)?;
+        let offered = source_specs(paths, config, &pins)
             .iter()
             .any(|spec| offered_names(&scan(spec)).iter().any(|name| name == server));
         Ok((config.select(selection), offered))
@@ -763,9 +998,13 @@ fn unselect(paths: &StorePaths, ui: &mut Ui<'_>, server: &str, dry_run: bool) ->
 }
 
 /// The limited `resolve` view of a server: no literal values, no `args`, no
-/// override contents.
+/// override contents. A winner from a Git source also carries its
+/// `definition_hash` and its audit findings while it is held or revoked by
+/// the gate; the findings' matched arguments go through the approval view's
+/// exception for Git-source definitions.
 fn server_json(server: &ServerResolution) -> Value {
     let definition = server.definition.as_ref();
+    let gated = server.gated.as_ref();
     json!({
         "name": server.name,
         "status": server.status,
@@ -776,16 +1015,18 @@ fn server_json(server: &ServerResolution) -> Value {
         "transport": definition.map(|d| d.transport_kind()),
         "auth": definition.and_then(|d| d.auth_kind()),
         "forwarded_env": definition.map(|d| d.forwarded_env()),
-        "definition_hash": definition.map(|d| d.definition_hash()),
+        "definition_hash": definition
+            .map(|d| d.definition_hash())
+            .or_else(|| gated.map(|gated| gated.definition_hash.clone())),
         "core_hash": definition.map(|d| d.core_hash()),
+        "findings": gated.map(|gated| &gated.findings),
     })
 }
 
 fn resolve_command(paths: &StorePaths) -> Result<Report> {
     let config = paths.load_config()?;
-    let mut snapshots: Vec<_> = source_specs(paths, &config).iter().map(scan).collect();
-    validate(&mut snapshots, registry());
-    let resolution = resolve(&snapshots, &config.selections);
+    let inputs = ReadInputs::load(paths)?;
+    let resolution = load_resolution(paths, &config, &inputs);
     let servers: Vec<Value> = resolution.servers.iter().map(server_json).collect();
     let mut text = String::new();
     if servers.is_empty() {

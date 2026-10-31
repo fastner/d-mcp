@@ -19,16 +19,16 @@ use crate::adapter::{
     self, Adapter, ApplyContext, ApplyMode, EntryOutcome, EntryResult, Gap, GapSeverity,
     HarnessPlan, HarnessRead, Hooks, Intent, Journal, Scope, VarLookup, WriteOp,
 };
-use crate::config::{Harness, HarnessSet};
+use crate::config::Harness;
+use crate::definition::Definition;
 use crate::error::{Error, Result};
 use crate::hashkey::{self, HashKey};
 use crate::output::Report;
 use crate::process::ProcessRunner;
-use crate::resolver::{HoldReason, Resolution, Status, resolve};
-use crate::source::{scan, source_specs};
+use crate::resolver::{HoldReason, Resolution, Status};
+use crate::source::{ReadInputs, load_resolution};
 use crate::state::{self, Hashes, Record, RecordKey, RecordState, Settled, State};
 use crate::store::{Environment, StoreLock, StorePaths};
-use crate::validate::validate;
 
 /// Test seams of the executor, for failure injection. Not part of the
 /// stable API.
@@ -128,7 +128,9 @@ impl Journal for StateJournal<'_> {
 }
 
 /// What the resolver wants for each server selected for a harness. Also the
-/// input of the read-only inventory classification.
+/// input of the read-only inventory classification. A `revoked` server is
+/// left out, so the planner removes an owned entry as for an unselected
+/// one.
 pub(crate) fn desired_for(
     adapter: &dyn Adapter,
     resolution: &Resolution,
@@ -137,39 +139,48 @@ pub(crate) fn desired_for(
     resolution
         .servers
         .iter()
-        .filter(|server| match &server.harnesses {
-            HarnessSet::All => true,
-            HarnessSet::Only(set) => set.contains(&harness),
-        })
-        .map(|server| {
-            let desired = match (&server.status, &server.definition) {
-                (Status::Resolved, Some(definition)) => {
-                    let mut rendered = adapter.render(definition);
-                    rendered
-                        .gaps
-                        .extend(adapter::foreign_security_gaps(adapter, definition));
-                    if adapter.reserved_names().contains(&server.name.as_str()) {
-                        rendered.gaps.push(Gap {
-                            field: "name".to_owned(),
-                            severity: GapSeverity::Important,
-                            reason: format!("the name is reserved by {}", harness.as_str()),
-                            unless_present: None,
-                        });
-                    }
-                    Desired::Render {
-                        rendered,
-                        definition_hash: definition.definition_hash(),
-                    }
-                }
-                (Status::Hold, _) => Desired::Held(match server.reason {
+        .filter(|server| server.harnesses.contains(harness))
+        .filter_map(|server| {
+            let desired = match server.status {
+                Status::Resolved => match &server.definition {
+                    Some(definition) => render_desired(adapter, &server.name, definition),
+                    // A resolved server always has a definition; fail
+                    // closed if not.
+                    None => Desired::Held(HeldReason::InvalidWinner),
+                },
+                Status::Hold => Desired::Held(match server.reason {
+                    Some(HoldReason::InvalidWinner) | None => HeldReason::InvalidWinner,
                     Some(HoldReason::SourceUnavailable) => HeldReason::SourceUnavailable,
-                    _ => HeldReason::InvalidWinner,
+                    Some(HoldReason::PendingApproval) => HeldReason::PendingApproval,
+                    Some(HoldReason::RiskNotAccepted) => HeldReason::RiskNotAccepted,
                 }),
-                _ => Desired::Held(HeldReason::NotOffered),
+                Status::NotOffered => Desired::Held(HeldReason::NotOffered),
+                Status::Revoked => return None,
             };
-            (server.name.clone(), desired)
+            Some((server.name.clone(), desired))
         })
         .collect()
+}
+
+/// The rendering of a resolved server for one harness.
+fn render_desired(adapter: &dyn Adapter, name: &str, definition: &Definition) -> Desired {
+    let harness = adapter.harness();
+    let mut rendered = adapter.render(definition);
+    rendered
+        .gaps
+        .extend(adapter::foreign_security_gaps(adapter, definition));
+    if adapter.reserved_names().contains(&name) {
+        rendered.gaps.push(Gap {
+            field: "name".to_owned(),
+            severity: GapSeverity::Important,
+            reason: format!("the name is reserved by {}", harness.as_str()),
+            unless_present: None,
+        });
+    }
+    Desired::Render {
+        rendered,
+        definition_hash: definition.definition_hash(),
+    }
 }
 
 /// Settles the `pending` records of a harness location against what was
@@ -698,9 +709,8 @@ fn run(
             return Err(Error::UnknownTakeOver { name: name.clone() });
         }
     }
-    let mut snapshots: Vec<_> = source_specs(paths, &config).iter().map(scan).collect();
-    validate(&mut snapshots, adapter::registry());
-    let resolution = resolve(&snapshots, &config.selections);
+    let inputs = ReadInputs::load(paths)?;
+    let resolution = load_resolution(paths, &config, &inputs);
     let context = Context {
         paths,
         env,

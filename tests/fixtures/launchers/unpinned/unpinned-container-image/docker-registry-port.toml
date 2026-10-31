@@ -1,0 +1,6 @@
+name = "docker-registry-port"
+
+[transport]
+type = "stdio"
+command = "docker"
+args = ["run", "localhost:5000/mcp/fetch"]

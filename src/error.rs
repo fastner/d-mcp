@@ -370,6 +370,189 @@ pub enum Error {
     /// The operating system has no random source for a new display-hash key.
     #[error("cannot create the display-hash key: the system random source is unavailable")]
     HashKeyUnavailable,
+    /// A Git source URL is not accepted. The hint never echoes the URL.
+    #[error(
+        "the Git source URL is not accepted (rule `{rule}`): use an `https://`, `ssh://`, scp-like (`git@host:org/repo.git`) or `file://` URL or an absolute path, without a password, a query or a fragment, and without user info on `https` and `file`; keep credentials in a credential helper or SSH"
+    )]
+    SourceUrlInvalid {
+        /// The broken rule: `url-invalid`, `url-scheme`, `url-userinfo`,
+        /// `url-query` or a secret rule.
+        rule: Rule,
+    },
+    /// A Git ref or commit id is not valid.
+    #[error(
+        "the {what} is not valid: a ref must pass `git check-ref-format` and must not start with `-`; a commit id is 40 or 64 hex characters"
+    )]
+    SourceRefInvalid {
+        /// `ref` or `commit`.
+        what: &'static str,
+    },
+    /// The requested commit does not exist or is not reachable from the ref.
+    #[error("commit {commit} is not reachable from the ref `{reference}` of source `{id}`")]
+    SourceCommitUnreachable {
+        /// The source id.
+        id: String,
+        /// The ref.
+        reference: String,
+        /// The commit id.
+        commit: String,
+    },
+    /// The new commit of a refresh does not descend from the pinned one,
+    /// or the source has no pin to check it against.
+    #[error(
+        "the ref `{reference}` of source `{id}` was rewritten (force-push or moved tag), or the source has no pin to check the new commit against; the old pin stays reachable, pass --allow-rewrite to accept the new commit"
+    )]
+    SourceRewrite {
+        /// The source id.
+        id: String,
+        /// The ref.
+        reference: String,
+    },
+    /// The ref of a Git source no longer exists on the remote.
+    #[error(
+        "the ref `{reference}` of source `{id}` no longer exists on the remote; the pin is kept"
+    )]
+    SourceRefDeleted {
+        /// The source id.
+        id: String,
+        /// The ref.
+        reference: String,
+    },
+    /// A Git source changed (removed, re-added or re-pinned) while a command
+    /// worked on it. Nothing was written.
+    #[error(
+        "source `{id}` changed while d-mcp was working on it; nothing was written, run the command again"
+    )]
+    SourceChanged {
+        /// The source id.
+        id: String,
+    },
+    /// An approval is blocked: audit findings without a matching risk
+    /// acceptance, an invalid or revoked definition (`--all-from`), or an
+    /// untrusted source for `--all-from`.
+    #[error("{}", approval_blocked_hint(*count, untrusted.as_deref()))]
+    ApprovalBlocked {
+        /// The number of blocked servers.
+        count: usize,
+        /// The source id, when `approve --all-from` was refused because the
+        /// source is not trusted.
+        untrusted: Option<String>,
+    },
+    /// `approve`, `accept-risk` or `revoke` of a server that needs no
+    /// approval or has nothing to accept.
+    #[error("`{server}` needs no {what}: {why}")]
+    ApprovalNotNeeded {
+        /// The server name, or the source id for `--all-from`.
+        server: String,
+        /// `approval` or `risk acceptance`.
+        what: &'static str,
+        /// Why, from a fixed vocabulary.
+        why: &'static str,
+    },
+    /// `approve` or `accept-risk` without `--expect` outside a dry run.
+    #[error("`{command}` needs --expect <{value}> from its preview; run it with --dry-run first")]
+    ExpectRequired {
+        /// The command.
+        command: &'static str,
+        /// What `--expect` takes: `definition_hash` or `pinned commit`.
+        value: &'static str,
+    },
+    /// The `accept-risk` reason is not accepted. The reason is never echoed.
+    #[error("the --reason is not accepted: {why}; it is not shown")]
+    ReasonInvalid {
+        /// Why, from a fixed vocabulary.
+        why: &'static str,
+    },
+    /// The definition (or pinned commit) changed since the preview, or the
+    /// `--expect` value does not match.
+    #[error(
+        "`{server}` changed since the preview (or its `--expect` value does not match); run the command with --dry-run again"
+    )]
+    ApprovalChanged {
+        /// The server name, or the source id for `--all-from`.
+        server: String,
+    },
+    /// `lock.toml` breaks a rule. It is never rewritten.
+    #[error(
+        "{} is corrupt at line {line}, column {column}{}; fix it by hand, d-mcp will not rewrite it",
+        path.display(),
+        if field.is_empty() { String::new() } else { format!(", field `{field}`") }
+    )]
+    LockCorrupt {
+        /// The file.
+        path: PathBuf,
+        /// 1-based line.
+        line: usize,
+        /// 1-based column.
+        column: usize,
+        /// The field path.
+        field: String,
+    },
+    /// `approvals.toml` breaks a rule. It is never rewritten.
+    #[error(
+        "{} is corrupt at line {line}, column {column}{}; fix it by hand, d-mcp will not rewrite it",
+        path.display(),
+        if field.is_empty() { String::new() } else { format!(", field `{field}`") }
+    )]
+    ApprovalsCorrupt {
+        /// The file.
+        path: PathBuf,
+        /// 1-based line.
+        line: usize,
+        /// 1-based column.
+        column: usize,
+        /// The field path.
+        field: String,
+    },
+    /// `git` was not found on `PATH`.
+    #[error("`git` was not found on PATH; Git sources need it for add-git and refresh")]
+    GitNotFound,
+    /// A `git` call did not finish in time and was stopped.
+    #[error("`git {operation}` did not finish in time and was stopped")]
+    GitTimeout {
+        /// The git subcommand.
+        operation: &'static str,
+    },
+    /// `git` reported failed authentication. Its output is never shown.
+    #[error(
+        "`git {operation}` failed: authentication failed; d-mcp never prompts, so set up a credential helper or an SSH key (its output is not shown)"
+    )]
+    GitAuthFailed {
+        /// The git subcommand.
+        operation: &'static str,
+    },
+    /// `git` refused an unknown or changed SSH host key.
+    #[error(
+        "`git {operation}` failed: the SSH host key is unknown or changed; verify it and add it to known_hosts first (its output is not shown)"
+    )]
+    GitHostUnknown {
+        /// The git subcommand.
+        operation: &'static str,
+    },
+    /// `git` could not reach the host or the repository.
+    #[error(
+        "`git {operation}` failed: the host or repository cannot be reached (its output is not shown)"
+    )]
+    GitUnreachable {
+        /// The git subcommand.
+        operation: &'static str,
+    },
+    /// The requested ref does not exist on the remote.
+    #[error(
+        "`git {operation}` failed: the ref does not exist on the remote (its output is not shown)"
+    )]
+    GitRefNotFound {
+        /// The git subcommand.
+        operation: &'static str,
+    },
+    /// Any other `git` failure. Its output is never shown.
+    #[error("`git {operation}` failed ({status}); its output is not shown")]
+    GitFailed {
+        /// The git subcommand.
+        operation: &'static str,
+        /// The exit status, such as `exit status 128`.
+        status: String,
+    },
     /// A file-system operation failed.
     #[error("cannot {operation} {}: {}", path.display(), io::Error::from(*kind))]
     Io {
@@ -380,6 +563,23 @@ pub enum Error {
         /// The I/O error kind (the OS message is not kept).
         kind: io::ErrorKind,
     },
+}
+
+/// The hint of [`Error::ApprovalBlocked`].
+fn approval_blocked_hint(count: usize, untrusted: Option<&str>) -> String {
+    match untrusted {
+        Some(id) => format!(
+            "source `{id}` is not trusted; `approve --all-from` needs a trusted source (`d-mcp source trust {id} --on`), or approve servers one by one"
+        ),
+        None => format!(
+            "{count} {} blocked from approval (audit findings without a matching `accept-risk`, an invalid definition, or a revoked server); see the report",
+            if count == 1 {
+                "server is"
+            } else {
+                "servers are"
+            }
+        ),
+    }
 }
 
 impl Error {
@@ -437,6 +637,26 @@ impl Error {
             Error::CurrentDirUnavailable => "cwd-unavailable",
             Error::HashKeyCorrupt { .. } => "hash-key-corrupt",
             Error::HashKeyUnavailable => "hash-key-unavailable",
+            Error::SourceUrlInvalid { .. } => "source-url-invalid",
+            Error::SourceRefInvalid { .. } => "source-ref-invalid",
+            Error::SourceCommitUnreachable { .. } => "source-commit-unreachable",
+            Error::SourceRewrite { .. } => "source-rewrite",
+            Error::SourceRefDeleted { .. } => "source-ref-deleted",
+            Error::SourceChanged { .. } => "source-changed",
+            Error::ApprovalBlocked { .. } => "approval-blocked",
+            Error::ApprovalNotNeeded { .. } => "approval-not-needed",
+            Error::ExpectRequired { .. } => "expect-required",
+            Error::ReasonInvalid { .. } => "reason-invalid",
+            Error::ApprovalChanged { .. } => "approval-changed",
+            Error::LockCorrupt { .. } => "lock-corrupt",
+            Error::ApprovalsCorrupt { .. } => "approvals-corrupt",
+            Error::GitNotFound => "git-not-found",
+            Error::GitTimeout { .. } => "git-timeout",
+            Error::GitAuthFailed { .. } => "git-auth-failed",
+            Error::GitHostUnknown { .. } => "git-host-unknown",
+            Error::GitUnreachable { .. } => "git-unreachable",
+            Error::GitRefNotFound { .. } => "git-ref-not-found",
+            Error::GitFailed { .. } => "git-failed",
             Error::Io { .. } => "io-error",
         }
     }
@@ -468,7 +688,16 @@ impl Error {
             | Error::UninstallIncomplete { .. }
             | Error::PurgeBlocked { .. }
             | Error::HarnessCliFailed { .. }
-            | Error::HarnessNoNeutralDir { .. } => EXIT_FAILURE,
+            | Error::HarnessNoNeutralDir { .. }
+            | Error::SourceUrlInvalid { .. }
+            | Error::SourceRefInvalid { .. }
+            | Error::SourceCommitUnreachable { .. }
+            | Error::SourceRewrite { .. }
+            | Error::SourceRefDeleted { .. }
+            | Error::ApprovalBlocked { .. }
+            | Error::ApprovalNotNeeded { .. }
+            | Error::ExpectRequired { .. }
+            | Error::ReasonInvalid { .. } => EXIT_FAILURE,
             Error::ConfigCorrupt { .. }
             | Error::SchemaUnsupported { .. }
             | Error::StoreLocked { .. }
@@ -478,13 +707,24 @@ impl Error {
             | Error::HarnessEditFailed { .. }
             | Error::StateCorrupt { .. }
             | Error::AdoptEntryChanged { .. }
-            | Error::HashKeyCorrupt { .. } => EXIT_UNSAFE,
+            | Error::HashKeyCorrupt { .. }
+            | Error::ApprovalChanged { .. }
+            | Error::SourceChanged { .. }
+            | Error::LockCorrupt { .. }
+            | Error::ApprovalsCorrupt { .. } => EXIT_UNSAFE,
             Error::HomeUnset
             | Error::CurrentDirUnavailable
             | Error::HarnessPathNotUtf8 { .. }
             | Error::HarnessCliNotFound { .. }
             | Error::HarnessCliTimeout { .. }
             | Error::HashKeyUnavailable
+            | Error::GitNotFound
+            | Error::GitTimeout { .. }
+            | Error::GitAuthFailed { .. }
+            | Error::GitHostUnknown { .. }
+            | Error::GitUnreachable { .. }
+            | Error::GitRefNotFound { .. }
+            | Error::GitFailed { .. }
             | Error::Io { .. } => EXIT_ENVIRONMENT,
         }
     }
@@ -590,6 +830,65 @@ impl Error {
             Error::CurrentDirUnavailable,
             Error::HashKeyCorrupt { path: path.clone() },
             Error::HashKeyUnavailable,
+            Error::SourceUrlInvalid {
+                rule: Rule::UrlUserinfo,
+            },
+            Error::SourceRefInvalid { what: "ref" },
+            Error::SourceCommitUnreachable {
+                id: "team".into(),
+                reference: "main".into(),
+                commit: "0".repeat(40),
+            },
+            Error::SourceRewrite {
+                id: "team".into(),
+                reference: "main".into(),
+            },
+            Error::SourceRefDeleted {
+                id: "team".into(),
+                reference: "main".into(),
+            },
+            Error::SourceChanged { id: "team".into() },
+            Error::ApprovalBlocked {
+                count: 1,
+                untrusted: None,
+            },
+            Error::ApprovalNotNeeded {
+                server: "github".into(),
+                what: "approval",
+                why: "it does not come from a Git source",
+            },
+            Error::ExpectRequired {
+                command: "approve",
+                value: "definition_hash",
+            },
+            Error::ReasonInvalid {
+                why: "it looks like a secret",
+            },
+            Error::ApprovalChanged {
+                server: "github".into(),
+            },
+            Error::LockCorrupt {
+                path: path.clone(),
+                line: 1,
+                column: 1,
+                field: "pins[0].commit".into(),
+            },
+            Error::ApprovalsCorrupt {
+                path: path.clone(),
+                line: 1,
+                column: 1,
+                field: String::new(),
+            },
+            Error::GitNotFound,
+            Error::GitTimeout { operation: "clone" },
+            Error::GitAuthFailed { operation: "clone" },
+            Error::GitHostUnknown { operation: "clone" },
+            Error::GitUnreachable { operation: "clone" },
+            Error::GitRefNotFound { operation: "clone" },
+            Error::GitFailed {
+                operation: "ls-tree",
+                status: "exit status 128".into(),
+            },
             Error::Io {
                 operation: "read",
                 path,
@@ -640,6 +939,26 @@ impl Error {
                 | Error::CurrentDirUnavailable
                 | Error::HashKeyCorrupt { .. }
                 | Error::HashKeyUnavailable
+                | Error::SourceUrlInvalid { .. }
+                | Error::SourceRefInvalid { .. }
+                | Error::SourceCommitUnreachable { .. }
+                | Error::SourceRewrite { .. }
+                | Error::SourceRefDeleted { .. }
+                | Error::SourceChanged { .. }
+                | Error::ApprovalBlocked { .. }
+                | Error::ApprovalNotNeeded { .. }
+                | Error::ExpectRequired { .. }
+                | Error::ReasonInvalid { .. }
+                | Error::ApprovalChanged { .. }
+                | Error::LockCorrupt { .. }
+                | Error::ApprovalsCorrupt { .. }
+                | Error::GitNotFound
+                | Error::GitTimeout { .. }
+                | Error::GitAuthFailed { .. }
+                | Error::GitHostUnknown { .. }
+                | Error::GitUnreachable { .. }
+                | Error::GitRefNotFound { .. }
+                | Error::GitFailed { .. }
                 | Error::Io { .. } => {}
             }
         }

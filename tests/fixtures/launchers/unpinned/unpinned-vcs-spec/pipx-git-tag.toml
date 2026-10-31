@@ -1,0 +1,6 @@
+name = "pipx-git-tag"
+
+[transport]
+type = "stdio"
+command = "pipx"
+args = ["run", "--spec", "git+https://github.com/org/mcp-server@v1.2.3", "mcp-server"]

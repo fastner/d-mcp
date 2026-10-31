@@ -1,0 +1,6 @@
+name = "env-double-dash-assignment"
+
+[transport]
+type = "stdio"
+command = "env"
+args = ["--", "LANG=C", "npx", "-y", "evil"]

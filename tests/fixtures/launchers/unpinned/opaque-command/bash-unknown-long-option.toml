@@ -1,0 +1,6 @@
+name = "bash-unknown-long-option"
+
+[transport]
+type = "stdio"
+command = "bash"
+args = ["--frobnicate", "value", "-c", "mcp-server"]

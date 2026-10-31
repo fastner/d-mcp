@@ -1,0 +1,9 @@
+name = "pip-extra-index-url"
+
+[transport]
+type = "stdio"
+command = "uvx"
+args = ["pkg==1.0"]
+
+[env]
+PIP_EXTRA_INDEX_URL = { value = "https://index.example.test/simple" }

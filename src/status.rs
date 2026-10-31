@@ -3,6 +3,10 @@
 //! definition reads that the current shell lacks, and with `--auth` the
 //! login state. Read-only: no lock, no writes, no `.hash-key`.
 //!
+//! - **Desired** comes from the shared resolution: `resolved`, `held` with
+//!   its reason (also `pending-approval` and `risk-not-accepted` for a
+//!   Git-source winner), `revoked` (selected, but its approval revoked; the
+//!   next sync removes an owned entry) or `not-selected`.
 //! - **Operation** comes from the read-only plan of `sync::plan_location`, the
 //!   one a dry-run sync makes (pending records settled in memory), not from
 //!   a second classifier.
@@ -30,15 +34,14 @@ use crate::error::Result;
 use crate::inventory::StoreView;
 use crate::output::Report;
 use crate::process::ProcessRunner;
-use crate::resolver::{Resolution, resolve};
-use crate::source::{scan, source_specs};
+use crate::resolver::Resolution;
+use crate::source::load_resolution;
 use crate::state::{Record, RecordKey, RecordState};
 use crate::store::{Environment, StorePaths};
 use crate::sync::{
     Desired, HeldReason, LocationPlan, Operation, PlanStatus, PlannedEntry, desired_for,
     plan_location,
 };
-use crate::validate::validate;
 
 /// The caveat every `status` output carries.
 pub const ENVIRONMENT_CAVEAT: &str = "variables are checked in this shell only; a harness launched from a GUI (a desktop app, a dock or a launcher) can see a different environment";
@@ -53,6 +56,9 @@ pub enum DesiredState {
     Resolved,
     /// Selected for the harness and held (see the reason).
     Held,
+    /// Selected, but the approval of its Git-source winner was revoked;
+    /// the next sync removes an owned entry.
+    Revoked,
     /// Not selected for the harness (it has a record only).
     NotSelected,
 }
@@ -64,6 +70,7 @@ impl DesiredState {
         match self {
             DesiredState::Resolved => "resolved",
             DesiredState::Held => "held",
+            DesiredState::Revoked => "revoked",
             DesiredState::NotSelected => "not-selected",
         }
     }
@@ -330,10 +337,23 @@ fn location_status(context: &Context<'_>, adapter: &dyn Adapter, scope: Scope) -
         .filter(|record| record.harness == harness && record.scope == scope)
         .map(|record| record.name.as_str())
         .collect();
+    // `desired_for` leaves a revoked server out, like an unselected one;
+    // a selected one is still listed (as `revoked`), with or without a
+    // record.
+    let is_revoked = |server: &crate::resolver::ServerResolution| {
+        server.status == crate::resolver::Status::Revoked && server.harnesses.contains(harness)
+    };
+    let revoked = context
+        .resolution
+        .servers
+        .iter()
+        .filter(|server| is_revoked(server))
+        .map(|server| server.name.as_str());
     let names: BTreeSet<&str> = desired
         .keys()
         .map(String::as_str)
         .chain(recorded)
+        .chain(revoked)
         .filter(|name| in_scope(name))
         .collect();
     let planned: BTreeMap<&str, &PlannedEntry> = planned
@@ -350,6 +370,7 @@ fn location_status(context: &Context<'_>, adapter: &dyn Adapter, scope: Scope) -
         let (state, reason) = match desired.get(name) {
             Some(Desired::Render { .. }) => (DesiredState::Resolved, None),
             Some(Desired::Held(reason)) => (DesiredState::Held, Some(*reason)),
+            None if server.is_some_and(is_revoked) => (DesiredState::Revoked, None),
             None => (DesiredState::NotSelected, None),
         };
         let actual = read
@@ -444,12 +465,7 @@ pub fn build(
     warnings: &mut Vec<String>,
 ) -> Result<Status> {
     let store = StoreView::load(paths, warnings)?;
-    let mut snapshots: Vec<_> = source_specs(paths, &store.config)
-        .iter()
-        .map(scan)
-        .collect();
-    validate(&mut snapshots, adapter::registry());
-    let resolution = resolve(&snapshots, &store.config.selections);
+    let resolution = load_resolution(paths, &store.config, &store.inputs);
     let process_env = |name: &str| std::env::var_os(name);
     let var: VarLookup<'_> = options.var.unwrap_or(&process_env);
     let mut notices = vec![ENVIRONMENT_CAVEAT.to_owned()];

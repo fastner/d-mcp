@@ -1,0 +1,6 @@
+name = "ksh-c"
+
+[transport]
+type = "stdio"
+command = "ksh"
+args = ["-c", "npx evil"]

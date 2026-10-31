@@ -1,0 +1,6 @@
+name = "bunx"
+
+[transport]
+type = "stdio"
+command = "bunx"
+args = ["mcp-server@1.2.3+build.5"]

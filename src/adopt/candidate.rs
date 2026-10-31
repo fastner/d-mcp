@@ -20,11 +20,11 @@ use crate::definition::{
 };
 use crate::error::Error;
 use crate::redact::{EntryView, entry_view, safe_key};
-use crate::resolver::{FileEntry, Status, resolve};
-use crate::source::{scan, source_specs};
+use crate::resolver::{FileEntry, Status};
+use crate::source::{load_snapshots, resolve_snapshots};
 use crate::state::{ReplacedField, State};
 use crate::sync::{Desired, desired_for};
-use crate::validate::{validate, validate_definition};
+use crate::validate::validate_definition;
 
 /// How the origins of a server relate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -497,10 +497,7 @@ fn resolve_with(
     definition: &Definition,
     sites: crate::definition::OverrideSites,
 ) -> BTreeMap<Harness, Desired> {
-    let mut snapshots: Vec<_> = source_specs(context.paths, config)
-        .iter()
-        .map(scan)
-        .collect();
+    let mut snapshots = load_snapshots(context.paths, config, &context.inputs);
     let Some(local) = snapshots
         .iter_mut()
         .find(|snapshot| snapshot.id == LOCAL_SOURCE_ID && snapshot.available)
@@ -516,15 +513,16 @@ fn resolve_with(
         key: Some(server.name.clone()),
         outcome: Ok(definition.clone()),
         override_sites: sites,
+        findings: Vec::new(),
+        gate: None,
     });
-    validate(&mut snapshots, adapter::registry());
     let mut selections = config.selections.clone();
     selections.retain(|selection| selection.server != server.name);
     selections.push(Selection {
         server: server.name.clone(),
         harnesses: HarnessSet::Only(server.harnesses.clone()),
     });
-    let resolution = resolve(&snapshots, &selections);
+    let resolution = resolve_snapshots(&mut snapshots, config, &selections, &context.inputs);
     let wins = resolution.servers.iter().any(|resolved| {
         resolved.name == server.name
             && resolved.status == Status::Resolved

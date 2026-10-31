@@ -17,6 +17,7 @@ use crate::rule::Rule;
 
 pub use hash::{CORE_DOMAIN_TAG, DEFINITION_DOMAIN_TAG, canonical_json};
 pub use serialize::to_toml;
+pub(crate) use walk::secret_rule;
 
 /// Maximum length of a neutral name.
 ///

@@ -1,0 +1,6 @@
+name = "yarn-dlx"
+
+[transport]
+type = "stdio"
+command = "yarn"
+args = ["dlx", "mcp-server"]

@@ -27,9 +27,25 @@
 //! of a harness location; [`doctor`] runs health checks over the store, the
 //! harness CLIs and the inventory. `uninstall --apply` removes entries only
 //! through a scoped sync and releases adopted ones as `unmanage` does.
+//!
+//! Git sources: [`git`] is the only module that runs `git`, and only
+//! mutating commands and dry runs call it. `source add-git` clones into the
+//! store, pins a commit in `lock.toml` ([`lockfile`]) and materializes the
+//! accepted definitions into a snapshot that [`source`] scans at read time
+//! like a directory, so read-only commands never run `git`; `source
+//! refresh` fetches, detects rewrites and moves the pin. [`approval`] holds
+//! the approvals file, and [`audit`] is the pure, table-driven launcher
+//! audit. Every command resolves through [`source::load_resolution`], whose
+//! gate gives each Git-source definition its approval verdict, which the
+//! pure [`resolver`] turns into `hold(pending-approval)`,
+//! `hold(risk-not-accepted)` or `revoked`, and which reports approvals of
+//! sources that are gone as `orphaned-approval`. `doctor` checks `lock.toml`,
+//! `approvals.toml`, `git` on `PATH` and the servers waiting for approval.
 
 pub mod adapter;
 pub mod adopt;
+pub mod approval;
+pub mod audit;
 pub mod canonical;
 pub mod cli;
 pub mod config;
@@ -37,8 +53,10 @@ pub mod credential;
 pub mod definition;
 pub mod doctor;
 pub mod error;
+pub mod git;
 pub mod hashkey;
 pub mod inventory;
+pub mod lockfile;
 pub mod output;
 pub mod process;
 pub mod redact;

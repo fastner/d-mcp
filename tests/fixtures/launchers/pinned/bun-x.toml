@@ -1,0 +1,6 @@
+name = "bun-x"
+
+[transport]
+type = "stdio"
+command = "bun"
+args = ["x", "mcp-server@1.2.3"]

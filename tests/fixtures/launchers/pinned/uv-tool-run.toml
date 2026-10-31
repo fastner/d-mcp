@@ -1,0 +1,6 @@
+name = "uv-tool-run"
+
+[transport]
+type = "stdio"
+command = "uv"
+args = ["tool", "run", "--python", "3.12", "mcp-server-fetch===2025.4.7"]

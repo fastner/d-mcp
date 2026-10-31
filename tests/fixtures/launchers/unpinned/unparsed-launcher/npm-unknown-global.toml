@@ -1,0 +1,6 @@
+name = "npm-unknown-global"
+
+[transport]
+type = "stdio"
+command = "npm"
+args = ["--frobnicate", "x", "exec", "evil"]

@@ -1,7 +1,7 @@
 # ADR 0002: Secret References Only
 
 - Status: Accepted
-- Date: 2026-10-26
+- Date: 2026-10-26, amended 2026-10-31 (WP5 approval view)
 - Source: concept `docs/concept/2026-10-26-d-mcp.md`, WP1b plan "Core model, store and resolver"
 
 ## Context
@@ -46,3 +46,11 @@ d-mcp never prints or persists a secret value.
   rule.
 - Users must export credentials in their environment; d-mcp never stores them.
 - Diagnostics are less specific than a parser message, but they are always safe to share.
+
+**Amendment 2026-10-31 (WP5): the approval view.** "`resolve` shows only variable names, never
+literal values, `args` or override contents" holds for every definition except one case, recorded
+in ADR 0006: for a winner from a Git source, the approval view (the `source refresh` change set,
+`approve`, `accept-risk` and `resolve`'s findings) also shows `command`, `args`, the URL path and
+`harness.codex.cwd`, and the findings name the matched launcher arguments. Those fields have passed
+the secret heuristics above; env values, header values and all other override values stay hidden,
+and no secret value is persisted or printed.

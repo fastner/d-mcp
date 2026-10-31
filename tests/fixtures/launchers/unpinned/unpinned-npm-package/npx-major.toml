@@ -1,0 +1,6 @@
+name = "npx-major"
+
+[transport]
+type = "stdio"
+command = "npx"
+args = ["mcp-server@1"]

@@ -1,0 +1,6 @@
+name = "bash-lc"
+
+[transport]
+type = "stdio"
+command = "/bin/bash"
+args = ["-lc", "exec mcp-server"]

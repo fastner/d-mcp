@@ -1,0 +1,9 @@
+name = "npm-config-registry"
+
+[transport]
+type = "stdio"
+command = "npx"
+args = ["-y", "pkg@1.2.3"]
+
+[env]
+npm_config_registry = { value = "https://registry.example.test" }

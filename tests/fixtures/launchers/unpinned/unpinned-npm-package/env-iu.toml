@@ -1,0 +1,6 @@
+name = "env-iu"
+
+[transport]
+type = "stdio"
+command = "env"
+args = ["-iu", "X", "npx", "evil"]

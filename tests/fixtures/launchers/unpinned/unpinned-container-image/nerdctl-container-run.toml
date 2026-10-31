@@ -1,0 +1,6 @@
+name = "nerdctl-container-run"
+
+[transport]
+type = "stdio"
+command = "nerdctl"
+args = ["container", "run", "-i", "evil"]

@@ -4,9 +4,16 @@
 //! Only names in [`KNOWN_ENTRIES`] are touched. An entry that is a symlink
 //! is unlinked, never followed, and [`fs::remove_dir_all`] does not follow
 //! symlinks inside `local/` either, so nothing outside the store (such as
-//! a registered source) is deleted. A symlinked store root is purged only
-//! with `--follow-store-link`: then the known entries inside its target are
-//! deleted, and the link and the target directory are left.
+//! a registered directory source) is deleted. `sources/` holds only the
+//! re-creatable Git clones and snapshots and is deleted. A symlinked store
+//! root is purged only with `--follow-store-link`: then the known entries
+//! inside its target are deleted, and the link and the target directory are
+//! left. A `local/` that is a Git repository (`local/.git` exists, the
+//! personal source of the multi-machine flow) may hold unpushed work, so it
+//! blocks the purge (`local-is-git`) unless `--include-local-repo` is given.
+//! A `local` that is a symlink is only unlinked, its target (a Git
+//! repository or not) is left as it is: it never blocks the purge, and a
+//! warning names the target that stays.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,6 +30,13 @@ pub struct PurgePlan {
     pub requested: bool,
     /// Whether `--follow-store-link` was given.
     pub follow_store_link: bool,
+    /// Whether `--include-local-repo` was given.
+    pub include_local_repo: bool,
+    /// Whether `local/.git` exists in the target and `local` is a real
+    /// directory (a symlinked `local` is only unlinked).
+    pub local_is_git: bool,
+    /// Whether `local` in the target is a symlink.
+    pub local_is_link: bool,
     /// Whether the store root is a symlink.
     pub root_is_link: bool,
     /// The directory the entries are deleted from: the store root, or the
@@ -42,7 +56,12 @@ impl PurgePlan {
     /// # Errors
     ///
     /// [`Error::Io`] when a symlinked store root cannot be resolved.
-    pub fn new(paths: &StorePaths, requested: bool, follow_store_link: bool) -> Result<Self> {
+    pub fn new(
+        paths: &StorePaths,
+        requested: bool,
+        follow_store_link: bool,
+        include_local_repo: bool,
+    ) -> Result<Self> {
         let root_is_link = fs::symlink_metadata(&paths.root)
             .is_ok_and(|metadata| metadata.file_type().is_symlink());
         let target = if root_is_link {
@@ -60,9 +79,18 @@ impl PurgePlan {
             .map(|name| target.join(name))
             .filter(|path| fs::symlink_metadata(path).is_ok())
             .collect();
+        let local = target.join("local");
+        let local_is_link =
+            fs::symlink_metadata(&local).is_ok_and(|metadata| metadata.file_type().is_symlink());
+        // Through a symlinked `local`, `local/.git` would be found in the
+        // link's target, which the purge leaves alone.
+        let local_is_git = !local_is_link && fs::symlink_metadata(local.join(".git")).is_ok();
         let mut plan = Self {
             requested,
             follow_store_link,
+            include_local_repo,
+            local_is_git,
+            local_is_link,
             root_is_link,
             target,
             entries,
@@ -71,6 +99,9 @@ impl PurgePlan {
         };
         if requested && root_is_link && !follow_store_link {
             plan.block(BlockReason::StoreRootSymlink, None);
+        }
+        if requested && local_is_git && !include_local_repo {
+            plan.block(BlockReason::LocalIsGit, None);
         }
         Ok(plan)
     }
@@ -102,6 +133,42 @@ impl PurgePlan {
             format!(
                 "the store root is a symlink: --purge deletes the store files inside its target {target}"
             )
+        })
+    }
+
+    /// The explicit warning for a `local/` that is a Git repository, or a
+    /// symlink, when `--purge` was given.
+    #[must_use]
+    pub fn local_repo_warning(&self, preview: bool) -> Option<String> {
+        let local = self.target.join("local");
+        if self.requested && self.local_is_link {
+            let target = fs::read_link(&local).map_or_else(
+                |_| "its target".to_owned(),
+                |target| target.display().to_string(),
+            );
+            let local = local.display();
+            return Some(if preview {
+                format!(
+                    "{local} is a symlink: --purge would only unlink it and leave {target} as it is"
+                )
+            } else {
+                format!(
+                    "{local} is a symlink: --purge only unlinks it and leaves {target} as it is"
+                )
+            });
+        }
+        if !(self.requested && self.local_is_git) {
+            return None;
+        }
+        let local = local.display();
+        Some(if !self.include_local_repo {
+            format!(
+                "{local} is a Git repository and may hold unpushed work; --purge deletes it only with --include-local-repo"
+            )
+        } else if preview {
+            format!("--purge would delete the Git repository {local}, including unpushed work")
+        } else {
+            format!("--purge deletes the Git repository {local}, including unpushed work")
         })
     }
 

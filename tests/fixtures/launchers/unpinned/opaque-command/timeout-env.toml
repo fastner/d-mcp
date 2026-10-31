@@ -1,0 +1,6 @@
+name = "timeout-env"
+
+[transport]
+type = "stdio"
+command = "timeout"
+args = ["5", "env", "npx", "pkg@1.0.0"]

@@ -1,0 +1,6 @@
+name = "env-double-dash"
+
+[transport]
+type = "stdio"
+command = "env"
+args = ["--", "LANG=C", "npx", "-y", "pkg@1.2.3"]

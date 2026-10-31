@@ -5,6 +5,10 @@
 //! an unsafe state (exit 3); d-mcp never rewrites a corrupt file. The built-in
 //! `local` source is implicit and never persisted here. This module does no
 //! I/O; [`crate::store`] reads and writes the file.
+//!
+//! A source is a `directory` (an absolute canonical `path`) or a `git`
+//! source (`url`, `ref`, `trusted`, no `path`): its location is derived as
+//! `<store>/sources/<id>` and its pinned commit lives in `lock.toml`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -31,12 +35,14 @@ pub struct Config {
     pub selections: Vec<Selection>,
 }
 
-/// The kind of a source. WP5 adds Git sources.
+/// The kind of a source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SourceKind {
-    /// A local directory.
+    /// A local directory, read as it is; no approval.
     Directory,
+    /// A Git repository, cloned into the store and pinned to a commit.
+    Git,
 }
 
 impl SourceKind {
@@ -45,8 +51,33 @@ impl SourceKind {
     pub fn as_str(self) -> &'static str {
         match self {
             SourceKind::Directory => "directory",
+            SourceKind::Git => "git",
         }
     }
+}
+
+/// Where a user source comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceOrigin {
+    /// A local directory.
+    Directory {
+        /// Absolute canonical path of the source root.
+        path: PathBuf,
+    },
+    /// A Git remote.
+    Git(GitOrigin),
+}
+
+/// The `config.toml` fields of a Git source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitOrigin {
+    /// The remote URL, validated by [`crate::git::validate_url`] on input and by
+    /// [`crate::git::validate_url_syntax`] when `config.toml` is parsed.
+    pub url: String,
+    /// The branch or tag that is followed.
+    pub reference: String,
+    /// Whether the source is trusted (allows `approve --all-from`).
+    pub trusted: bool,
 }
 
 /// A registered user source.
@@ -54,12 +85,39 @@ impl SourceKind {
 pub struct SourceEntry {
     /// The source id; follows the neutral name rule.
     pub id: String,
-    /// The source kind.
-    pub kind: SourceKind,
-    /// Absolute canonical path of the source root.
-    pub path: PathBuf,
     /// Priority, at least 1 and unique. Higher wins.
     pub priority: u32,
+    /// The directory or the Git remote.
+    pub origin: SourceOrigin,
+}
+
+impl SourceEntry {
+    /// The source kind.
+    #[must_use]
+    pub fn kind(&self) -> SourceKind {
+        match self.origin {
+            SourceOrigin::Directory { .. } => SourceKind::Directory,
+            SourceOrigin::Git(_) => SourceKind::Git,
+        }
+    }
+
+    /// The root of a directory source; `None` for a Git source.
+    #[must_use]
+    pub fn path(&self) -> Option<&Path> {
+        match &self.origin {
+            SourceOrigin::Directory { path } => Some(path),
+            SourceOrigin::Git(_) => None,
+        }
+    }
+
+    /// The fields of a Git source; `None` for a directory source.
+    #[must_use]
+    pub fn git(&self) -> Option<&GitOrigin> {
+        match &self.origin {
+            SourceOrigin::Directory { .. } => None,
+            SourceOrigin::Git(git) => Some(git),
+        }
+    }
 }
 
 /// A harness d-mcp can target.
@@ -104,6 +162,15 @@ pub enum HarnessSet {
 }
 
 impl HarnessSet {
+    /// Whether the set covers `harness`.
+    #[must_use]
+    pub fn contains(&self, harness: Harness) -> bool {
+        match self {
+            HarnessSet::All => true,
+            HarnessSet::Only(set) => set.contains(&harness),
+        }
+    }
+
     /// The stable list form: `["all"]` or the sorted harness names.
     #[must_use]
     pub fn names(&self) -> Vec<&'static str> {
@@ -179,9 +246,19 @@ impl Config {
             for source in sources {
                 let mut table = Table::new();
                 table["id"] = value(source.id.as_str());
-                table["kind"] = value(source.kind.as_str());
-                table["path"] = value(source.path.to_string_lossy().as_ref());
-                table["priority"] = value(i64::from(source.priority));
+                table["kind"] = value(source.kind().as_str());
+                match &source.origin {
+                    SourceOrigin::Directory { path } => {
+                        table["path"] = value(path.to_string_lossy().as_ref());
+                        table["priority"] = value(i64::from(source.priority));
+                    }
+                    SourceOrigin::Git(git) => {
+                        table["url"] = value(git.url.as_str());
+                        table["ref"] = value(git.reference.as_str());
+                        table["priority"] = value(i64::from(source.priority));
+                        table["trusted"] = value(git.trusted);
+                    }
+                }
                 array.push(table);
             }
             document["sources"] = toml_edit::Item::ArrayOfTables(array);
@@ -339,7 +416,15 @@ impl Parser<'_> {
         let mut sources = Vec::new();
         for (position, (entries, offset)) in self.tables(node, "sources")?.into_iter().enumerate() {
             let base = format!("sources[{position}]");
-            self.check_keys(entries, &base, &["id", "kind", "path", "priority"])?;
+            let git = find(entries, "kind").is_some_and(
+                |kind| matches!(&kind.value.kind, NodeKind::String(text) if text == "git"),
+            );
+            let allowed: &[&str] = if git {
+                &["id", "kind", "url", "ref", "priority", "trusted"]
+            } else {
+                &["id", "kind", "path", "priority"]
+            };
+            self.check_keys(entries, &base, allowed)?;
             let field = |key: &str| format!("{base}.{key}");
 
             let id_entry = self.required(entries, &field("id"), "id", offset)?;
@@ -356,7 +441,8 @@ impl Parser<'_> {
             }
 
             let kind_entry = self.required(entries, &field("kind"), "kind", offset)?;
-            if self.string(&kind_entry.value, &field("kind"))? != "directory" {
+            let kind = self.string(&kind_entry.value, &field("kind"))?;
+            if kind != "directory" && kind != "git" {
                 return Err(self.corrupt(
                     Rule::InvalidValue,
                     &field("kind"),
@@ -364,22 +450,29 @@ impl Parser<'_> {
                 ));
             }
 
-            let path_entry = self.required(entries, &field("path"), "path", offset)?;
-            let path = self.string(&path_entry.value, &field("path"))?;
-            if !Path::new(path).is_absolute() {
-                return Err(self.corrupt(
-                    Rule::InvalidValue,
-                    &field("path"),
-                    path_entry.value_offset(),
-                ));
-            }
-            if !paths.insert(path.to_owned()) {
-                return Err(self.corrupt(
-                    Rule::DuplicateEntry,
-                    &field("path"),
-                    path_entry.value_offset(),
-                ));
-            }
+            let origin = if git {
+                SourceOrigin::Git(self.git_origin(entries, &field, offset)?)
+            } else {
+                let path_entry = self.required(entries, &field("path"), "path", offset)?;
+                let path = self.string(&path_entry.value, &field("path"))?;
+                if !Path::new(path).is_absolute() {
+                    return Err(self.corrupt(
+                        Rule::InvalidValue,
+                        &field("path"),
+                        path_entry.value_offset(),
+                    ));
+                }
+                if !paths.insert(path.to_owned()) {
+                    return Err(self.corrupt(
+                        Rule::DuplicateEntry,
+                        &field("path"),
+                        path_entry.value_offset(),
+                    ));
+                }
+                SourceOrigin::Directory {
+                    path: PathBuf::from(path),
+                }
+            };
 
             let priority_entry = self.required(entries, &field("priority"), "priority", offset)?;
             let NodeKind::Integer(priority) = priority_entry.value.kind else {
@@ -409,12 +502,48 @@ impl Parser<'_> {
 
             sources.push(SourceEntry {
                 id: id.to_owned(),
-                kind: SourceKind::Directory,
-                path: PathBuf::from(path),
                 priority,
+                origin,
             });
         }
         Ok(sources)
+    }
+
+    /// The `url`, `ref` and `trusted` fields of a Git source.
+    fn git_origin(
+        &self,
+        entries: &[Entry],
+        field: &dyn Fn(&str) -> String,
+        offset: Option<usize>,
+    ) -> Result<GitOrigin> {
+        let url_entry = self.required(entries, &field("url"), "url", offset)?;
+        let url = self.string(&url_entry.value, &field("url"))?;
+        if crate::git::validate_url_syntax(url).is_err() {
+            return Err(self.corrupt(Rule::InvalidValue, &field("url"), url_entry.value_offset()));
+        }
+        let ref_entry = self.required(entries, &field("ref"), "ref", offset)?;
+        let reference = self.string(&ref_entry.value, &field("ref"))?;
+        if crate::git::validate_ref_syntax(reference).is_err() {
+            return Err(self.corrupt(Rule::InvalidValue, &field("ref"), ref_entry.value_offset()));
+        }
+        let trusted = match find(entries, "trusted") {
+            None => false,
+            Some(entry) => match entry.value.kind {
+                NodeKind::Boolean(trusted) => trusted,
+                _ => {
+                    return Err(self.corrupt(
+                        Rule::WrongType,
+                        &field("trusted"),
+                        entry.value_offset(),
+                    ));
+                }
+            },
+        };
+        Ok(GitOrigin {
+            url: url.to_owned(),
+            reference: reference.to_owned(),
+            trusted,
+        })
     }
 
     fn selections(&self, node: &Node) -> Result<Vec<Selection>> {
@@ -504,15 +633,17 @@ mod tests {
             sources: vec![
                 SourceEntry {
                     id: "team".to_owned(),
-                    kind: SourceKind::Directory,
-                    path: PathBuf::from("/srv/team \"defs\""),
                     priority: 10,
+                    origin: SourceOrigin::Directory {
+                        path: PathBuf::from("/srv/team \"defs\""),
+                    },
                 },
                 SourceEntry {
                     id: "alpha".to_owned(),
-                    kind: SourceKind::Directory,
-                    path: PathBuf::from("/srv/alpha"),
                     priority: 5,
+                    origin: SourceOrigin::Directory {
+                        path: PathBuf::from("/srv/alpha"),
+                    },
                 },
             ],
             selections: Vec::new(),
@@ -529,7 +660,10 @@ mod tests {
         let parsed = Config::parse(&text).unwrap();
         assert_eq!(parsed.selections, config.selections);
         assert_eq!(parsed.sources[0].id, "alpha");
-        assert_eq!(parsed.sources[1].path, PathBuf::from("/srv/team \"defs\""));
+        assert_eq!(
+            parsed.sources[1].path(),
+            Some(Path::new("/srv/team \"defs\""))
+        );
         assert!(text.contains("harnesses = [\"claude\", \"codex\"]"));
         assert_eq!(parsed.source("team").unwrap().priority, 10);
         assert!(parsed.source("nope").is_none());
@@ -569,7 +703,8 @@ mod tests {
             (source(&ok.replace("\"team\"", "1")), Rule::WrongType),
             (source(&ok.replace("\"team\"", "\"Team\"")), Rule::NameRule),
             (source(&ok.replace("\"team\"", "\"local\"")), Rule::NameRule),
-            (source(&ok.replace("directory", "git")), Rule::InvalidValue),
+            (source(&ok.replace("directory", "svn")), Rule::InvalidValue),
+            (source(&ok.replace("directory", "git")), Rule::UnknownKey),
             (
                 source(&ok.replace("/srv/team", "srv/team")),
                 Rule::InvalidValue,
@@ -660,9 +795,76 @@ mod tests {
             "[\"codex\"]"
         );
         assert_eq!(SourceKind::Directory.as_str(), "directory");
+        assert_eq!(SourceKind::Git.as_str(), "git");
         assert_eq!(
             serde_json::to_string(&SourceKind::Directory).unwrap(),
             "\"directory\""
         );
+    }
+
+    #[test]
+    fn git_sources_round_trip_and_are_strict() {
+        let config = Config {
+            sources: vec![SourceEntry {
+                id: "personal".to_owned(),
+                priority: 20,
+                origin: SourceOrigin::Git(GitOrigin {
+                    url: "git@github.com:me/mcp.git".to_owned(),
+                    reference: "main".to_owned(),
+                    trusted: true,
+                }),
+            }],
+            selections: Vec::new(),
+        };
+        let text = config.render();
+        assert_eq!(
+            text,
+            "schema_version = 1\n\n[[sources]]\nid = \"personal\"\nkind = \"git\"\n\
+             url = \"git@github.com:me/mcp.git\"\nref = \"main\"\npriority = 20\ntrusted = true\n"
+        );
+        let parsed = Config::parse(&text).unwrap();
+        assert_eq!(parsed, config);
+        let source = &parsed.sources[0];
+        assert_eq!(source.kind(), SourceKind::Git);
+        assert_eq!(source.path(), None);
+        assert!(source.git().unwrap().trusted);
+
+        let v = "schema_version = 1\n[[sources]]\n";
+        let ok = "id = \"p\"\nkind = \"git\"\nurl = \"https://h/me/d.git\"\nref = \"main\"\npriority = 2";
+        let untrusted = Config::parse(&format!("{v}{ok}\n")).unwrap();
+        assert!(!untrusted.sources[0].git().unwrap().trusted);
+        assert_eq!(untrusted.sources[0].git().unwrap().reference, "main");
+        let directory = Config::parse(
+            "schema_version = 1\n[[sources]]\nid = \"d\"\nkind = \"directory\"\npath = \"/d\"\npriority = 1\n",
+        )
+        .unwrap();
+        assert!(directory.sources[0].git().is_none());
+        assert_eq!(directory.sources[0].kind(), SourceKind::Directory);
+        let cases = [
+            (format!("{v}{ok}\npath = \"/x\"\n"), Rule::UnknownKey),
+            (format!("{v}{ok}\ntrusted = 1\n"), Rule::WrongType),
+            (
+                format!(
+                    "{v}{}\n",
+                    ok.replace("https://h/me/d.git", "https://u:p@h/d")
+                ),
+                Rule::InvalidValue,
+            ),
+            (
+                format!("{v}{}\n", ok.replace("\"main\"", "\"-x\"")),
+                Rule::InvalidValue,
+            ),
+            (
+                format!("{v}{}\n", ok.replace("ref = \"main\"\n", "")),
+                Rule::MissingField,
+            ),
+            (
+                format!("{v}{}\n", ok.replace("url = \"https://h/me/d.git\"\n", "")),
+                Rule::MissingField,
+            ),
+        ];
+        for (text, rule) in cases {
+            assert_eq!(corrupt_rule(&text), rule, "{text}");
+        }
     }
 }

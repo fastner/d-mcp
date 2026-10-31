@@ -1,0 +1,6 @@
+name = "env-npx"
+
+[transport]
+type = "stdio"
+command = "env"
+args = ["NODE_ENV=production", "npx", "-y", "mcp-server@1.2.3"]

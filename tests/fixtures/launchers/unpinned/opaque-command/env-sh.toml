@@ -1,0 +1,6 @@
+name = "env-sh"
+
+[transport]
+type = "stdio"
+command = "/usr/bin/env"
+args = ["-i", "LANG=C", "sh", "-c", "mcp-server"]

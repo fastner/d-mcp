@@ -1,0 +1,6 @@
+name = "uvx-from-comma-name"
+
+[transport]
+type = "stdio"
+command = "uvx"
+args = ["--from", "evil,dep==1.0", "tool"]

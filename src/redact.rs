@@ -20,6 +20,14 @@
 //! there is content without showing it. A name that does not look like a
 //! name (see [`safe_key`]) is replaced by [`REDACTED_KEY`].
 //!
+//! **The approval view** ([`approval_view`]) is the one documented exception
+//! (ADR 0006): for a definition from a Git source, the refresh change set,
+//! `approve`, `accept-risk` and the pending-approval detail additionally
+//! show `command`, `args`, the URL path and the `harness.codex.cwd`
+//! override, so an approval is never blind. These have already passed the
+//! WP1 secret rules. Env values, header values, every other override value,
+//! `description`, the client id and scopes stay redacted.
+//!
 //! The existing invariants are kept, not re-implemented here: child stdout
 //! is only parsed and child stderr is dropped ([`crate::process`]), sync
 //! reports carry no field values, and parser errors carry only file, line
@@ -513,10 +521,130 @@ pub fn definition_view(definition: &Definition) -> EntryView {
     }
 }
 
+/// The approval view of a Git-source definition: the redacted
+/// [`definition_view`] plus what an approval must not be blind to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ApprovalView {
+    /// The redacted view; `command`, `args` and `url.path` are no longer
+    /// listed as hidden.
+    #[serde(flatten)]
+    pub view: EntryView,
+    /// The stdio command.
+    pub command: Option<String>,
+    /// The stdio arguments.
+    pub args: Option<Vec<String>>,
+    /// The URL path of an HTTP server.
+    pub url_path: Option<String>,
+    /// The `harness.codex.cwd` override.
+    pub cwd: Option<String>,
+}
+
+impl ApprovalView {
+    /// A one-line text form: the [`EntryView::text`] followed by
+    /// `command=`, `args=` (a JSON array), `url_path=` and `cwd=`.
+    #[must_use]
+    pub fn text(&self) -> String {
+        let mut text = self.view.text();
+        if let Some(command) = &self.command {
+            text.push_str(&format!(" command={command}"));
+        }
+        if let Some(args) = &self.args {
+            text.push_str(&format!(
+                " args={}",
+                serde_json::to_string(args).unwrap_or_default()
+            ));
+        }
+        if let Some(path) = &self.url_path {
+            text.push_str(&format!(" url_path={path}"));
+        }
+        if let Some(cwd) = &self.cwd {
+            text.push_str(&format!(" cwd={cwd}"));
+        }
+        text
+    }
+}
+
+/// The approval view of a definition from a Git source (see the module
+/// documentation). Never use it for a directory source or a harness entry.
+#[must_use]
+pub fn approval_view(definition: &Definition) -> ApprovalView {
+    let mut view = definition_view(definition);
+    let (command, args, url_path) = match &definition.transport {
+        Transport::Stdio { command, args, .. } => {
+            view.hidden
+                .retain(|part| !matches!(*part, "command" | "args"));
+            (Some(command.clone()), Some(args.clone()), None)
+        }
+        Transport::Http { url, .. } => {
+            if let Some(url) = &mut view.url {
+                url.hidden.retain(|part| *part != "path");
+            }
+            let path = parse_url_shape(url).map(|shape| shape.path.to_owned());
+            (None, None, path.filter(|path| !path.is_empty()))
+        }
+    };
+    let cwd = definition
+        .overrides
+        .get("codex")
+        .and_then(|table| table.get("cwd"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    ApprovalView {
+        view,
+        command,
+        args,
+        url_path,
+        cwd,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn approval_views_show_command_args_path_and_cwd_only() {
+        let stdio = crate::definition::parse_definition(
+            "name = \"a\"\ndescription = \"CANARY\"\n[transport]\ntype = \"stdio\"\n\
+             command = \"npx\"\nargs = [\"-y\", \"pkg@1.2.3\"]\n[env]\nFWD = { forward = true }\n\
+             LIT = { value = \"CANARYVALUE\" }\n[harness.codex]\ncwd = \"/srv/work\"\n\
+             enabled_tools = [\"CANARY\"]\n[harness.claude]\ntimeout = 5000\n",
+            "a",
+        )
+        .unwrap();
+        let view = approval_view(&stdio);
+        assert_eq!(view.command.as_deref(), Some("npx"));
+        assert_eq!(
+            view.args.as_deref(),
+            Some(&["-y".to_owned(), "pkg@1.2.3".to_owned()][..])
+        );
+        assert_eq!(view.cwd.as_deref(), Some("/srv/work"));
+        assert_eq!(view.url_path, None);
+        assert_eq!(
+            view.view.hidden,
+            ["description", "env.values", "override.values"]
+        );
+        let text = format!("{} {}", view.text(), serde_json::to_string(&view).unwrap());
+        assert!(!text.contains("CANARY"), "{text}");
+        assert!(
+            text.contains("command=npx args=[\"-y\",\"pkg@1.2.3\"] cwd=/srv/work"),
+            "{text}"
+        );
+        let http = crate::definition::parse_definition(
+            "name = \"h\"\n[transport]\ntype = \"http\"\nurl = \"https://mcp.example.test/v1/mcp\"\n\
+             [auth]\ntype = \"oauth\"\nclient_id = \"CANARY\"\n",
+            "h",
+        )
+        .unwrap();
+        let view = approval_view(&http);
+        assert_eq!(view.url_path.as_deref(), Some("/v1/mcp"));
+        assert!(view.view.url.as_ref().unwrap().hidden.is_empty());
+        assert_eq!(view.command, None);
+        let text = format!("{} {}", view.text(), serde_json::to_string(&view).unwrap());
+        assert!(!text.contains("CANARY"), "{text}");
+        assert!(text.contains("url_path=/v1/mcp"), "{text}");
+    }
 
     #[test]
     fn definitions_show_names_only() {
