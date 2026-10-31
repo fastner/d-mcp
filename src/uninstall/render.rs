@@ -52,6 +52,8 @@ pub fn json(uninstall: &Uninstall) -> Value {
         "purge": {
             "requested": purge.requested,
             "follow_store_link": purge.follow_store_link,
+            "include_local_repo": purge.include_local_repo,
+            "local_is_git": purge.local_is_git,
             "store_root_symlink": purge.root_is_link,
             "target": display(&purge.target),
             "entries": purge.entries.iter().map(|path| display(path)).collect::<Vec<_>>(),

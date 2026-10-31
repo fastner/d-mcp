@@ -306,7 +306,7 @@ fn doctor_is_ok_with_verified_harnesses_and_a_clean_store() {
     let (code, value, stderr) = run(&env, &[], &["doctor"]);
     assert_eq!(code, 0, "{value:#}\n{stderr}");
     assert_eq!(value["ok"], true);
-    for id in ["store", "state", "hash-key"] {
+    for id in ["store", "state", "hash-key", "lock", "approvals", "git"] {
         assert_eq!(check(&value, id, None)["severity"], "ok", "{id}");
     }
     let claude = check(&value, "harness-version", Some("claude"));
@@ -329,6 +329,7 @@ fn doctor_is_ok_with_verified_harnesses_and_a_clean_store() {
         "recurring-vanish",
         "shadowing",
         "static-token",
+        "pending-approval",
         "name-length",
         "credential-names",
         "managed-policy",
@@ -464,6 +465,13 @@ fn doctor_reports_store_problems_as_errors_with_exit_1() {
     let (code, value, _) = run(&env, &[], &["doctor"]);
     assert_eq!(code, 1);
     assert_eq!(check(&value, "store", None)["code"], "schema-unsupported");
+    // Without config.toml the approvals cannot be matched to sources; the
+    // `ok` says so instead of claiming they all belong to one.
+    let approvals = check(&value, "approvals", None);
+    assert_eq!(approvals["severity"], "ok");
+    let message = approvals["message"].as_str().unwrap();
+    assert!(message.contains("is not checked"), "{message}");
+    assert!(!message.contains("every approval"), "{message}");
 }
 
 #[test]

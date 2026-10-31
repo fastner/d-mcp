@@ -1,0 +1,6 @@
+name = "docker-container-run"
+
+[transport]
+type = "stdio"
+command = "docker"
+args = ["container", "run", "-i", "mcp/fetch"]

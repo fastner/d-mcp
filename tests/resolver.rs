@@ -20,6 +20,8 @@ fn file(spec: &FileSpec, position: usize) -> FileEntry {
             key: None,
             outcome: Err(FileProblem::file(Rule::InvalidStem)),
             override_sites: OverrideSites::default(),
+            findings: Vec::new(),
+            gate: None,
         },
         Some(index) => {
             let name = NAMES[index];
@@ -39,6 +41,8 @@ fn file(spec: &FileSpec, position: usize) -> FileEntry {
                 key: Some(name.to_owned()),
                 outcome,
                 override_sites: OverrideSites::default(),
+                findings: Vec::new(),
+                gate: None,
             }
         }
     }
@@ -76,6 +80,7 @@ fn sources() -> impl Strategy<Value = Vec<SourceSnapshot>> {
                         Vec::new()
                     },
                     notices: Vec::new(),
+                    revoked: std::collections::BTreeSet::new(),
                 }
             })
             .collect()

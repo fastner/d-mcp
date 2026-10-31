@@ -1,0 +1,6 @@
+name = "npx-package"
+
+[transport]
+type = "stdio"
+command = "npx"
+args = ["--package=mcp-remote", "mcp-remote"]

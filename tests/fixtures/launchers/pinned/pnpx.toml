@@ -1,0 +1,6 @@
+name = "pnpx"
+
+[transport]
+type = "stdio"
+command = "pnpx"
+args = ["mcp-server@1.2.3"]

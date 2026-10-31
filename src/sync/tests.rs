@@ -413,6 +413,8 @@ fn vanished_held_orphaned() {
         HeldReason::InvalidWinner,
         HeldReason::SourceUnavailable,
         HeldReason::NotOffered,
+        HeldReason::PendingApproval,
+        HeldReason::RiskNotAccepted,
     ] {
         let held = Case::new()
             .desire("a", Desired::Held(reason))

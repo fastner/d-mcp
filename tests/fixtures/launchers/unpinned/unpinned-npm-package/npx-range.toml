@@ -1,0 +1,6 @@
+name = "npx-range"
+
+[transport]
+type = "stdio"
+command = "npx"
+args = ["mcp-server@^1.2.3"]

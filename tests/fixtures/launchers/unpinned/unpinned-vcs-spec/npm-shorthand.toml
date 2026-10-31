@@ -1,0 +1,6 @@
+name = "npm-shorthand"
+
+[transport]
+type = "stdio"
+command = "npx"
+args = ["org/mcp-server"]

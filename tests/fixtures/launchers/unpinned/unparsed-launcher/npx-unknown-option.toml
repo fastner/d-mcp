@@ -1,0 +1,6 @@
+name = "npx-unknown-option"
+
+[transport]
+type = "stdio"
+command = "npx"
+args = ["--frobnicate", "x@1.0.0", "evil"]

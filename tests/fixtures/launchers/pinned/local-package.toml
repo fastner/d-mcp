@@ -1,0 +1,6 @@
+name = "local-package"
+
+[transport]
+type = "stdio"
+command = "npx"
+args = ["./packages/mcp-server"]

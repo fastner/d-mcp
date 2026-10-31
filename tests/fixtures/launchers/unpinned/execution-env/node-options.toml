@@ -1,0 +1,9 @@
+name = "node-options"
+
+[transport]
+type = "stdio"
+command = "npx"
+args = ["-y", "pkg@1.2.3"]
+
+[env]
+NODE_OPTIONS = { value = "--require ./hook.js" }

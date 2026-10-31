@@ -1,0 +1,6 @@
+name = "bunx"
+
+[transport]
+type = "stdio"
+command = "bunx"
+args = ["@scope/mcp-server"]

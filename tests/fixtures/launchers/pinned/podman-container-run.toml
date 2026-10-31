@@ -1,0 +1,6 @@
+name = "podman-container-run"
+
+[transport]
+type = "stdio"
+command = "podman"
+args = ["container", "run", "-i", "--rm", "mcp/fetch:1.2"]

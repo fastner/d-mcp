@@ -1,0 +1,6 @@
+name = "uvx-at"
+
+[transport]
+type = "stdio"
+command = "uvx"
+args = ["mcp-server-time@0.6.2"]

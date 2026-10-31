@@ -1,0 +1,6 @@
+name = "npm-tarball"
+
+[transport]
+type = "stdio"
+command = "npx"
+args = ["https://registry.example.test/mcp-server-1.2.3.tgz"]

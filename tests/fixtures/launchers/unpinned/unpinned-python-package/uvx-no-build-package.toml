@@ -1,0 +1,6 @@
+name = "uvx-no-build-package"
+
+[transport]
+type = "stdio"
+command = "uvx"
+args = ["--no-build-package", "x==1.0", "evil"]

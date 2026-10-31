@@ -1,0 +1,6 @@
+name = "npx-latest"
+
+[transport]
+type = "stdio"
+command = "npx"
+args = ["mcp-server@latest"]

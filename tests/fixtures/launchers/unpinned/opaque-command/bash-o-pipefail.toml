@@ -1,0 +1,6 @@
+name = "bash-o-pipefail"
+
+[transport]
+type = "stdio"
+command = "bash"
+args = ["-o", "pipefail", "-c", "npx evil"]

@@ -674,3 +674,205 @@ fn discovery_debug_forms_never_leak() {
     }
     assert!(imported_any);
 }
+
+/// A Git source whose definitions carry the team fixture's canaries:
+/// `source add-git` (also as a dry run), `source list`, `resolve` and
+/// `source remove` never show them, in either form. The snapshot under
+/// `sources/` holds the definitions as they are, like a directory source;
+/// every other store file stays canary-free.
+#[test]
+fn git_sources_never_leak() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/real-setup/team/servers");
+    for json in [false, true] {
+        let env = TestEnv::new().with_git();
+        env.init();
+        let remote = env.remote("team");
+        for entry in fs::read_dir(&fixture).expect("team fixture") {
+            let entry = entry.expect("entry");
+            let name = entry.file_name().into_string().expect("utf-8 name");
+            remote.write(
+                &format!("servers/{name}"),
+                fs::read(entry.path()).expect("read"),
+            );
+        }
+        remote.commit("team");
+        let url = remote.url();
+        let mut seen = Vec::new();
+        for (expected, args) in [
+            (0, vec!["--dry-run", "source", "add-git", url.as_str()]),
+            (0, vec!["source", "add-git", url.as_str(), "--id", "team"]),
+            (0, vec!["select", "wiki"]),
+            (0, vec!["select", "broken"]),
+            (0, vec!["source", "list"]),
+            (0, vec!["resolve"]),
+            (0, vec!["inventory"]),
+            (0, vec!["--dry-run", "source", "remove", "team"]),
+        ] {
+            let mut cmd = env.cmd();
+            if json {
+                cmd.arg("--json");
+            }
+            let output = cmd.args(&args).output().expect("run d-mcp");
+            let text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.status.code(), Some(expected), "{args:?}: {text}");
+            seen.push((args, text));
+        }
+        let store = env.default_store();
+        assert!(
+            fs::read_to_string(store.join("sources/team/snapshot/servers/wiki.toml"))
+                .expect("snapshot")
+                .contains(CANARY)
+        );
+        for (path, contents) in snapshot(&store) {
+            if path.starts_with(store.join("sources")) {
+                continue;
+            }
+            if let Some(contents) = contents {
+                assert!(
+                    !String::from_utf8_lossy(&contents).contains(CANARY),
+                    "a canary reached {}",
+                    path.display()
+                );
+            }
+        }
+        let output = env
+            .cmd()
+            .args(["source", "remove", "team"])
+            .output()
+            .expect("run");
+        assert!(output.status.success());
+        seen.push((
+            vec!["source remove"],
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        ));
+        for (args, text) in seen {
+            assert!(
+                !text.contains(CANARY),
+                "a canary leaked from {args:?}:\n{text}"
+            );
+        }
+        assert!(!store.join("sources/team").exists());
+    }
+}
+
+/// The approval view of a Git-source definition shows `command`, `args`,
+/// the URL path and `cwd`, and nothing else: canaries in env values,
+/// override values, the description, the client id and scopes never reach
+/// any output of `source refresh`, `approve` (also `--all-from`),
+/// `accept-risk`, `revoke`, `source trust`, `select --all-from`, `resolve`,
+/// `status` or `sync`, in either form, nor any store file outside the
+/// snapshot.
+#[test]
+fn approval_views_never_leak() {
+    let stdio = "name = \"tool\"\ndescription = \"CANARY_DESCRIPTION\"\n[transport]\n\
+                 type = \"stdio\"\ncommand = \"uvx\"\nargs = [\"tool-mcp\", \"--stdio\"]\n\
+                 [env]\nTOKEN = { forward = true }\nMODE = { value = \"CANARY_ENV_VALUE\" }\n\
+                 [harness.codex]\ncwd = \"/srv/work\"\nenabled_tools = [\"CANARY_TOOL\"]\n";
+    let http = "name = \"remote\"\n[transport]\ntype = \"http\"\n\
+                url = \"https://mcp.example.test/v1/mcp\"\n[auth]\ntype = \"oauth\"\n\
+                client_id = \"CANARY_CLIENT\"\nscopes = [\"CANARY_SCOPE\"]\n\
+                [harness.claude]\ntimeout = 5000\n";
+    for json in [false, true] {
+        let env = TestEnv::new().with_git();
+        env.init();
+        fs::create_dir_all(env.codex_home()).expect("codex home");
+        fs::write(env.codex_config(), "").expect("codex config");
+        let remote = env.remote("team");
+        remote.write("servers/tool.toml", stdio);
+        remote.write("servers/remote.toml", http);
+        remote.commit("team");
+        let url = remote.url();
+        env.cmd()
+            .args(["source", "add-git", url.as_str(), "--id", "team"])
+            .assert()
+            .success();
+        let hash = |name: &str| -> String {
+            let (_, value, _) = env.json(&["--dry-run", "approve", name]);
+            value["data"]["definition_hash"]
+                .as_str()
+                .expect("hash")
+                .to_owned()
+        };
+        let (tool, remote_hash) = (hash("tool"), hash("remote"));
+        remote.write("servers/tool.toml", stdio.replace("--stdio", "--quiet"));
+        remote.commit("change");
+        let mut seen = Vec::new();
+        let mut run = |args: Vec<String>, expected: i32| {
+            let mut cmd = env.cmd();
+            if json {
+                cmd.arg("--json");
+            }
+            let output = cmd.args(&args).output().expect("run d-mcp");
+            let text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.status.code(), Some(expected), "{args:?}: {text}");
+            seen.push((args, text));
+        };
+        let owned = |list: &[&str]| list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        run(owned(&["--dry-run", "source", "refresh", "team"]), 0);
+        run(owned(&["source", "refresh", "team"]), 0);
+        let tool = {
+            let (_, value, _) = env.json(&["--dry-run", "approve", "tool"]);
+            assert_ne!(value["data"]["definition_hash"], tool.as_str());
+            value["data"]["definition_hash"]
+                .as_str()
+                .expect("hash")
+                .to_owned()
+        };
+        run(owned(&["--dry-run", "approve", "tool"]), 1);
+        run(
+            owned(&["--dry-run", "accept-risk", "tool", "--reason", "ours"]),
+            0,
+        );
+        run(
+            owned(&["accept-risk", "tool", "--reason", "ours", "--expect", &tool]),
+            0,
+        );
+        run(owned(&["approve", "tool", "--expect", &tool]), 0);
+        run(owned(&["approve", "remote", "--expect", &remote_hash]), 0);
+        run(owned(&["--dry-run", "source", "trust", "team", "--on"]), 0);
+        run(owned(&["source", "trust", "team", "--on"]), 0);
+        run(owned(&["--dry-run", "approve", "--all-from", "team"]), 0);
+        run(owned(&["--dry-run", "select", "--all-from", "team"]), 0);
+        run(owned(&["select", "--all-from", "team"]), 0);
+        run(owned(&["resolve"]), 0);
+        run(owned(&["status"]), 0);
+        run(owned(&["sync", "--harness", "codex", "--dry-run"]), 0);
+        run(owned(&["--dry-run", "revoke", "tool"]), 0);
+        run(owned(&["revoke", "tool"]), 0);
+        run(owned(&["resolve"]), 0);
+        for (args, text) in &seen {
+            assert!(
+                !text.contains(CANARY),
+                "a canary leaked from {args:?}:\n{text}"
+            );
+        }
+        // The approval view itself is not blind.
+        let (_, value, _) = env.json(&["--dry-run", "approve", "remote"]);
+        assert_eq!(value["data"]["view"]["url_path"], "/v1/mcp");
+        let (_, value, _) = env.json(&["--dry-run", "accept-risk", "tool", "--reason", "x"]);
+        assert_eq!(value["data"]["view"]["command"], "uvx");
+        assert_eq!(value["data"]["view"]["cwd"], "/srv/work");
+        let store = env.default_store();
+        for (path, contents) in snapshot(&store) {
+            if path.starts_with(store.join("sources")) {
+                continue;
+            }
+            if let Some(contents) = contents {
+                assert!(
+                    !String::from_utf8_lossy(&contents).contains(CANARY),
+                    "a canary reached {}",
+                    path.display()
+                );
+            }
+        }
+    }
+}

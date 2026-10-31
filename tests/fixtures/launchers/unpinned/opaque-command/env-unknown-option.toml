@@ -1,0 +1,6 @@
+name = "env-unknown-option"
+
+[transport]
+type = "stdio"
+command = "env"
+args = ["--frobnicate", "npx", "pkg@1.0.0"]

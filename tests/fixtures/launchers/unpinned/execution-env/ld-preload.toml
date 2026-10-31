@@ -1,0 +1,9 @@
+name = "ld-preload"
+
+[transport]
+type = "stdio"
+command = "npx"
+args = ["-y", "pkg@1.2.3"]
+
+[env]
+LD_PRELOAD = { value = "/opt/hook.so" }

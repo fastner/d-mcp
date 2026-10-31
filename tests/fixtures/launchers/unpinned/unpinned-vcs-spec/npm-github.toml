@@ -1,0 +1,6 @@
+name = "npm-github"
+
+[transport]
+type = "stdio"
+command = "npx"
+args = ["github:org/mcp-server"]

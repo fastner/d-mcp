@@ -1,0 +1,6 @@
+name = "uvx-with"
+
+[transport]
+type = "stdio"
+command = "uvx"
+args = ["--with", "extra-plugin", "mcp-server-fetch==2025.4.7"]

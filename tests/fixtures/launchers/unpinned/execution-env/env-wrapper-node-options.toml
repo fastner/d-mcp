@@ -1,0 +1,6 @@
+name = "env-wrapper-node-options"
+
+[transport]
+type = "stdio"
+command = "env"
+args = ["NODE_OPTIONS=--require=./hook.js", "npx", "-y", "pkg@1.2.3"]

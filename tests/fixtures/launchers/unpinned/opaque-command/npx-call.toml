@@ -1,0 +1,6 @@
+name = "npx-call"
+
+[transport]
+type = "stdio"
+command = "npx"
+args = ["-c", "mcp-server --stdio"]

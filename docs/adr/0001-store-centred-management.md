@@ -1,7 +1,7 @@
 # ADR 0001: Store-Centred Management
 
 - Status: Accepted
-- Date: 2026-10-26
+- Date: 2026-10-26, amended 2026-10-31 (WP5 Git sources)
 - Source: concept `docs/concept/2026-10-26-d-mcp.md`, WP1b plan "Core model, store and resolver"
 
 ## Context
@@ -38,3 +38,12 @@ configuration files as pure output targets.
   delivered (see ADR 0003).
 - d-mcp reuses Dalo's patterns as concepts, not as a shared store: the two tools keep separate
   stores.
+
+**Amendment 2026-10-31 (WP5): Git sources and approvals.** The decision stays; WP5 refines three
+statements. The "lock file of pinned definitions" is `lock.toml`, which pins one *commit* per Git
+source; approvals live in a separate `approvals.toml` (ADR 0006). Resolution is a pure function of
+the store, the source snapshots and the approvals: a Git source is read from its snapshot under
+`<store>/sources/<id>/`, never through `git`. Mutating commands still take the lock before reading
+`config.toml`, with one exception: `source add-git` and `source refresh` run their network `git`
+calls (the clone or fetch) before taking it, and re-check the source under the lock before writing
+anything into the store.

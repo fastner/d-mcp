@@ -1,0 +1,9 @@
+name = "uv-index-url"
+
+[transport]
+type = "stdio"
+command = "uvx"
+args = ["pkg==1.0"]
+
+[env]
+UV_INDEX_URL = { value = "https://index.example.test/simple" }

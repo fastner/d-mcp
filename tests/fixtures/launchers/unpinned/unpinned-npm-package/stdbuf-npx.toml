@@ -1,0 +1,6 @@
+name = "stdbuf-npx"
+
+[transport]
+type = "stdio"
+command = "stdbuf"
+args = ["-o", "L", "npx", "evil"]

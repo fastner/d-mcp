@@ -38,8 +38,10 @@ pub const LOCK_RETRY_DELAYS: [Duration; 7] = [
 /// Store entries that may exist in a (possibly partial) store directory.
 /// `state.toml` is written by `sync`; `.hash-key` by `init` and by any
 /// mutating command that finds it missing (see [`crate::hashkey`]);
-/// `lock.toml` and `approvals.toml` are written by later work packages.
-pub const KNOWN_ENTRIES: [&str; 7] = [
+/// `lock.toml` (pinned commits) and `sources/` (Git clones and snapshots) by
+/// `source add-git`; `approvals.toml` by `approve`, `accept-risk` and
+/// `revoke`.
+pub const KNOWN_ENTRIES: [&str; 8] = [
     "config.toml",
     "local",
     ".lock",
@@ -47,6 +49,7 @@ pub const KNOWN_ENTRIES: [&str; 7] = [
     ".hash-key",
     "lock.toml",
     "approvals.toml",
+    "sources",
 ];
 
 /// A non-fatal store condition, reported as a `warning:` line on stderr.
@@ -297,6 +300,12 @@ pub struct StorePaths {
     pub state: PathBuf,
     /// `.hash-key`, the key of the display hashes (see [`crate::hashkey`]).
     pub hash_key: PathBuf,
+    /// `lock.toml`, the pinned commits of the Git sources.
+    pub pins: PathBuf,
+    /// `approvals.toml`: approvals, revoked markers and accepted risks.
+    pub approvals: PathBuf,
+    /// `sources/`, one directory per Git source (`repo/` and `snapshot/`).
+    pub sources: PathBuf,
 }
 
 impl StorePaths {
@@ -310,8 +319,17 @@ impl StorePaths {
             lock: root.join(".lock"),
             state: root.join("state.toml"),
             hash_key: root.join(".hash-key"),
+            pins: root.join("lock.toml"),
+            approvals: root.join("approvals.toml"),
+            sources: root.join("sources"),
             root,
         }
+    }
+
+    /// The location of a Git source, `sources/<id>`.
+    #[must_use]
+    pub fn git_source(&self, id: &str) -> PathBuf {
+        self.sources.join(id)
     }
 
     /// Whether `config.toml` exists (as any file-system entry).

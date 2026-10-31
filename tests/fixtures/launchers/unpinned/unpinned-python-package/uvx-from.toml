@@ -1,0 +1,6 @@
+name = "uvx-from"
+
+[transport]
+type = "stdio"
+command = "uvx"
+args = ["--from", "mcp-server-git>=0.6", "mcp-server-git"]

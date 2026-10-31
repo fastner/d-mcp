@@ -13,6 +13,13 @@
 //! the fakes on `PATH` with [`TestEnv::with_path`], [`TestEnv::fake_codex_dir`]
 //! and [`TestEnv::fake_claude_dir`]. The fake `claude` refuses to run unless
 //! its `HOME` lies in a directory marked by [`TEST_ROOT_MARKER`].
+//!
+//! Git tests use [`TestEnv::with_git`]: `PATH` then holds only a symlink to
+//! the resolved `git` binary, and git's configuration is isolated for d-mcp
+//! and for the repository builders alike (`GIT_CONFIG_GLOBAL` points to a
+//! file in the temporary root, `GIT_CONFIG_NOSYSTEM=1`, and
+//! `GIT_CONFIG_COUNT` and `GIT_CONFIG_PARAMETERS` are unset). Remotes are
+//! local bare repositories built by [`Remote`]; no test uses the network.
 
 #![allow(dead_code)]
 
@@ -41,6 +48,7 @@ pub struct TestEnv {
     path: OsString,
     codex_home: bool,
     claude_config_dir: bool,
+    git_config: Option<PathBuf>,
 }
 
 impl TestEnv {
@@ -72,7 +80,43 @@ impl TestEnv {
             root,
             codex_home: true,
             claude_config_dir: true,
+            git_config: None,
         }
+    }
+
+    /// Puts only the resolved `git` binary on `PATH` (a symlink in
+    /// `<root>/git-bin`) and gives d-mcp's git the isolated global
+    /// configuration [`TestEnv::git_config`] (an empty file) and no system
+    /// configuration.
+    pub fn with_git(mut self) -> Self {
+        let bin = self.git_bin();
+        fs::create_dir_all(&bin).expect("create git bin dir");
+        let link = bin.join("git");
+        if fs::symlink_metadata(&link).is_err() {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(system_git(), &link).expect("link git");
+        }
+        let config = self.root().join("gitconfig");
+        fs::write(&config, "").expect("write the isolated git config");
+        self.git_config = Some(config);
+        self.with_path(&[bin])
+    }
+
+    /// The directory that holds the `git` symlink of [`TestEnv::with_git`].
+    pub fn git_bin(&self) -> PathBuf {
+        self.root().join("git-bin")
+    }
+
+    /// The global git configuration d-mcp's git reads with
+    /// [`TestEnv::with_git`].
+    pub fn git_config(&self) -> PathBuf {
+        self.root().join("gitconfig")
+    }
+
+    /// A bare repository `<root>/remotes/<name>.git` with a work tree
+    /// `<root>/remotes/<name>-work` whose `origin` it is.
+    pub fn remote(&self, name: &str) -> Remote {
+        Remote::new(self.root(), name)
     }
 
     /// Sets `PATH` to exactly these directories.
@@ -259,6 +303,12 @@ impl TestEnv {
             cmd.env("CODEX_HOME", self.root().join("codex"));
         } else {
             cmd.env_remove("CODEX_HOME");
+        }
+        if let Some(config) = &self.git_config {
+            cmd.env("GIT_CONFIG_GLOBAL", config)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_CONFIG_COUNT")
+                .env_remove("GIT_CONFIG_PARAMETERS");
         }
         cmd
     }
@@ -505,4 +555,158 @@ pub fn snapshot(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
     }
     entries.sort();
     entries
+}
+
+/// The `git` binary of the machine running the tests, resolved from the test
+/// process's `PATH` and canonicalized.
+pub fn system_git() -> PathBuf {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("git"))
+        .find(|candidate| candidate.is_file())
+        .and_then(|git| git.canonicalize().ok())
+        .expect("the git tests need `git` on PATH")
+}
+
+/// A local bare repository and a work tree that pushes to it, built with
+/// the system `git` under an isolated configuration
+/// (`<root>/builder-gitconfig`, no system configuration, `HOME` in the
+/// temporary root).
+pub struct Remote {
+    /// The bare repository; its path is the URL d-mcp clones.
+    pub bare: PathBuf,
+    /// The work tree.
+    pub work: PathBuf,
+    root: PathBuf,
+}
+
+impl Remote {
+    fn new(root: &Path, name: &str) -> Self {
+        let remotes = root.join("remotes");
+        fs::create_dir_all(&remotes).expect("create remotes dir");
+        let config = root.join("builder-gitconfig");
+        if !config.exists() {
+            fs::write(
+                &config,
+                "[user]\n\tname = d-mcp test\n\temail = test@example.invalid\n\
+                 [init]\n\tdefaultBranch = main\n[commit]\n\tgpgsign = false\n\
+                 [tag]\n\tgpgsign = false\n",
+            )
+            .expect("write builder git config");
+            fs::create_dir_all(root.join("builder-home")).expect("create builder home");
+        }
+        let remote = Self {
+            bare: remotes.join(format!("{name}.git")),
+            work: remotes.join(format!("{name}-work")),
+            root: root.to_path_buf(),
+        };
+        remote.git_in(
+            &remotes,
+            &["init", "-q", "--bare", "-b", "main", &format!("{name}.git")],
+        );
+        remote.git_in(
+            &remotes,
+            &["init", "-q", "-b", "main", &format!("{name}-work")],
+        );
+        remote.git(&[
+            "remote",
+            "add",
+            "origin",
+            remote.bare.to_str().expect("utf-8"),
+        ]);
+        remote
+    }
+
+    /// The URL to clone: the bare repository's absolute path.
+    pub fn url(&self) -> String {
+        self.bare.to_str().expect("utf-8 path").to_owned()
+    }
+
+    /// The isolated `git` command of the builders, run in `dir`.
+    pub fn command(&self, dir: &Path) -> std::process::Command {
+        let mut command = std::process::Command::new(system_git());
+        command
+            .env_clear()
+            .env("HOME", self.root.join("builder-home"))
+            .env("GIT_CONFIG_GLOBAL", self.root.join("builder-gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_DATE", "2026-10-31T12:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2026-10-31T12:00:00Z")
+            .current_dir(dir);
+        if let Some(tmp) = std::env::var_os("TMPDIR") {
+            command.env("TMPDIR", tmp);
+        }
+        command
+    }
+
+    /// Runs `git <args>` in `dir`, asserts success and returns stdout.
+    pub fn git_in(&self, dir: &Path, args: &[&str]) -> String {
+        let output = self.command(dir).args(args).output().expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("utf-8 git output")
+    }
+
+    /// Runs `git <args>` in the work tree.
+    pub fn git(&self, args: &[&str]) -> String {
+        self.git_in(&self.work, args)
+    }
+
+    /// Writes a file in the work tree, creating its directories.
+    pub fn write(&self, path: &str, bytes: impl AsRef<[u8]>) {
+        let target = self.work.join(path);
+        fs::create_dir_all(target.parent().expect("parent")).expect("create dirs");
+        fs::write(target, bytes).expect("write work-tree file");
+    }
+
+    /// Removes a file from the work tree.
+    pub fn remove(&self, path: &str) {
+        fs::remove_file(self.work.join(path)).expect("remove work-tree file");
+    }
+
+    /// Stages every change, commits and returns the new commit id (without
+    /// pushing).
+    pub fn commit_local(&self, message: &str) -> String {
+        self.git(&["add", "-A"]);
+        self.commit_staged(message)
+    }
+
+    /// Commits what is staged and returns the new commit id.
+    pub fn commit_staged(&self, message: &str) -> String {
+        self.git(&["commit", "-q", "--allow-empty", "-m", message]);
+        self.head()
+    }
+
+    /// Stages every change, commits, pushes the branch and returns the
+    /// commit id.
+    pub fn commit(&self, message: &str) -> String {
+        let commit = self.commit_local(message);
+        self.push();
+        commit
+    }
+
+    /// Pushes the current branch to `origin`.
+    pub fn push(&self) {
+        let branch = self.git(&["rev-parse", "--abbrev-ref", "HEAD"]);
+        self.git(&[
+            "push",
+            "-q",
+            "--force",
+            "origin",
+            &format!("HEAD:refs/heads/{}", branch.trim()),
+        ]);
+    }
+
+    /// The commit id of `HEAD` in the work tree.
+    pub fn head(&self) -> String {
+        self.git(&["rev-parse", "HEAD"]).trim().to_owned()
+    }
+
+    /// Runs `git <args>` on the bare repository.
+    pub fn bare_git(&self, args: &[&str]) -> String {
+        self.git_in(&self.bare, args)
+    }
 }

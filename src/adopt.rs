@@ -43,6 +43,7 @@ use crate::config::Harness;
 use crate::error::{Error, Result};
 use crate::hashkey::{self, HashKey};
 use crate::output::Report;
+use crate::source::ReadInputs;
 use crate::store::{Environment, StoreLock, StorePaths};
 
 pub use candidate::ServerPlan;
@@ -302,6 +303,8 @@ pub(crate) struct Context<'a> {
     pub(crate) options: &'a AdoptOptions<'a>,
     pub(crate) repository: PathBuf,
     pub(crate) key: Option<HashKey>,
+    /// `lock.toml` and `approvals.toml`, for the shared resolution.
+    pub(crate) inputs: ReadInputs,
 }
 
 impl Context<'_> {
@@ -360,6 +363,7 @@ pub fn adopt(
             }
         },
     };
+    let inputs = ReadInputs::load(paths)?;
     let cwd = env.cwd.clone().ok_or(Error::CurrentDirUnavailable)?;
     let context = Context {
         paths,
@@ -367,6 +371,7 @@ pub fn adopt(
         options,
         repository: repository_root(&cwd),
         key,
+        inputs,
     };
     let mut adoption = Adoption {
         store: paths.root.clone(),

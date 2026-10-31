@@ -103,6 +103,10 @@ pub enum HeldReason {
     SourceUnavailable,
     /// No source offers the server any more.
     NotOffered,
+    /// The winner from a Git source is not approved.
+    PendingApproval,
+    /// The winner is approved, but its audit findings are not accepted.
+    RiskNotAccepted,
 }
 
 impl HeldReason {
@@ -113,6 +117,8 @@ impl HeldReason {
             HeldReason::InvalidWinner => "invalid-winner",
             HeldReason::SourceUnavailable => "source-unavailable",
             HeldReason::NotOffered => "not-offered",
+            HeldReason::PendingApproval => "pending-approval",
+            HeldReason::RiskNotAccepted => "risk-not-accepted",
         }
     }
 }

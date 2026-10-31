@@ -1,0 +1,6 @@
+name = "uvx"
+
+[transport]
+type = "stdio"
+command = "uvx"
+args = ["mcp-server-fetch==2025.4.7"]

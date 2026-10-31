@@ -1,0 +1,6 @@
+name = "npm-tarball-commit"
+
+[transport]
+type = "stdio"
+command = "npx"
+args = ["https://registry.example.test/pkg.tgz@4f2a9c0d8e7b6a5f4e3d2c1b0a9f8e7d6c5b4a39"]

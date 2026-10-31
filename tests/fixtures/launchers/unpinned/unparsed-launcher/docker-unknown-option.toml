@@ -1,0 +1,6 @@
+name = "docker-unknown-option"
+
+[transport]
+type = "stdio"
+command = "docker"
+args = ["run", "--frobnicate", "x:1", "evil"]

@@ -1,0 +1,6 @@
+name = "env-split"
+
+[transport]
+type = "stdio"
+command = "env"
+args = ["-S", "npx mcp-server"]

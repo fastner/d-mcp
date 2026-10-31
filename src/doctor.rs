@@ -7,31 +7,34 @@
 //! store is reported as `error` checks instead of aborting, and the checks
 //! that need the store are then left out.
 //!
-//! The checks, in output order: `store`, `state`, `hash-key`,
-//! `harness-version` (per adapter, see `version`), `discovery` (only when
-//! it fails), `harness-config`,
+//! The checks, in output order: `store`, `state`, `hash-key`, `lock`,
+//! `approvals`, `harness-version` (per adapter, see `version`), `git`,
+//! `discovery` (only when it fails), `harness-config`,
 //! `drift`, `location-changed`, `pending`, `recurring-vanish`, `shadowing`,
-//! `static-token`, `name-length`, `credential-names`, `managed-policy`,
-//! and with `--auth` `login`. A check without findings reports one `ok`.
-//! Messages name harnesses, scopes, files, entries and variables only.
+//! `static-token`, `pending-approval`, `name-length`, `credential-names`,
+//! `managed-policy`, and with `--auth` `login`. A check without findings
+//! reports one `ok`. Messages name harnesses, scopes, files, entries and
+//! variables only. A corrupt `lock.toml` or `approvals.toml` is an `error`
+//! check like a corrupt `config.toml` (see `sources`), and `git` is never
+//! run.
 
 mod render;
+mod sources;
 mod version;
 
 use crate::adapter::{self, Adapter, LoginState, Scope};
-use crate::config::{Config, Harness, HarnessSet};
+use crate::config::{Config, Harness};
 use crate::definition::{Auth, MAX_NAME_LEN, Transport};
 use crate::error::{Error, Result};
 use crate::hashkey;
 use crate::inventory::{self, Class, Inventory, InventoryOptions};
 use crate::output::Report;
 use crate::process::ProcessRunner;
-use crate::resolver::{Status, resolve};
-use crate::source::{scan, source_specs};
+use crate::resolver::{Resolution, Status};
+use crate::source::{ReadInputs, load_resolution};
 use crate::state::{self, OriginScope, State};
 use crate::status::{AUTH_WARNING, login_states};
 use crate::store::{Environment, StorePaths};
-use crate::validate::validate;
 use version::Probe;
 
 /// How serious a check is.
@@ -66,8 +69,14 @@ pub enum CheckId {
     State,
     /// `.hash-key`: present and valid.
     HashKey,
+    /// `lock.toml`: valid.
+    Lock,
+    /// `approvals.toml`: valid, without orphaned approvals.
+    Approvals,
     /// The harness CLI's presence and `--version`.
     HarnessVersion,
+    /// `git` is on `PATH` when a Git source is registered.
+    Git,
     /// Discovery (the inventory the harness checks build on) could run.
     Discovery,
     /// Every discovered harness file could be read.
@@ -84,6 +93,8 @@ pub enum CheckId {
     Shadowing,
     /// A static token where the server supports OAuth.
     StaticToken,
+    /// A selected server is held for approval.
+    PendingApproval,
     /// An unmanaged entry name longer than the name limit.
     NameLength,
     /// The credential-name list can be incomplete (informational).
@@ -102,7 +113,10 @@ impl CheckId {
             CheckId::Store => "store",
             CheckId::State => "state",
             CheckId::HashKey => "hash-key",
+            CheckId::Lock => "lock",
+            CheckId::Approvals => "approvals",
             CheckId::HarnessVersion => "harness-version",
+            CheckId::Git => "git",
             CheckId::Discovery => "discovery",
             CheckId::HarnessConfig => "harness-config",
             CheckId::Drift => "drift",
@@ -111,6 +125,7 @@ impl CheckId {
             CheckId::RecurringVanish => "recurring-vanish",
             CheckId::Shadowing => "shadowing",
             CheckId::StaticToken => "static-token",
+            CheckId::PendingApproval => "pending-approval",
             CheckId::NameLength => "name-length",
             CheckId::CredentialNames => "credential-names",
             CheckId::ManagedPolicy => "managed-policy",
@@ -179,6 +194,11 @@ impl Check {
         self.hint = Some(hint.into());
         self
     }
+
+    fn code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
+    }
 }
 
 /// The whole doctor report.
@@ -216,6 +236,9 @@ pub struct DoctorOptions {
 struct Loaded {
     config: Option<Config>,
     state: Option<State>,
+    /// `lock.toml` and `approvals.toml`; `None` when one is corrupt or the
+    /// store is not initialized.
+    inputs: Option<ReadInputs>,
 }
 
 fn store_checks(paths: &StorePaths, checks: &mut Vec<Check>) -> Loaded {
@@ -227,6 +250,7 @@ fn store_checks(paths: &StorePaths, checks: &mut Vec<Check>) -> Loaded {
         return Loaded {
             config: None,
             state: None,
+            inputs: None,
         };
     }
     let config = match paths.load_config() {
@@ -276,7 +300,12 @@ fn store_checks(paths: &StorePaths, checks: &mut Vec<Check>) -> Loaded {
         Err(error) => Check::error(CheckId::HashKey, &error)
             .hint("remove .hash-key and run `d-mcp init` to create a new one"),
     });
-    Loaded { config, state }
+    let inputs = sources::file_checks(paths, config.as_ref(), checks);
+    Loaded {
+        config,
+        state,
+        inputs,
+    }
 }
 
 /// Whether d-mcp has a reason to expect the harness: its file exists, or
@@ -294,10 +323,7 @@ fn expected(adapter: &dyn Adapter, env: &Environment, loaded: &Loaded) -> bool {
         config
             .selections
             .iter()
-            .any(|selection| match &selection.harnesses {
-                HarnessSet::All => true,
-                HarnessSet::Only(set) => set.contains(&harness),
-            })
+            .any(|selection| selection.harnesses.contains(harness))
     });
     file || recorded || selected
 }
@@ -498,10 +524,7 @@ fn vanish_checks(state: &State) -> Vec<Check> {
         .collect()
 }
 
-fn static_token_checks(paths: &StorePaths, config: &Config) -> Vec<Check> {
-    let mut snapshots: Vec<_> = source_specs(paths, config).iter().map(scan).collect();
-    validate(&mut snapshots, adapter::registry());
-    let resolution = resolve(&snapshots, &config.selections);
+fn static_token_checks(resolution: &Resolution) -> Vec<Check> {
     resolution
         .servers
         .iter()
@@ -581,7 +604,19 @@ pub fn build(
     for adapter in adapter::registry() {
         checks.push(version_check(*adapter, env, &loaded));
     }
-    let store_ok = !paths.is_initialized() || (loaded.config.is_some() && loaded.state.is_some());
+    if !paths.is_initialized() {
+        checks.push(sources::git_check(&Config::default(), env));
+    } else if let Some(config) = &loaded.config {
+        checks.push(sources::git_check(config, env));
+    }
+    let store_ok = !paths.is_initialized()
+        || (loaded.config.is_some() && loaded.state.is_some() && loaded.inputs.is_some());
+    // The one shared resolution of the store; `None` when it cannot be
+    // read (then `store_ok` is false) or is not initialized.
+    let resolution = match (&loaded.config, &loaded.inputs) {
+        (Some(config), Some(inputs)) => Some(load_resolution(paths, config, inputs)),
+        _ => None,
+    };
     // The inventory reports its own key warnings; the `hash-key` check
     // covers them.
     let mut ignored = Vec::new();
@@ -606,7 +641,7 @@ pub fn build(
             found.as_mut().map(|found| std::mem::take(pick(found)))
         };
         let state = loaded.state.as_ref();
-        let config = loaded.config.as_ref();
+        let resolution = resolution.as_ref();
         // The checks of the inventory are `None` without one; the others
         // need the loaded store only.
         let groups = [
@@ -642,12 +677,13 @@ pub fn build(
             ),
             (
                 CheckId::StaticToken,
-                Some(
-                    config
-                        .map(|config| static_token_checks(paths, config))
-                        .unwrap_or_default(),
-                ),
+                Some(resolution.map(static_token_checks).unwrap_or_default()),
                 "no definition uses a static token where OAuth is possible",
+            ),
+            (
+                CheckId::PendingApproval,
+                Some(resolution.map(sources::pending_checks).unwrap_or_default()),
+                "no selected server waits for approval",
             ),
             (
                 CheckId::NameLength,

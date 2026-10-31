@@ -1,0 +1,6 @@
+name = "uvx-latest"
+
+[transport]
+type = "stdio"
+command = "uvx"
+args = ["mcp-server-time@latest"]

@@ -1,0 +1,6 @@
+name = "nerdctl-run"
+
+[transport]
+type = "stdio"
+command = "nerdctl"
+args = ["run", "-i", "mcp/fetch:2025-04-07"]

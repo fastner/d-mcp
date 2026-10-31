@@ -1,0 +1,6 @@
+name = "pip-git"
+
+[transport]
+type = "stdio"
+command = "uvx"
+args = ["--from", "git+https://github.com/org/mcp-server", "mcp-server"]

@@ -1,0 +1,6 @@
+name = "npm-git-branch"
+
+[transport]
+type = "stdio"
+command = "npx"
+args = ["git+https://github.com/org/mcp-server.git#main"]

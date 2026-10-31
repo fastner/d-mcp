@@ -1,0 +1,6 @@
+name = "zsh-c"
+
+[transport]
+type = "stdio"
+command = "zsh"
+args = ["-c", "mcp-server"]

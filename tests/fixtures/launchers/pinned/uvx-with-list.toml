@@ -1,0 +1,6 @@
+name = "uvx-with-list"
+
+[transport]
+type = "stdio"
+command = "uvx"
+args = ["--with", "dep==1.0,rich[cli]==2.0", "tool==1.0"]

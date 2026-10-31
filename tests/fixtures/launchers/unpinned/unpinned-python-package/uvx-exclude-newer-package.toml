@@ -1,0 +1,6 @@
+name = "uvx-exclude-newer-package"
+
+[transport]
+type = "stdio"
+command = "uvx"
+args = ["--exclude-newer-package", "x=2024-01-01", "evil"]

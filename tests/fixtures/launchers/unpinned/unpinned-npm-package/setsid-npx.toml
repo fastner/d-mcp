@@ -1,0 +1,6 @@
+name = "setsid-npx"
+
+[transport]
+type = "stdio"
+command = "setsid"
+args = ["-f", "npx", "evil"]

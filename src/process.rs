@@ -15,6 +15,13 @@
 //! echo foreign secrets from a broken config line. Errors name only the
 //! program, the exit status or signal, and `timeout` or `not-found`.
 //!
+//! An invocation can opt into [`Invocation::classify_stderr`]: stderr is then
+//! read up to [`STDERR_CAP`] bytes, matched in memory against fixed `git`
+//! patterns and reduced to a [`StderrClass`]. The text itself is dropped right
+//! after matching; it is never printed, persisted or kept in [`Output`]. An
+//! invocation can also carry its own timeout ([`Invocation::timeout`]), which
+//! the network `git` calls use.
+//!
 //! Known limit: on timeout only the direct child is killed, and the reader
 //! threads are not joined afterwards. A grandchild (for example the native
 //! binary behind the npm `codex` shim) may outlive the kill and keep the pipes
@@ -35,6 +42,8 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_MAX_OUTPUT: usize = 1024 * 1024;
 /// Interval of the `try_wait` polling.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Cap on the stderr bytes read for [`Invocation::classify_stderr`].
+pub const STDERR_CAP: usize = 64 * 1024;
 
 /// One program invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +59,11 @@ pub struct Invocation {
     pub remove: Vec<OsString>,
     /// The child's working directory; `None` inherits d-mcp's.
     pub cwd: Option<PathBuf>,
+    /// Whether stderr is read (capped) and classified into
+    /// [`Output::stderr_class`]; otherwise it is drained and dropped.
+    pub classify_stderr: bool,
+    /// The timeout of this invocation; `None` uses the runner's.
+    pub timeout: Option<Duration>,
 }
 
 impl Invocation {
@@ -62,7 +76,16 @@ impl Invocation {
             env: Vec::new(),
             remove: Vec::new(),
             cwd: None,
+            classify_stderr: false,
+            timeout: None,
         }
+    }
+
+    /// Adds one argument.
+    #[must_use]
+    pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
+        self.args.push(arg.into());
+        self
     }
 
     /// Adds arguments.
@@ -97,6 +120,103 @@ impl Invocation {
         self.cwd = Some(dir.into());
         self
     }
+
+    /// Reads stderr (capped) and classifies it; see [`StderrClass`].
+    #[must_use]
+    pub fn classify_stderr(mut self) -> Self {
+        self.classify_stderr = true;
+        self
+    }
+
+    /// Sets the timeout of this invocation, output included.
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+}
+
+/// The class of a `git` failure, matched in memory against fixed patterns of
+/// its stderr. The text is never kept; only the class is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StderrClass {
+    /// Authentication failed or credentials would have been prompted for.
+    AuthFailed,
+    /// The SSH host key is unknown or changed.
+    HostUnknown,
+    /// The host or repository cannot be reached.
+    Unreachable,
+    /// The requested ref does not exist on the remote.
+    RefNotFound,
+    /// Any other failure.
+    Failed,
+}
+
+/// Fixed stderr patterns (lowercase), checked in this order.
+const STDERR_PATTERNS: [(StderrClass, &[&str]); 4] = [
+    (
+        StderrClass::HostUnknown,
+        &[
+            "host key verification failed",
+            "no ed25519 host key is known",
+            "no ecdsa host key is known",
+            "no rsa host key is known",
+            "remote host identification has changed",
+        ],
+    ),
+    (
+        StderrClass::AuthFailed,
+        &[
+            "authentication failed",
+            "permission denied (publickey",
+            "permission denied, please try again",
+            "could not read username",
+            "could not read password",
+            "terminal prompts disabled",
+            "invalid username or password",
+            "access denied",
+            "the requested url returned error: 401",
+            "the requested url returned error: 403",
+        ],
+    ),
+    (
+        StderrClass::RefNotFound,
+        &[
+            "not found in upstream",
+            "couldn't find remote ref",
+            "could not find remote branch",
+        ],
+    ),
+    (
+        StderrClass::Unreachable,
+        &[
+            "could not resolve host",
+            "could not resolve hostname",
+            "name or service not known",
+            "connection refused",
+            "connection timed out",
+            "operation timed out",
+            "network is unreachable",
+            "no route to host",
+            "failed to connect",
+            "could not connect",
+            "does not appear to be a git repository",
+            "repository not found",
+            "does not exist",
+            "the requested url returned error: 404",
+            "could not read from remote repository",
+        ],
+    ),
+];
+
+/// Classifies `git` stderr. Matching is case-insensitive and in memory only.
+#[must_use]
+pub fn classify_git_stderr(stderr: &[u8]) -> StderrClass {
+    let text = String::from_utf8_lossy(stderr).to_lowercase();
+    STDERR_PATTERNS
+        .iter()
+        .find(|(_, patterns)| patterns.iter().any(|pattern| text.contains(pattern)))
+        .map_or(StderrClass::Failed, |(class, _)| *class)
 }
 
 /// How a finished program ended.
@@ -119,6 +239,9 @@ pub struct Output {
     pub stdout: Vec<u8>,
     /// Whether stdout exceeded the cap and was cut.
     pub truncated: bool,
+    /// The class of stderr, with [`Invocation::classify_stderr`] and a
+    /// non-zero exit; `None` otherwise.
+    pub stderr_class: Option<StderrClass>,
 }
 
 impl Output {
@@ -136,6 +259,7 @@ impl fmt::Debug for Output {
             .field("exit", &self.exit)
             .field("stdout", &format_args!("<{} bytes>", self.stdout.len()))
             .field("truncated", &self.truncated)
+            .field("stderr_class", &self.stderr_class)
             .finish()
     }
 }
@@ -268,7 +392,7 @@ impl ProcessRunner {
                 }
             }
         })?;
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + invocation.timeout.unwrap_or(self.timeout);
         let (sender, receiver) = mpsc::channel();
         if let Some(stdout) = child.stdout.take() {
             let sender = sender.clone();
@@ -277,11 +401,17 @@ impl ProcessRunner {
                 let _ = sender.send(drain(stdout, cap));
             });
         }
+        let (stderr_sender, stderr_receiver) = mpsc::channel();
         if let Some(stderr) = child.stderr.take() {
-            // stderr is drained so the child never blocks on it, then
-            // dropped unread.
+            // stderr is drained so the child never blocks on it. Unless the
+            // invocation classifies it, it is dropped unread; otherwise only
+            // its class leaves the reader thread.
+            let classify = invocation.classify_stderr;
             thread::spawn(move || {
-                let _ = drain(stderr, 0);
+                let (bytes, _) = drain(stderr, if classify { STDERR_CAP } else { 0 });
+                if classify {
+                    let _ = stderr_sender.send(classify_git_stderr(&bytes));
+                }
             });
         }
         drop(sender);
@@ -310,10 +440,22 @@ impl ProcessRunner {
         // EOF; the remaining time bounds the wait.
         let remaining = deadline.saturating_duration_since(Instant::now());
         let (stdout, truncated) = receiver.recv_timeout(remaining).map_err(|_| timeout())?;
+        let exit = exit_of(status);
+        let stderr_class = if invocation.classify_stderr && exit != Exit::Code(0) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            Some(
+                stderr_receiver
+                    .recv_timeout(remaining)
+                    .map_err(|_| timeout())?,
+            )
+        } else {
+            None
+        };
         Ok(Output {
-            exit: exit_of(status),
+            exit,
             stdout,
             truncated,
+            stderr_class,
         })
     }
 }
@@ -399,6 +541,7 @@ mod tests {
             exit: Exit::Code(0),
             stdout: b"ghp_secret".to_vec(),
             truncated: false,
+            stderr_class: None,
         };
         assert!(output.success());
         assert!(!format!("{output:?}").contains("ghp_secret"));
@@ -483,5 +626,91 @@ mod tests {
             !text.lines().any(|line| line.starts_with("PATH=")),
             "{text}"
         );
+    }
+
+    #[test]
+    fn git_stderr_is_classified_by_fixed_patterns() {
+        let cases: [(&[u8], StderrClass); 9] = [
+            (
+                b"Host key verification failed.\r\nfatal: Could not read from remote repository.",
+                StderrClass::HostUnknown,
+            ),
+            (
+                b"git@github.com: Permission denied (publickey).",
+                StderrClass::AuthFailed,
+            ),
+            (
+                b"fatal: could not read Username for 'https://x': terminal prompts disabled",
+                StderrClass::AuthFailed,
+            ),
+            (
+                b"fatal: Remote branch nope not found in upstream origin",
+                StderrClass::RefNotFound,
+            ),
+            (
+                b"fatal: couldn't find remote ref refs/heads/nope",
+                StderrClass::RefNotFound,
+            ),
+            (
+                b"ssh: Could not resolve hostname nowhere: Name or service not known",
+                StderrClass::Unreachable,
+            ),
+            (
+                b"fatal: '/srv/x.git' does not appear to be a git repository",
+                StderrClass::Unreachable,
+            ),
+            (b"fatal: something else entirely", StderrClass::Failed),
+            (b"\xff\xfe", StderrClass::Failed),
+        ];
+        for (stderr, class) in cases {
+            assert_eq!(classify_git_stderr(stderr), class, "{stderr:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classified_stderr_keeps_only_the_class_and_timeouts_are_per_invocation() {
+        let runner = ProcessRunner::default();
+        let path = std::env::var_os("PATH");
+        let output = runner
+            .run(
+                &Invocation::new("sh")
+                    .args([
+                        "-c",
+                        "echo 'fatal: Authentication failed for CANARY' >&2; exit 128",
+                    ])
+                    .classify_stderr(),
+                path.as_deref(),
+            )
+            .unwrap();
+        assert_eq!(output.stderr_class, Some(StderrClass::AuthFailed));
+        assert!(!format!("{output:?}").contains("CANARY"));
+        // A successful run is not classified.
+        let output = runner
+            .run(
+                &Invocation::new("sh")
+                    .args(["-c", "echo noise >&2"])
+                    .classify_stderr(),
+                path.as_deref(),
+            )
+            .unwrap();
+        assert_eq!(output.stderr_class, None);
+        // Without the opt-in, stderr is never classified.
+        let output = runner
+            .run(
+                &Invocation::new("sh").args(["-c", "echo x >&2; exit 1"]),
+                path.as_deref(),
+            )
+            .unwrap();
+        assert_eq!(output.stderr_class, None);
+        let error = runner
+            .run(
+                &Invocation::new("sh")
+                    .args(["-c", "/bin/sleep 5"])
+                    .timeout(Duration::from_millis(100)),
+                path.as_deref(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, RunError::Timeout { .. }));
     }
 }

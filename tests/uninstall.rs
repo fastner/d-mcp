@@ -1,9 +1,11 @@
 //! `d-mcp uninstall`: the read-only preview, the removal of entries d-mcp
 //! created through a scoped sync, the release of adopted and taken-over
 //! entries, drifted entries left with exit 1, and `--purge` (known store
-//! entries only, blocked by location changes, a missing `claude`, and a
-//! symlinked store root without `--follow-store-link`), against the fake
-//! `claude` and Codex config files in an isolated environment.
+//! entries only, the Git clones under `sources/` included, blocked by
+//! location changes, a missing `claude`, a symlinked store root without
+//! `--follow-store-link`, and a `local/` Git repository without
+//! `--include-local-repo`), against the fake `claude` and Codex config
+//! files in an isolated environment.
 
 mod common;
 
@@ -580,4 +582,248 @@ fn an_error_in_a_later_step_keeps_the_outcomes_of_earlier_ones() {
     assert!(!state.contains("name = \"tools\""), "{state}");
     assert!(!state.contains("name = \"time\""), "{state}");
     assert!(state.contains("name = \"github\""), "{state}");
+}
+
+/// A store with a Git source, the clone and snapshot under `sources/`.
+fn with_git_source() -> (TestEnv, common::Remote) {
+    let env = TestEnv::new().with_git();
+    env.init();
+    let remote = env.remote("personal");
+    remote.write("servers/github.toml", stdio("github", "npx"));
+    remote.commit("first");
+    ok(&env, &["source", "add-git", &remote.url()]);
+    assert!(env.default_store().join("sources/personal/repo").is_dir());
+    (env, remote)
+}
+
+fn entry_names(value: &Value) -> Vec<String> {
+    value["data"]["purge"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|path| {
+            Path::new(path.as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
+/// `--purge` deletes `sources/` with the Git clones and snapshots, and
+/// never touches the remote or a registered directory source.
+#[test]
+fn purge_deletes_the_git_clones_under_sources() {
+    let (env, remote) = with_git_source();
+    let team = env.source_dir("team");
+    fs::write(team.join("servers/wiki.toml"), stdio("wiki", "w")).unwrap();
+    ok(
+        &env,
+        &[
+            "source",
+            "add",
+            team.to_str().unwrap(),
+            "--id",
+            "team",
+            "--priority",
+            "5",
+        ],
+    );
+    let store = env.default_store();
+    let preview = ok(&env, &["uninstall", "--purge"]);
+    assert_eq!(
+        entry_names(&preview),
+        [
+            "config.toml",
+            "local",
+            "state.toml",
+            ".hash-key",
+            "lock.toml",
+            "sources",
+            ".lock"
+        ]
+        .iter()
+        .filter(|name| store.join(name).exists())
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>()
+    );
+    assert!(entry_names(&preview).contains(&"sources".to_owned()));
+    assert_eq!(preview["data"]["purge"]["local_is_git"], false);
+    let remote_before = snapshot(&remote.bare);
+    let value = ok(&env, &["uninstall", "--apply", "--purge"]);
+    assert_eq!(value["data"]["purge"]["deleted"], true);
+    assert!(!store.exists(), "the empty store root is removed");
+    assert_eq!(snapshot(&remote.bare), remote_before);
+    assert!(team.join("servers/wiki.toml").exists());
+}
+
+/// A `local/` that is a Git repository blocks `--purge` (`local-is-git`)
+/// until `--include-local-repo` is given.
+#[test]
+fn a_local_git_repository_blocks_purge_without_include_local_repo() {
+    let (env, remote) = with_git_source();
+    let store = env.default_store();
+    let local = store.join("local");
+    remote.git_in(&local, &["init", "-q", "-b", "main"]);
+    assert!(local.join(".git").is_dir());
+    let before = snapshot(&store);
+    for args in [
+        &["uninstall", "--purge"][..],
+        &["uninstall", "--apply", "--purge"],
+    ] {
+        let (code, value, stderr) = run(&env, &[], args);
+        assert_eq!(code, 1, "{args:?}: {value:#}");
+        assert_eq!(value["error"]["code"], "purge-blocked");
+        assert_eq!(
+            value["data"]["purge"]["blocked"],
+            json!([{ "reason": "local-is-git", "harness": null }])
+        );
+        assert_eq!(value["data"]["purge"]["local_is_git"], true);
+        assert_eq!(value["data"]["purge"]["deleted"], false);
+        assert!(stderr.contains("--include-local-repo"), "{stderr}");
+        assert!(stderr.contains("unpushed work"), "{stderr}");
+    }
+    assert_eq!(snapshot(&store), before);
+    // The text form names the reason.
+    let output = env
+        .cmd()
+        .args(["uninstall", "--apply", "--purge"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Purge blocked: local-is-git"));
+    // `--include-local-repo` needs `--purge`.
+    let output = env
+        .cmd()
+        .args(["uninstall", "--apply", "--include-local-repo"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(snapshot(&store), before);
+
+    let (code, value, stderr) = run(
+        &env,
+        &[],
+        &["uninstall", "--apply", "--purge", "--include-local-repo"],
+    );
+    assert_eq!(code, 0, "{value:#}\n{stderr}");
+    assert_eq!(value["data"]["purge"]["include_local_repo"], true);
+    assert_eq!(value["data"]["purge"]["deleted"], true);
+    assert!(stderr.contains("deletes the Git repository"), "{stderr}");
+    assert!(!store.exists());
+}
+
+/// A symlinked `local` is only unlinked by `--purge`: even when its target
+/// is a Git repository it does not block the purge, the warning says that
+/// the target stays, and the target is left as it is.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_local_git_repository_is_only_unlinked() {
+    let (env, remote) = with_git_source();
+    let store = env.default_store();
+    let outside = env.root().join("outside-local");
+    fs::create_dir_all(outside.join("servers")).unwrap();
+    remote.git_in(&outside, &["init", "-q", "-b", "main"]);
+    fs::write(outside.join("servers/wiki.toml"), stdio("wiki", "w")).unwrap();
+    fs::remove_dir_all(store.join("local")).unwrap();
+    std::os::unix::fs::symlink(&outside, store.join("local")).unwrap();
+    let before = snapshot(&outside);
+
+    let (code, value, stderr) = run(&env, &[], &["uninstall", "--purge"]);
+    assert_eq!(code, 0, "{value:#}\n{stderr}");
+    assert_eq!(value["data"]["purge"]["local_is_git"], false);
+    assert_eq!(value["data"]["purge"]["blocked"], json!([]));
+    assert!(
+        stderr.contains("is a symlink: --purge would only unlink it"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(&outside.display().to_string()), "{stderr}");
+    assert!(!stderr.contains("unpushed work"), "{stderr}");
+
+    let (code, value, stderr) = run(&env, &[], &["uninstall", "--apply", "--purge"]);
+    assert_eq!(code, 0, "{value:#}\n{stderr}");
+    assert_eq!(value["data"]["purge"]["deleted"], true);
+    assert!(stderr.contains("--purge only unlinks it"), "{stderr}");
+    assert!(!store.exists(), "the empty store root is removed");
+    assert_eq!(snapshot(&outside), before);
+    assert!(outside.join(".git").is_dir());
+}
+
+/// `--purge` unlinks a symlink under `sources/`, and a `sources` that is a
+/// symlink itself, without following either.
+#[cfg(unix)]
+#[test]
+fn purge_never_follows_symlinks_under_or_at_sources() {
+    // A symlink inside `sources/`.
+    let (env, _remote) = with_git_source();
+    let store = env.default_store();
+    let outside = env.root().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("keep.txt"), "x").unwrap();
+    std::os::unix::fs::symlink(&outside, store.join("sources/linked")).unwrap();
+    std::os::unix::fs::symlink(
+        outside.join("keep.txt"),
+        store.join("sources/personal/snapshot/linked.txt"),
+    )
+    .unwrap();
+    let before = snapshot(&outside);
+    let value = ok(&env, &["uninstall", "--apply", "--purge"]);
+    assert_eq!(value["data"]["purge"]["deleted"], true);
+    assert!(!store.exists());
+    assert_eq!(snapshot(&outside), before);
+
+    // `sources` itself is a symlink.
+    let (env, _remote) = with_git_source();
+    let store = env.default_store();
+    let outside = env.root().join("outside-sources");
+    fs::rename(store.join("sources"), &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, store.join("sources")).unwrap();
+    let before = snapshot(&outside);
+    assert!(!before.is_empty());
+    let preview = ok(&env, &["uninstall", "--purge"]);
+    assert!(entry_names(&preview).contains(&"sources".to_owned()));
+    let value = ok(&env, &["uninstall", "--apply", "--purge"]);
+    assert_eq!(value["data"]["purge"]["deleted"], true);
+    assert!(fs::symlink_metadata(store.join("sources")).is_err());
+    assert_eq!(snapshot(&outside), before);
+    assert!(outside.join("personal/repo/.git").is_dir());
+}
+
+/// A corrupt `lock.toml` or `approvals.toml` stops `uninstall` (preview
+/// and apply, with or without `--purge`) before anything is written: the
+/// scoped removals resolve through both files.
+#[test]
+fn corrupt_lock_or_approvals_stop_uninstall_before_any_write() {
+    for (file, code) in [
+        ("lock.toml", "lock-corrupt"),
+        ("approvals.toml", "approvals-corrupt"),
+    ] {
+        let env = setup();
+        env.write_local("github", &stdio("github", "npx"));
+        ok(&env, &["select", "github", "--harness", "codex"]);
+        ok(&env, &["sync"]);
+        assert!(
+            fs::read_to_string(env.codex_config())
+                .unwrap()
+                .contains("github")
+        );
+        fs::write(
+            env.default_store().join(file),
+            "schema_version = 1\nx = 1\n",
+        )
+        .unwrap();
+        let before = everything(&env);
+        for args in [
+            &["uninstall"][..],
+            &["uninstall", "--apply"],
+            &["uninstall", "--apply", "--purge"],
+        ] {
+            let (exit, value, _) = run(&env, &[], args);
+            assert_eq!(exit, 3, "{file} {args:?}: {value:#}");
+            assert_eq!(value["error"]["code"], code, "{file} {args:?}");
+            assert_eq!(value["data"], Value::Null, "{file} {args:?}");
+            assert_eq!(everything(&env), before, "{file} {args:?} wrote");
+        }
+    }
 }

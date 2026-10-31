@@ -1,0 +1,6 @@
+name = "zsh-emulate"
+
+[transport]
+type = "stdio"
+command = "zsh"
+args = ["--emulate", "sh", "-c", "mcp-server"]

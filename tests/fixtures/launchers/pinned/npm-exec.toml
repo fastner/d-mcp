@@ -1,0 +1,6 @@
+name = "npm-exec"
+
+[transport]
+type = "stdio"
+command = "npm"
+args = ["exec", "--yes", "mcp-server@1.2.3"]
